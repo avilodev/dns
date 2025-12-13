@@ -2,29 +2,25 @@
 
 
 /**
- * Query a specific DNS server via UDP
- * Includes timeout and transaction ID validation
+ * Query server
  */
-struct Packet* query_server(const char* server_ip, struct Packet* query)
+struct Packet* query_server_with_timeout(const char* server_ip, struct Packet* query, int timeout_sec)
 {
     if (!server_ip || !query || !query->request) {
         return NULL;
     }
 
-    // Detect if this is IPv4 or IPv6
     bool is_ipv6 = strchr(server_ip, ':') != NULL;
     int addr_family = is_ipv6 ? AF_INET6 : AF_INET;
 
-    // Create UDP socket
     int sockfd = socket(addr_family, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         perror("  Socket creation failed");
         return NULL;
     }
 
-    // Set receive timeout
     struct timeval timeout = {
-        .tv_sec = SOCKET_TIMEOUT,
+        .tv_sec = timeout_sec,
         .tv_usec = 0
     };
     
@@ -38,7 +34,6 @@ struct Packet* query_server(const char* server_ip, struct Packet* query)
     socklen_t addr_len;
     
     if (is_ipv6) {
-        // IPv6
         struct sockaddr_in6 server_addr = {0};
         server_addr.sin6_family = AF_INET6;
         server_addr.sin6_port = htons(DNS_PORT);
@@ -53,7 +48,6 @@ struct Packet* query_server(const char* server_ip, struct Packet* query)
                       (struct sockaddr*)&server_addr, sizeof(server_addr));
         addr_len = sizeof(server_addr);
     } else {
-        // IPv4
         struct sockaddr_in server_addr = {0};
         server_addr.sin_family = AF_INET;
         server_addr.sin_port = htons(DNS_PORT);
@@ -75,9 +69,6 @@ struct Packet* query_server(const char* server_ip, struct Packet* query)
         return NULL;
     }
 
-    printf("  → Sent %zd bytes to %s:53\n", sent, server_ip);
-
-    // Allocate buffer for response
     char* recv_buffer = malloc(MAXLINE);
     if (!recv_buffer) {
         perror("  malloc failed");
@@ -86,20 +77,26 @@ struct Packet* query_server(const char* server_ip, struct Packet* query)
     }
     memset(recv_buffer, 0, MAXLINE);
 
-    // Receive DNS response
     union {
         struct sockaddr_in v4;
         struct sockaddr_in6 v6;
     } recv_addr;
     
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
+    
     ssize_t received = recvfrom(sockfd, recv_buffer, MAXLINE, 0,
                                 (struct sockaddr*)&recv_addr, &addr_len);
+    
+    gettimeofday(&end, NULL);
+    long elapsed_ms = (end.tv_sec - start.tv_sec) * 1000 + 
+                     (end.tv_usec - start.tv_usec) / 1000;
     
     close(sockfd);
 
     if (received < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            fprintf(stderr, "  ✗ Timeout waiting for response from %s\n", server_ip);
+            // Timeout, just return NULL
         } else {
             perror("  ✗ recvfrom failed");
         }
@@ -107,10 +104,9 @@ struct Packet* query_server(const char* server_ip, struct Packet* query)
         return NULL;
     }
 
-    printf("  ← Received %zd bytes from %s:53\n", received, server_ip);
+    printf("  ← Received %zd bytes from %s in %ldms\n", received, server_ip, elapsed_ms);
 
-    // Parse the response
-    struct Packet* response = parse_request_headers(recv_buffer, received);
+    struct Packet* response = parse_response(recv_buffer, received);
     free(recv_buffer);
     
     if (!response) {
@@ -118,7 +114,6 @@ struct Packet* query_server(const char* server_ip, struct Packet* query)
         return NULL;
     }
 
-    // Validate transaction ID
     if (response->id != query->id) {
         fprintf(stderr, "  ✗ Transaction ID mismatch: sent %u, got %u\n", 
                 query->id, response->id);
@@ -128,3 +123,12 @@ struct Packet* query_server(const char* server_ip, struct Packet* query)
 
     return response;
 }
+
+/**
+ * Default query_server with standard timeout
+ */
+struct Packet* query_server(const char* server_ip, struct Packet* query)
+{
+    return query_server_with_timeout(server_ip, query, SOCKET_TIMEOUT);
+}
+

@@ -69,15 +69,15 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
     int pos = HEADER_LEN;
     int domain_len = 0;
     
-    // Parse DNS label format (length-prefixed labels)
+    // Parse DNS label format
     while (pos < recv_len) {
         uint8_t label_len = (uint8_t)buffer[pos];
         
         if (label_len == 0) {
-            break; // End of domain name
+            break;
         }
         
-        // Check for DNS compression (not expected in question section)
+        // Check for DNS compression
         if ((label_len & 0xC0) == 0xC0) {
             fprintf(stderr, "Error: Unexpected compression in question section\n");
             free_packet(pkt);
@@ -94,7 +94,7 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
             domain[domain_len++] = '.';
         }
         
-        pos++; // Skip length byte
+        pos++; // Skip length
         
         if (pos + label_len > recv_len) {
             fprintf(stderr, "Error: Label extends beyond packet boundary\n");
@@ -173,7 +173,7 @@ static void parse_domain_components(struct Packet* pkt, const char* domain) {
     }
 
     if (*second_last_dot == '.') {
-        // Has subdomain
+        // subdomain
         size_t domain_len = last_dot - second_last_dot - 1;
         pkt->domain = strndup(second_last_dot + 1, domain_len);
         

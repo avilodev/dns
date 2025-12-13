@@ -96,7 +96,7 @@ char* extract_ip_from_response(struct Packet* response) {
     // Build result with all IPs
     char result[1024] = "";
     int ip_count = 0;
-    uint16_t first_non_ip_type = 0;  // Track first non-A/AAAA record type
+    uint16_t first_non_ip_type = 0;  //Tracks first either A or AAAA
 
     // Parse answer section
     for (int i = 0; i < ancount && ptr < end; i++) {
@@ -214,17 +214,17 @@ void print_packet_info(const char* label, struct Packet* pkt) {
 }
 
 /**
- * Print hexadecimal dump of data
+ * Print hex dump of data
  */
 void print_hex_dump(const char* data, ssize_t len) {
     printf("Hex dump (%zd bytes): ", len);
-    for (ssize_t i = 0; i < len && i < 64; i++) {
+    for (ssize_t i = 0; i < len && i < 4096; i++) {
         printf("%02X ", (unsigned char)data[i]);
         if ((i + 1) % 16 == 0) {
             printf("\n                      ");
         }
     }
-    if (len > 64) {
+    if (len > 4096) {
         printf("... (truncated)");
     }
     printf("\n");

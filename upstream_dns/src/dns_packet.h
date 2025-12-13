@@ -4,6 +4,8 @@
 #include "types.h"
 #include "resolve.h"
 
+#define MAX_PACKET_SIZE 1024
+
 struct Packet* copy_packet(struct Packet* pkt);
 int construct_dns_packet(struct Packet* pkt);
 int free_packet(struct Packet* pkt);

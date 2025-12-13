@@ -43,9 +43,9 @@ struct ThreadPool {
  * the pool is shut down. Properly handles synchronization using mutex locks
  * and condition variables to coordinate with other threads.
  *
- * @param arg Pointer to ThreadPool structure (cast from void*)
+ * @param arg Pointer to ThreadPool structure
  *
- * @return NULL when thread exits (on pool shutdown)
+ * @return NULL when thread exits on pool shutdown
  *
  * @note Function runs indefinitely until pool->shutdown is set to true
  * @note Updates active_workers count while executing work items
@@ -83,7 +83,7 @@ static void* worker_thread(void* arg) {
         
         pthread_mutex_unlock(&pool->queue_mutex);
         
-        // Execute work (outside of lock to allow other threads to run)
+        // Execute work
         if (item) {
             item->func(item->arg);
             free(item);
@@ -108,9 +108,9 @@ static void* worker_thread(void* arg) {
  * and condition variables), and sets up the work queue. All worker threads
  * are started immediately and begin waiting for work.
  *
- * @param config ThreadPoolConfig structure containing:
+ * @param config ThreadPoolConfig structure:
  *               - num_threads: Number of worker threads to create
- *               - max_queue_size: Maximum queued work items (0 = unlimited)
+ *               - max_queue_size: Maximum queued work items where: 0 = unlimited
  *
  * @return Pointer to initialized ThreadPool structure, or NULL on error
  *
@@ -206,7 +206,7 @@ struct ThreadPool* threadpool_create(struct ThreadPoolConfig config) {
  *
  * @param pool Pointer to ThreadPool structure
  * @param func Function pointer to execute (work_func_t signature)
- * @param arg Argument to pass to the function (can be NULL)
+ * @param arg Argument to pass to the function 
  *
  * @return 0 on success, -1 on failure
  *
@@ -306,7 +306,8 @@ void threadpool_wait(struct ThreadPool* pool) {
  * @note Returns immediately if pool is NULL
  * @note Broadcasts shutdown signal to wake all waiting threads
  * @note Joins all worker threads before cleanup
- * @note Frees work item arguments (assumes they were malloc'd)
+ * @note Frees work item arguments 
+            - Assuming they were malloced 
  * @note Prints completion statistics before destruction
  * @warning After calling, pool pointer is invalid and must not be used
  *
@@ -330,7 +331,7 @@ void threadpool_destroy(struct ThreadPool* pool) {
     struct WorkItem* item = pool->work_queue_head;
     while (item) {
         struct WorkItem* next = item->next;
-        free(item->arg);  // Assumes arg was malloc'd
+        free(item->arg);
         free(item);
         item = next;
     }

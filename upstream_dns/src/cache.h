@@ -7,7 +7,7 @@
 
 // Cache entry for nameserver mappings
 typedef struct NSCacheEntry {
-    char* domain;              // Domain name
+    char* domain;              // Domain name 
     char* ns_ip;               // Nameserver IP address
     time_t expiry;             // Expiration timestamp
     struct NSCacheEntry* next; // Linked list for hash collision
@@ -38,8 +38,8 @@ typedef struct AnswerCache {
 } AnswerCache;
 
 // Cache configuration
-#define NS_CACHE_SIZE 1024
-#define ANSWER_CACHE_SIZE 4096
+#define NS_CACHE_SIZE 10007
+#define ANSWER_CACHE_SIZE 100003
 #define DEFAULT_NS_TTL 3600      // 1 hour for NS records
 #define MIN_CACHE_TTL 60         // Minimum 60 seconds
 #define MAX_CACHE_TTL 86400      // Maximum 24 hours

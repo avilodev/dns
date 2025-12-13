@@ -19,7 +19,7 @@
 #include <openssl/err.h>
 
 #define PORT 53
-#define VERSION "v1.0"
+#define VERSION "v1.2"
 /*
     1.0 - Basic Functionality
     1.1 - Full Functionality

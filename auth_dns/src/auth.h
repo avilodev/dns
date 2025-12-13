@@ -8,7 +8,7 @@
 struct AuthDomain {
     char domain[256];
     char ip[16];
-    bool is_blocked;  // true if this should return NXDOMAIN
+    bool is_blocked;
 };
 
 struct Packet* check_internal(struct Packet* request);

@@ -9,30 +9,32 @@ struct Packet* copy_packet(struct Packet* pkt)
     if (!copy) 
         return NULL;
 
-    //Malloc for binary data
+    // Always allocate a buffer for the copy
+    copy->request = malloc(MAX_PACKET_SIZE);
+    if (!copy->request) {
+        free(copy);
+        return NULL;
+    }
+    
+    // If source has data, copy it; otherwise buffer is initialized to zeros (from malloc)
     if (pkt->request && pkt->recv_len > 0) {
-        copy->request = malloc(pkt->recv_len);
-        if (!copy->request) {
-            free(copy);
-            return NULL;
-        }
         memcpy(copy->request, pkt->request, pkt->recv_len);
         copy->recv_len = pkt->recv_len;
     } else {
-        copy->request = NULL;
-        copy->recv_len = 0;
+        // No source data - set recv_len to buffer size so construct_dns_packet() can use it
+        copy->recv_len = MAX_PACKET_SIZE;
     }
 
     copy->id = pkt->id;
     copy->flags = pkt->flags;
-    copy->qr = pkt->qr;
+    copy->qr = 1;
     copy->opcode = pkt->opcode;
-    copy->aa = pkt->aa;      
+    copy->aa = 0;   
     copy->tc = pkt->tc;   
     copy->rd = pkt->rd;    
-    copy->ra = pkt->ra;      
+    copy->ra = 1;     
     copy->z = pkt->z;     
-    copy->ad = pkt->ad;    
+    copy->ad = 0;                 //DNSSEC - for future
     copy->cd = pkt->cd;   
     copy->rcode = pkt->rcode;  
 
@@ -63,7 +65,7 @@ int construct_dns_packet(struct Packet* pkt)
     }
     
     // Assume standard DNS buffer size if recv_len is 0 or negative
-    size_t buffer_size = (pkt->recv_len > 0) ? (size_t)pkt->recv_len : 512;
+    size_t buffer_size = (pkt->recv_len > 0) ? (size_t)pkt->recv_len : 4096;
     
     if (buffer_size < 12) {
         return -1;  // Need at least header size
@@ -111,7 +113,7 @@ int construct_dns_packet(struct Packet* pkt)
     
     remaining = buffer_size - (ptr - (unsigned char*)pkt->request);
     
-    // === QUESTION SECTION ===
+    // Question Section
     if (pkt->qdcount > 0 && pkt->full_domain) {
         // Encode domain name in DNS format
         int qname_len = encode_dns_name(pkt->full_domain, ptr, remaining);
@@ -136,6 +138,36 @@ int construct_dns_packet(struct Packet* pkt)
         remaining -= 4;
     }
     
+    // EDNS0 OPT Section
+    if (remaining >= 11) {
+        // NAME: root domain (1 byte)
+        *ptr++ = 0x00;
+        
+        // TYPE: OPT (41 = 0x0029) (2 bytes)
+        *ptr++ = 0x00;
+        *ptr++ = 0x29;
+        
+        // CLASS: UDP payload size (4096 = 0x1000) (2 bytes)
+        *ptr++ = 0x10;
+        *ptr++ = 0x00;
+        
+        // TTL: Extended RCODE and flags (4 bytes, all zeros)
+        *ptr++ = 0x00;
+        *ptr++ = 0x00;
+        *ptr++ = 0x00;
+        *ptr++ = 0x00;
+        
+        // RDLENGTH: 0 - no EDNS options (2 bytes)
+        *ptr++ = 0x00;
+        *ptr++ = 0x00;
+        
+        // Update ARCOUNT in header to 1
+        unsigned char* pkt_bytes = (unsigned char*)pkt->request;
+        pkt_bytes[10] = 0x00;
+        pkt_bytes[11] = 0x01;
+        pkt->arcount = 1;
+    }
+
     // Total bytes written
     return ptr - (unsigned char*)pkt->request;
 }
@@ -209,8 +241,8 @@ void set_packet_fields(struct Packet* pkt)
     if (!pkt) return;
 
     pkt->id = get_random_id();
-    pkt->qr = 0;       // Query
-    pkt->opcode = 0;   // Standard query
+    pkt->qr = 0;       // Query Count
+    pkt->opcode = 0;   // Standard Query
     pkt->rd = 0;       // No recursion desired (iterative)
     pkt->ra = 0;
     pkt->aa = 0;

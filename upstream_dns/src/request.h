@@ -10,5 +10,6 @@
 
 struct Packet* parse_request_headers(char* buffer, ssize_t recv_len);
 void parse_domain_components(struct Packet* pkt, const char* domain);
+struct Packet* parse_response(char* buffer, ssize_t recv_len);
 
 #endif /* REQUEST_H */ 

@@ -46,6 +46,10 @@ void signal_handler(int signum) {
             printf("\nReceived shutdown signal (%d)\n", signum);
             g_shutdown = 0;
             break;
+        case SIGUSR1: 
+            printf("\n");
+            print_cache_stats(g_ns_cache, g_answer_cache);
+            break;
         default:
             break;
     }
@@ -75,30 +79,121 @@ void setup_signals(void) {
     sigaction(SIGUSR1, &sa, NULL);
 }
 
-//d
+/**
+ * Extract IP addresses from answer section for logging
+ */
+const char* extract_answer_ips(struct Packet* pkt, char* buffer, size_t buffer_size)
+{
+    if (!pkt || !pkt->request || !buffer || buffer_size == 0) {
+        return "SUCCESS";
+    }
+    
+    buffer[0] = '\0';
+    size_t offset = 0;
+    
+    unsigned char* buf = (unsigned char*)pkt->request;
+    int pos = HEADER_LEN;
+    
+    // Skip question section
+    for (int i = 0; i < pkt->qdcount && pos < pkt->recv_len; i++) {
+        skip_dns_name(buf, pkt->recv_len, &pos);
+        if (pos + 4 <= pkt->recv_len) {
+            pos += 4;
+        }
+    }
+    
+    // Extract IPs from answer section
+    int ip_count = 0;
+    int max_ips = 4;  // Limit to 4 IPs to prevent buffer overflow
+    
+    for (int i = 0; i < pkt->ancount && pos < pkt->recv_len && ip_count < max_ips; i++) {
+        skip_dns_name(buf, pkt->recv_len, &pos);
+        
+        if (pos + 10 > pkt->recv_len) break;
+        
+        uint16_t rr_type = ntohs(*(uint16_t*)(buf + pos));
+        uint16_t rdlength = ntohs(*(uint16_t*)(buf + pos + 8));
+        
+        if (pos + 10 + rdlength > pkt->recv_len) break;
+        
+        if (rr_type == QTYPE_A && rdlength == 4) {
+            struct in_addr addr;
+            memcpy(&addr, buf + pos + 10, 4);
+            char ip_str[INET_ADDRSTRLEN];
+            
+            if (inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str))) {
+                size_t needed = strlen(ip_str) + (ip_count > 0 ? 2 : 0);
+                if (offset + needed + 10 >= buffer_size) break;
+                
+                if (ip_count > 0) {
+                    offset += snprintf(buffer + offset, buffer_size - offset, ", ");
+                }
+                offset += snprintf(buffer + offset, buffer_size - offset, "%s", ip_str);
+                ip_count++;
+            }
+        } else if (rr_type == QTYPE_AAAA && rdlength == 16) {
+            char ipv6_str[INET6_ADDRSTRLEN];
+            
+            if (inet_ntop(AF_INET6, buf + pos + 10, ipv6_str, sizeof(ipv6_str))) {
+                size_t needed = strlen(ipv6_str) + (ip_count > 0 ? 2 : 0);
+                if (offset + needed + 10 >= buffer_size) break;
+                
+                if (ip_count > 0) {
+                    offset += snprintf(buffer + offset, buffer_size - offset, ", ");
+                }
+                offset += snprintf(buffer + offset, buffer_size - offset, "%s", ipv6_str);
+                ip_count++;
+            }
+        }
+        
+        pos += 10 + rdlength;
+    }
+    
+    // Add ... if there are more IPs
+    if (ip_count >= max_ips && ip_count < pkt->ancount) {
+        if (offset + 10 < buffer_size) {
+            snprintf(buffer + offset, buffer_size - offset, " (+%d more)", 
+                     pkt->ancount - ip_count);
+        }
+    }
+    
+    if (buffer[0] == '\0') {
+        return "SUCCESS";
+    }
+    
+    return buffer;
+}
+
 void* process_query(void* arg) {
     struct QueryContext* ctx = (struct QueryContext*)arg;
+    
+    if (!ctx) return NULL;
     
     char* client_ip = inet_ntoa(ctx->client_addr.sin_addr);
     uint16_t client_port = ntohs(ctx->client_addr.sin_port);
 
     struct Packet* pkt = parse_request_headers(ctx->buffer, ctx->recv_len);
     if (!pkt) {
+        fprintf(stderr, "✗ Failed to parse request from %s:%u\n", client_ip, client_port);
         free(ctx->buffer);
         free(ctx);
         return NULL;
     }
 
-    const char* qtype_str = 
-        (pkt->q_type == QTYPE_A) ? "A" : 
-        (pkt->q_type == QTYPE_AAAA) ? "AAAA" : 
-        (pkt->q_type == QTYPE_CNAME) ? "CNAME" :
-        (pkt->q_type == QTYPE_MX) ? "MX" :
-        (pkt->q_type == QTYPE_NS) ? "NS" :
-        (pkt->q_type == QTYPE_TXT) ? "TXT" : "OTHER";
+    // Validate parsed packet
+    if (!pkt->full_domain) {
+        fprintf(stderr, "✗ No domain in request from %s:%u\n", client_ip, client_port);
+        free_packet(pkt);
+        free(ctx->buffer);
+        free(ctx);
+        return NULL;
+    }
+
+    //const char* qtype_str = qtype_to_string(pkt->q_type);
 
     struct Packet* answer = format_resolver(pkt);
     if (!answer) {
+        fprintf(stderr, "✗ Failed to format resolver for %s\n", pkt->full_domain);
         free_packet(pkt);
         free(ctx->buffer);
         free(ctx);
@@ -107,6 +202,7 @@ void* process_query(void* arg) {
 
     struct Packet* ret = send_resolver(answer);
     if (!ret) {
+        fprintf(stderr, "✗ Failed to resolve %s\n", pkt->full_domain);
         free_packet(pkt);
         free_packet(answer);
         free(ctx->buffer);
@@ -117,35 +213,61 @@ void* process_query(void* arg) {
     // Update transaction ID to match client's
     ret->id = pkt->id;
     if (ret->request && ret->recv_len >= 2) {
-        ret->request[0] = (ret->id >> 8) & 0xFF;
-        ret->request[1] = ret->id & 0xFF;
+        ((unsigned char*)ret->request)[0] = (ret->id >> 8) & 0xFF;
+        ((unsigned char*)ret->request)[1] = ret->id & 0xFF;
+    }
+
+    // Set TC bit if response is too large for UDP
+    if (ret->recv_len > 512 && ret->request && ret->recv_len >= 3) {
+        ((unsigned char*)ret->request)[2] |= 0x02;  // Set TC bit
     }
 
     // Send response
-    ssize_t sent = sendto(ctx->dns_sock, ret->request, ret->recv_len, 0,
-                          (struct sockaddr*)&ctx->client_addr, 
-                          sizeof(ctx->client_addr));
+    ssize_t sent = -1;
+    if (ret->request && ret->recv_len > 0) {
+        sent = sendto(ctx->dns_sock, ret->request, ret->recv_len, 0,
+                     (struct sockaddr*)&ctx->client_addr, 
+                     sizeof(ctx->client_addr));
+    }
     
     // Determine result type for logging
     const char* result;
-    if (sent < 0) {
-        result = "SEND_FAILED";
-    } else if (ret->rcode == RCODE_NAME_ERROR) {
-        result = "NXDOMAIN";  // Domain doesn't exist
-    } else if (ret->rcode != RCODE_NO_ERROR) {
-        result = "ERROR";
-    } else if (ret->ancount > 0) {
-        result = "SUCCESS";   // Got answers
-    } else if (ret->aa && ret->ancount == 0) {
-        result = "NODATA";    // Domain exists, no records of this type
+    char* result_buffer = malloc(2048);
+    if (!result_buffer) {
+        result = "MEMORY_ERROR";
     } else {
-        result = "NO_ANSWER"; // Unexpected
+        result_buffer[0] = '\0';
+        
+        if (sent < 0) {
+            result = "SEND_FAILED";
+        } else if (ret->rcode == RCODE_NAME_ERROR) {
+            result = "NXDOMAIN";
+        } else if (ret->rcode != RCODE_NO_ERROR) {
+            snprintf(result_buffer, 2048, "ERROR_RCODE_%u", ret->rcode);
+            result = result_buffer;
+        } else if (ret->ancount > 0) {
+            // Extract IPs for display
+            result = extract_answer_ips(ret, result_buffer, 2048);
+        } else if (ret->aa && ret->ancount == 0) {
+            result = "NODATA";
+        } else {
+            result = "NO_ANSWER";
+        }
     }
     
-    printf("[%lu] %s:%u %s/%s -> %s\n", 
-           ctx->query_num, client_ip, client_port,
-           pkt->full_domain ? pkt->full_domain : "?",
-           qtype_str, result);
+    // Log with timestamp
+    time_t now = time(NULL);
+    struct tm* tm_info = localtime(&now);
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+    
+    printf("[%s] %s:%u - %s -> %s\n", 
+           timestamp, client_ip, client_port,
+           pkt->full_domain, result);
+
+    if (result_buffer) {
+        free(result_buffer);
+    }
 
     free_packet(ret);
     free_packet(answer);
@@ -212,7 +334,7 @@ int main(int argc, char** argv)
     socklen_t client_len = sizeof(client_addr);
     unsigned long query_count = 0;
 
-    // Main server loop - just receives and dispatches to thread pool
+    // Main server loop
     while (g_shutdown) {
         memset(&client_addr, 0, sizeof(client_addr));
 
