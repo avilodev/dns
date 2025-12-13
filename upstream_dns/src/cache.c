@@ -3,7 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-// Simple hash function (djb2)
+// Simple hash function
 static unsigned long hash_string(const char* str) {
     unsigned long hash = 5381;
     int c;
@@ -30,7 +30,7 @@ NSCache* ns_cache_create(size_t size) {
         free(cache);
         return NULL;
     }
-    
+     
     cache->size = size;
     pthread_mutex_init(&cache->lock, NULL);
     
@@ -63,7 +63,7 @@ void ns_cache_destroy(NSCache* cache) {
 int ns_cache_put(NSCache* cache, const char* domain, const char* ns_ip, uint32_t ttl) {
     if (!cache || !domain || !ns_ip) return -1;
     
-    // Enforce TTL limits
+    // TTL limits
     if (ttl < MIN_CACHE_TTL) ttl = MIN_CACHE_TTL;
     if (ttl > MAX_CACHE_TTL) ttl = MAX_CACHE_TTL;
     
@@ -72,7 +72,7 @@ int ns_cache_put(NSCache* cache, const char* domain, const char* ns_ip, uint32_t
     
     pthread_mutex_lock(&cache->lock);
     
-    // Check if entry already exists - update it
+    // Check if entry already exists and updates it
     NSCacheEntry* entry = cache->buckets[index];
     while (entry) {
         if (strcmp(entry->domain, domain) == 0) {
@@ -168,7 +168,6 @@ void ns_cache_cleanup_expired(NSCache* cache) {
     }
 }
 
-//answer cache implementation
 AnswerCache* answer_cache_create(size_t size) {
     AnswerCache* cache = malloc(sizeof(AnswerCache));
     if (!cache) return NULL;
@@ -221,7 +220,7 @@ int answer_cache_put(AnswerCache* cache, const char* domain, uint16_t qtype,
     
     pthread_mutex_lock(&cache->lock);
     
-    // Check if entry exists - update it
+    // Check if entry exists and updates it
     AnswerCacheEntry* entry = cache->buckets[index];
     while (entry) {
         if (strcmp(entry->domain, domain) == 0 && entry->qtype == qtype) {
@@ -281,8 +280,8 @@ struct Packet* answer_cache_get(AnswerCache* cache, const char* domain, uint16_t
     while (entry) {
         if (strcmp(entry->domain, domain) == 0 && entry->qtype == qtype) {
             if (entry->expiry > now) {
-                // Parse cached response
-                struct Packet* pkt = parse_request_headers(entry->response_data, entry->response_len);
+                // Cached data is a response
+                struct Packet* pkt = parse_response(entry->response_data, entry->response_len);
                 pthread_mutex_unlock(&cache->lock);
                 
                 if (pkt) {
@@ -339,7 +338,80 @@ uint32_t extract_min_ttl_from_response(struct Packet* response) {
         return DEFAULT_NS_TTL;
     }
     
-    return DEFAULT_NS_TTL;
+    unsigned char* buffer = (unsigned char*)response->request;
+    int pos = HEADER_LEN;
+    int buffer_len = response->recv_len;
+    uint32_t min_ttl = DEFAULT_NS_TTL;
+    bool found_ttl = false;
+    
+    // Skip question section
+    for (int i = 0; i < response->qdcount && pos < buffer_len; i++) {
+        skip_dns_name(buffer, buffer_len, &pos);
+        pos += 4;  // QTYPE + QCLASS
+    }
+    
+    // Check answer section for TTLs
+    for (int i = 0; i < response->ancount && pos < buffer_len; i++) {
+        skip_dns_name(buffer, buffer_len, &pos);
+        
+        if (pos + 10 > buffer_len) break;
+        
+        uint32_t ttl = ntohl(*(uint32_t*)(buffer + pos + 4));
+        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        
+        if (!found_ttl || ttl < min_ttl) {
+            min_ttl = ttl;
+            found_ttl = true;
+        }
+        
+        pos += 10 + rdlength;
+    }
+    
+    // For NXDOMAIN, check authority section for SOA minimum TTL
+    if (response->rcode == RCODE_NAME_ERROR && response->nscount > 0) {
+        for (int i = 0; i < response->nscount && pos < buffer_len; i++) {
+            skip_dns_name(buffer, buffer_len, &pos);
+            
+            if (pos + 10 > buffer_len) break;
+            
+            uint16_t type = ntohs(*(uint16_t*)(buffer + pos));
+            uint32_t ttl = ntohl(*(uint32_t*)(buffer + pos + 4));
+            uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+            
+            // Found authoritative NXDOMAIN (SOA)
+            if (type == QTYPE_SOA && rdlength > 20) {
+                int rdata_pos = pos + 10;
+                
+                // Skip primary nameserver
+                skip_dns_name(buffer, buffer_len, &rdata_pos);
+                
+                // Skip RNAME
+                skip_dns_name(buffer, buffer_len, &rdata_pos);
+                
+                // Skip serial, refresh, retry, expire (4 uint32_t = 16 bytes)
+                rdata_pos += 16;
+                
+                // Read MINIMUM (the negative caching TTL)
+                if (rdata_pos + 4 <= buffer_len) {
+                    uint32_t soa_minimum = ntohl(*(uint32_t*)(buffer + rdata_pos));
+                    
+                    // Use the smaller of SOA TTL or SOA minimum
+                    uint32_t negative_ttl = (ttl < soa_minimum) ? ttl : soa_minimum;
+                    
+                    printf("  [TTL] SOA minimum for NXDOMAIN: %u seconds\n", negative_ttl);
+                    return negative_ttl;
+                }
+            }
+            
+            pos += 10 + rdlength;
+        }
+    }
+    
+    // Enforce reasonable limits
+    if (min_ttl < 60) min_ttl = MIN_CACHE_TTL;
+    if (min_ttl > 86400) min_ttl = MAX_CACHE_TTL;
+    
+    return found_ttl ? min_ttl : DEFAULT_NS_TTL;
 }
 
 void print_cache_stats(NSCache* ns_cache, AnswerCache* answer_cache) {

@@ -54,24 +54,24 @@ struct Packet* build_nxdomain_response(struct Packet* request) {
     memcpy(response->request + pos, request->request, 2);
     pos += 2;
 
-    // Set response flags with NXDOMAIN (rcode=3)
+    // Set response flags with NXDOMAIN
     uint16_t flags = 0;
-    flags |= (1 << 15);           // QR: Response
-    flags |= (1 << 10);           // AA: Authoritative Answer
-    flags |= (request->rd << 8);  // RD: Copy recursion desired
-    flags |= (1 << 7);            // RA: Recursion Available
-    flags |= RCODE_NAME_ERROR;    // RCODE: Name Error (NXDOMAIN = 3)
+    flags |= (1 << 15);           // Response
+    flags |= (1 << 10);           // Authoritative Answer
+    flags |= (request->rd << 8);  // Copy recursion desired
+    flags |= (1 << 7);            // Recursion Available
+    flags |= RCODE_NAME_ERROR;    // RCODE: NXDOMAIN = 3
     *(uint16_t*)(response->request + pos) = htons(flags);
     pos += 2;
 
-    // Set counts (question only, no answers)
-    *(uint16_t*)(response->request + pos) = htons(1);  // QDCOUNT: 1 question
+    // Set counts
+    *(uint16_t*)(response->request + pos) = htons(1);  // 1 question
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);  // ANCOUNT: 0 answers
+    *(uint16_t*)(response->request + pos) = htons(0);  // 0 answers
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);  // NSCOUNT: 0
+    *(uint16_t*)(response->request + pos) = htons(0);  // 0
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);  // ARCOUNT: 0
+    *(uint16_t*)(response->request + pos) = htons(0);  // 0
     pos += 2;
 
     // Copy question section

@@ -3,7 +3,7 @@
 extern Config g_config;
 
 /**
- * Resolve DNS query recursively using upstream DNS server (1.1.1.1)
+ * Resolve DNS query recursively using upstream DNS server 
  * @param pkt Parsed DNS request
  * @return Response packet from upstream server or NULL on error
  */

@@ -19,7 +19,7 @@ struct QueryContext {
 };
 
 /**
- * Process a single DNS query (executed by worker thread)
+ * Process a single query
  */
 void* process_query(void* arg) {
     struct QueryContext* ctx = (struct QueryContext*)arg;
@@ -45,7 +45,7 @@ void* process_query(void* arg) {
     struct Packet* answer = NULL;
     char* resolved_ip = NULL;
 
-    // Step 1: Check if this is an authoritative query
+    // Check if this is an authoritative query
     answer = check_internal(pkt);
     
     if (answer) {
@@ -74,6 +74,8 @@ void* process_query(void* arg) {
         } else {
             printf("✓ Sent authoritative response (%zd bytes)\n", answer->recv_len);
         }
+
+	print_hex_dump(answer->request, answer->recv_len);
         
         free_packet(answer);
         free_packet(pkt);
@@ -82,7 +84,7 @@ void* process_query(void* arg) {
         return NULL;
     }
 
-    // Step 2: Resolve recursively using upstream DNS 
+    // Resolve recursively using upstream DNS 
     answer = resolve_recursive(pkt);
     
     if (!answer) {
@@ -117,6 +119,8 @@ void* process_query(void* arg) {
     } else {
         printf("✓ Sent recursive response (%zd bytes)\n", answer->recv_len);
     }
+
+    //print_hex_dump(answer->request, answer->recv_len);
 
     free_packet(pkt);
     free_packet(answer);
@@ -200,11 +204,11 @@ int main(int argc, char** argv) {
     socklen_t client_len = sizeof(client_addr);
     unsigned long query_count = 0;
 
-    // Main server loop - just receives and dispatches to thread pool
+    // Main loop
     while (1) {
         memset(&client_addr, 0, sizeof(client_addr));
 
-        // Allocate buffer for this query
+        // Allocate buffer
         char* buffer = malloc(MAXLINE);
         if (!buffer) {
             perror("Error: Failed to allocate buffer");
@@ -249,7 +253,7 @@ int main(int argc, char** argv) {
     if(g_config.upstream_dns)
         free(g_config.upstream_dns);
 
-    // Cleanup (unreachable in this implementation, but good practice)
+    // Cleanup
     threadpool_wait(thread_pool);
     threadpool_destroy(thread_pool);
     close(dns_sock);

@@ -4,6 +4,14 @@
 #include "types.h"
 #include "shared_types.h"
 #include "resolve.h"
+#include "dns_wire.h"
+#include "utils.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <arpa/inet.h>
 
 bool check_cname_loop(CnameChain* chain, const char* domain);
 struct Packet* reconstruct_cname_response(

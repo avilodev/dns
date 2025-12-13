@@ -20,9 +20,11 @@
 #include <openssl/err.h>
 
 
-#define VERSION "v1.0"
+#define VERSION "v2.1"
 /*
     1.0 - Basic Functionality
+    2.0 - Full Functionality
+    2.1 - Parallel Requests
 */
 
 #define MAXLINE 4096
@@ -47,6 +49,12 @@
 #define RCODE_FORMAT_ERROR 1
 #define RCODE_SERVER_FAILURE 2
 #define RCODE_NAME_ERROR 3
+
+//Timeout for Parallel Queries
+#define TIMEOUT_PARALLEL_FAST 1    // Timeout for parallel queries
+#define TIMEOUT_SEQUENTIAL 2       // Timeout for sequential query 
+#define MAX_PARALLEL_QUERIES 3     // Query 3 servers simultaneously
+#define SOCKET_TIMEOUT 5           // Timeout
 
 #define SERVER_PATH "/home/avilo/dns/upstream_dns"
 #define HINTS_FILE "/misc/root_hints.txt"

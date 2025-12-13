@@ -133,8 +133,7 @@ int write_dns_name(const char* name, unsigned char* buffer,
     return pos - start_pos;
 }
 
-// Helper function to encode domain name into DNS wire format
-// "www.example.com" -> 3www7example3com0
+// Encodes domain name into DNS wire format
 int encode_dns_name(const char* domain, unsigned char* buffer, size_t buf_size)
 {
     if (!domain || !buffer || buf_size == 0) {

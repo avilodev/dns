@@ -17,13 +17,7 @@ struct ThreadPoolConfig {
     int max_queue_size;     // Max pending work items (0 = unlimited)
 };
 
-// Thread pool operations
-struct ThreadPool* threadpool_create(struct ThreadPoolConfig config);
-int threadpool_add_work(struct ThreadPool* pool, work_func_t func, void* arg);
-void threadpool_wait(struct ThreadPool* pool);
-void threadpool_destroy(struct ThreadPool* pool);
-
-// Statistics (optional but useful)
+// Statistics
 struct ThreadPoolStats {
     int active_threads;
     int queued_work;
@@ -31,6 +25,11 @@ struct ThreadPoolStats {
     int rejected_work;
 };
 
+// Thread pool operations
+struct ThreadPool* threadpool_create(struct ThreadPoolConfig config);
+int threadpool_add_work(struct ThreadPool* pool, work_func_t func, void* arg);
+void threadpool_wait(struct ThreadPool* pool);
+void threadpool_destroy(struct ThreadPool* pool);
 void threadpool_get_stats(struct ThreadPool* pool, struct ThreadPoolStats* stats);
 
 #endif

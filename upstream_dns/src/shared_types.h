@@ -10,10 +10,10 @@ typedef struct {
 
 typedef struct {
     struct {
-        char* name;           // CNAME owner (source)
+        char* name;           // CNAME owner
         char* target;         // CNAME target
         uint32_t ttl;
-        unsigned char* rdata; // Raw DNS wire format of CNAME RR
+        unsigned char* rdata;
         size_t rdata_len;
     } entries[MAX_CNAME_DEPTH];
     int count;

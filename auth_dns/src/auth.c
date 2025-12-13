@@ -68,13 +68,13 @@ struct Packet* check_internal(struct Packet* request) {
     pos += 2;
 
     // Set counts
-    *(uint16_t*)(response->request + pos) = htons(1);  // QDCOUNT: 1 question
+    *(uint16_t*)(response->request + pos) = htons(1);  // 1 question
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(1);  // ANCOUNT: 1 answer
+    *(uint16_t*)(response->request + pos) = htons(1);  // 1 answer
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);  // NSCOUNT: 0
+    *(uint16_t*)(response->request + pos) = htons(0);  
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);  // ARCOUNT: 0
+    *(uint16_t*)(response->request + pos) = htons(0);
     pos += 2;
 
     // Copy question section
@@ -92,7 +92,7 @@ struct Packet* check_internal(struct Packet* request) {
         pos += tld_len;
     }
 
-    response->request[pos++] = 0;  // Null terminator
+    response->request[pos++] = 0;
 
     *(uint16_t*)(response->request + pos) = htons(request->q_type);
     pos += 2;
@@ -100,15 +100,15 @@ struct Packet* check_internal(struct Packet* request) {
     pos += 2;
 
     // Build answer section with compression pointer
-    *(uint16_t*)(response->request + pos) = htons(0xC00C);  // Name: pointer to offset 12
+    *(uint16_t*)(response->request + pos) = htons(0xC00C); // Pointer offset
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(QTYPE_A);  // Type: A
+    *(uint16_t*)(response->request + pos) = htons(QTYPE_A);  // A
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(1);  // Class: IN
+    *(uint16_t*)(response->request + pos) = htons(1);  // IN
     pos += 2;
-    *(uint32_t*)(response->request + pos) = htonl(3600);  // TTL: 1 hour
+    *(uint32_t*)(response->request + pos) = htonl(3600);  // 1 hour
     pos += 4;
-    *(uint16_t*)(response->request + pos) = htons(4);  // RDLENGTH: 4 bytes
+    *(uint16_t*)(response->request + pos) = htons(4);
     pos += 2;
 
     // RDATA: Parse and insert IP address from file
@@ -134,11 +134,6 @@ struct Packet* check_internal(struct Packet* request) {
  * Load authoritative domains from file
  * File format: domain_name ip_address
  * Special: Use NXDOMAIN to block domains
- * Example:
- *   avilodev.com 192.168.1.18
- *   pi5.local 192.168.1.3
- *   youtube.com NXDOMAIN
- *   ads.example.com NXDOMAIN
  */
 int load_auth_domains(const char* filename) {
     int fd = open(filename, O_RDONLY);
@@ -183,7 +178,6 @@ int load_auth_domains(const char* filename) {
             continue;
         }
 
-        // Parse: domain ip_or_NXDOMAIN
         char domain[256];
         char ip[16];
         int parsed = sscanf(line, "%255s %15s", domain, ip);
