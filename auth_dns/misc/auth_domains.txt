@@ -4,3 +4,6 @@ adoliva.com 192.168.1.3
 pi3.local 192.168.1.3
 ads.google.com NXDOMAIN
 doubleclick.net NXDOMAIN
+avilo.local MX 10 mail.avilo.local
+mail.avilo.local 192.168.1.3
+avilo.com 2001:db8::1

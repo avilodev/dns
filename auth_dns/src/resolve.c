@@ -13,8 +13,8 @@ struct Packet* resolve_recursive(struct Packet* pkt) {
         return NULL;
     }
 
-    printf("→ Forwarding query to upstream DNS (%s) for %s\n", 
-           g_config.upstream_dns, pkt->full_domain ? pkt->full_domain : "unknown");
+    //printf("→ Forwarding query to upstream DNS (%s) for %s\n", 
+           //g_config.upstream_dns, pkt->full_domain ? pkt->full_domain : "unknown");
 
     // Create UDP socket for upstream query
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -107,7 +107,7 @@ struct Packet* resolve_recursive(struct Packet* pkt) {
         response->top_level_domain = strdup(pkt->top_level_domain);
     }
 
-    printf("← Received %zd bytes from upstream DNS\n", response->recv_len);
+    //printf("← Received %zd bytes from upstream DNS\n", response->recv_len);
 
     return response;
 }
