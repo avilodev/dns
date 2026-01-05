@@ -27,20 +27,20 @@ void* process_query(void* arg) {
     char* client_ip = inet_ntoa(ctx->client_addr.sin_addr);
     uint16_t client_port = ntohs(ctx->client_addr.sin_port);
 
-    printf("\n[Query #%lu] From %s:%u (%zd bytes)\n", 
-           ctx->query_num, client_ip, client_port, ctx->recv_len);
+    //printf("\n[Query #%lu] From %s:%u (%zd bytes)\n", 
+    //       ctx->query_num, client_ip, client_port, ctx->recv_len);
 
     // Parse DNS request
     struct Packet* pkt = parse_request_headers(ctx->buffer, ctx->recv_len);
     if (!pkt) {
-        fprintf(stderr, "✗ Failed to parse packet header\n");
+        fprintf(stderr, "Failed to parse packet header\n");
         log_entry(client_ip, client_port, "PARSE_ERROR", NULL);
         free(ctx->buffer);
         free(ctx);
         return NULL;
     }
 
-    print_packet_info("QUESTION", pkt);
+    //print_packet_info("QUESTION", pkt);
 
     struct Packet* answer = NULL;
     char* resolved_ip = NULL;
@@ -50,32 +50,34 @@ void* process_query(void* arg) {
     
     if (answer) {
         // Handle authoritative response
-        printf("✓ Responding authoritatively\n");
+        //printf("Responding authoritatively\n");
         
         // Parse the answer packet to print its info
         struct Packet* parsed_answer = parse_request_headers((char*)answer->request, answer->recv_len);
         if (parsed_answer) {
-            print_packet_info("ANSWER", parsed_answer);
+            //print_packet_info("ANSWER", parsed_answer);
             free_packet(parsed_answer);
         }
         
         // Extract IP for logging
         resolved_ip = extract_ip_from_response(answer);
+	/*
         if (resolved_ip) {
-            printf("✓ Resolved IPs: %s\n", resolved_ip);
+            //printf("Resolved IPs: %s\n", resolved_ip);
         } else {
-            printf("⚠ No A/AAAA records found\n");
+            //printf("No A/AAAA records found\n");
         }
+	*/
         log_entry(client_ip, client_port, pkt->full_domain, resolved_ip);
         free(resolved_ip);
         
         if (send_response(ctx->dns_sock, answer, &ctx->client_addr) < 0) {
-            fprintf(stderr, "✗ Failed to send authoritative response\n");
+            fprintf(stderr, "Failed to send authoritative response\n");
         } else {
-            printf("✓ Sent authoritative response (%zd bytes)\n", answer->recv_len);
+            //printf("✓ Sent authoritative response (%zd bytes)\n", answer->recv_len);
         }
 
-	print_hex_dump(answer->request, answer->recv_len);
+	//print_hex_dump(answer->request, answer->recv_len);
         
         free_packet(answer);
         free_packet(pkt);
@@ -88,7 +90,7 @@ void* process_query(void* arg) {
     answer = resolve_recursive(pkt);
     
     if (!answer) {
-        fprintf(stderr, "✗ Recursive resolution failed\n");
+        fprintf(stderr, "Recursive resolution failed\n");
         log_entry(client_ip, client_port, pkt->full_domain, "FAILED");
         free_packet(pkt);
         free(ctx->buffer);
@@ -99,25 +101,27 @@ void* process_query(void* arg) {
     // Parse the upstream response to print its info correctly
     struct Packet* parsed_answer = parse_request_headers((char*)answer->request, answer->recv_len);
     if (parsed_answer) {
-        print_packet_info("ANSWER", parsed_answer);
+        //print_packet_info("ANSWER", parsed_answer);
         free_packet(parsed_answer);
     }
 
     // Extract IP for logging
     resolved_ip = extract_ip_from_response(answer);
+    /*
     if (resolved_ip) {
-        printf("✓ Resolved IPs: %s\n", resolved_ip);
+        printf("Resolved IPs: %s\n", resolved_ip);
     } else {
-        printf("⚠ No A/AAAA records found\n");
+        printf("No A/AAAA records found\n");
     }
+    */
     log_entry(client_ip, client_port, pkt->full_domain, resolved_ip);
     free(resolved_ip);
 
     // Send response to client
     if (send_response(ctx->dns_sock, answer, &ctx->client_addr) < 0) {
-        fprintf(stderr, "✗ Failed to send recursive response\n");
+        fprintf(stderr, "Failed to send recursive response\n");
     } else {
-        printf("✓ Sent recursive response (%zd bytes)\n", answer->recv_len);
+        //printf("Sent recursive response (%zd bytes)\n", answer->recv_len);
     }
 
     //print_hex_dump(answer->request, answer->recv_len);
@@ -195,9 +199,9 @@ int main(int argc, char** argv) {
         exit(EXIT_FAILURE);
     }
     
-    printf("✓ DNS Server listening on 0.0.0.0:%d\n", PORT);
-    printf("✓ Upstream DNS: %s\n", g_config.upstream_dns);
-    printf("✓ Loaded %d authoritative domain(s)\n", auth_domain_count);
+    printf("DNS Server listening on 0.0.0.0:%d\n", PORT);
+    printf("Upstream DNS: %s\n", g_config.upstream_dns);
+    printf("Loaded %d authoritative domain(s)\n", auth_domain_count);
     printf("\nWaiting for queries...\n\n");
 
     struct sockaddr_in client_addr;
@@ -244,7 +248,7 @@ int main(int argc, char** argv) {
 
         // Add work to thread pool
         if (threadpool_add_work(thread_pool, process_query, ctx) < 0) {
-            fprintf(stderr, "✗ Failed to queue work (pool might be full)\n");
+            fprintf(stderr, "Failed to queue work (pool might be full)\n");
             free(buffer);
             free(ctx);
         }
