@@ -34,7 +34,7 @@ NSCache* ns_cache_create(size_t size) {
     cache->size = size;
     pthread_mutex_init(&cache->lock, NULL);
     
-    printf("✓ NS Cache created (%zu buckets)\n", size);
+    //printf("NS Cache created (%zu buckets)\n", size);
     return cache;
 }
 
@@ -76,11 +76,15 @@ int ns_cache_put(NSCache* cache, const char* domain, const char* ns_ip, uint32_t
     NSCacheEntry* entry = cache->buckets[index];
     while (entry) {
         if (strcmp(entry->domain, domain) == 0) {
+            char* new_ip = strdup(ns_ip);
+            if (!new_ip) {
+                pthread_mutex_unlock(&cache->lock);
+                return -1;
+            }
             free(entry->ns_ip);
-            entry->ns_ip = strdup(ns_ip);
+            entry->ns_ip = new_ip;
             entry->expiry = time(NULL) + ttl;
             pthread_mutex_unlock(&cache->lock);
-            printf("  [NS Cache] Updated: %s -> %s (TTL: %u)\n", domain, ns_ip, ttl);
             return 0;
         }
         entry = entry->next;
@@ -92,16 +96,23 @@ int ns_cache_put(NSCache* cache, const char* domain, const char* ns_ip, uint32_t
         pthread_mutex_unlock(&cache->lock);
         return -1;
     }
-    
+
     new_entry->domain = strdup(domain);
-    new_entry->ns_ip = strdup(ns_ip);
+    new_entry->ns_ip  = strdup(ns_ip);
+    if (!new_entry->domain || !new_entry->ns_ip) {
+        free(new_entry->domain);
+        free(new_entry->ns_ip);
+        free(new_entry);
+        pthread_mutex_unlock(&cache->lock);
+        return -1;
+    }
     new_entry->expiry = time(NULL) + ttl;
     new_entry->next = cache->buckets[index];
     cache->buckets[index] = new_entry;
     
     pthread_mutex_unlock(&cache->lock);
     
-    printf("  [NS Cache] Added: %s -> %s (TTL: %u)\n", domain, ns_ip, ttl);
+    //printf("  [NS Cache] Added: %s -> %s (TTL: %u)\n", domain, ns_ip, ttl);
     return 0;
 }
 
@@ -120,12 +131,12 @@ char* ns_cache_get(NSCache* cache, const char* domain) {
             if (entry->expiry > now) {
                 char* result = strdup(entry->ns_ip);
                 pthread_mutex_unlock(&cache->lock);
-                printf("  [NS Cache] HIT: %s -> %s\n", domain, entry->ns_ip);
+                //printf("  [NS Cache] HIT: %s -> %s\n", domain, entry->ns_ip);
                 return result;
             } else {
                 // Entry expired
                 pthread_mutex_unlock(&cache->lock);
-                printf("  [NS Cache] EXPIRED: %s\n", domain);
+                //printf("  [NS Cache] EXPIRED: %s\n", domain);
                 return NULL;
             }
         }
@@ -133,7 +144,7 @@ char* ns_cache_get(NSCache* cache, const char* domain) {
     }
     
     pthread_mutex_unlock(&cache->lock);
-    printf("  [NS Cache] MISS: %s\n", domain);
+    //printf("  [NS Cache] MISS: %s\n", domain);
     return NULL;
 }
 
@@ -164,7 +175,7 @@ void ns_cache_cleanup_expired(NSCache* cache) {
     pthread_mutex_unlock(&cache->lock);
     
     if (removed > 0) {
-        printf("[NS Cache] Cleaned up %d expired entries\n", removed);
+        //printf("[NS Cache] Cleaned up %d expired entries\n", removed);
     }
 }
 
@@ -181,7 +192,7 @@ AnswerCache* answer_cache_create(size_t size) {
     cache->size = size;
     pthread_mutex_init(&cache->lock, NULL);
     
-    printf("✓ Answer Cache created (%zu buckets)\n", size);
+    //printf("✓ Answer Cache created (%zu buckets)\n", size);
     return cache;
 }
 
@@ -224,15 +235,18 @@ int answer_cache_put(AnswerCache* cache, const char* domain, uint16_t qtype,
     AnswerCacheEntry* entry = cache->buckets[index];
     while (entry) {
         if (strcmp(entry->domain, domain) == 0 && entry->qtype == qtype) {
-            free(entry->response_data);
-            entry->response_data = malloc(response_len);
-            if (entry->response_data) {
-                memcpy(entry->response_data, response_data, response_len);
-                entry->response_len = response_len;
-                entry->expiry = time(NULL) + ttl;
+            char* new_data = malloc(response_len);
+            if (!new_data) {
+                pthread_mutex_unlock(&cache->lock);
+                return -1;
             }
+            free(entry->response_data);
+            entry->response_data = new_data;
+            memcpy(entry->response_data, response_data, response_len);
+            entry->response_len = response_len;
+            entry->expiry = time(NULL) + ttl;
             pthread_mutex_unlock(&cache->lock);
-            printf("  [Answer Cache] Updated: %s (Type: %u, TTL: %u)\n", domain, qtype, ttl);
+            //printf("  [Answer Cache] Updated: %s (Type: %u, TTL: %u)\n", domain, qtype, ttl);
             return 0;
         }
         entry = entry->next;
@@ -263,7 +277,7 @@ int answer_cache_put(AnswerCache* cache, const char* domain, uint16_t qtype,
     
     pthread_mutex_unlock(&cache->lock);
     
-    printf("  [Answer Cache] Added: %s (Type: %u, TTL: %u)\n", domain, qtype, ttl);
+    //printf("  [Answer Cache] Added: %s (Type: %u, TTL: %u)\n", domain, qtype, ttl);
     return 0;
 }
 
@@ -280,25 +294,31 @@ struct Packet* answer_cache_get(AnswerCache* cache, const char* domain, uint16_t
     while (entry) {
         if (strcmp(entry->domain, domain) == 0 && entry->qtype == qtype) {
             if (entry->expiry > now) {
-                // Cached data is a response
-                struct Packet* pkt = parse_response(entry->response_data, entry->response_len);
-                pthread_mutex_unlock(&cache->lock);
-                
-                if (pkt) {
-                    printf("  [Answer Cache] HIT: %s (Type: %u)\n", domain, qtype);
+                // Copy raw response data under the lock, then parse outside
+                // critical section to avoid holding mutex during allocation.
+                ssize_t data_len = entry->response_len;
+                char* data_copy = malloc(data_len);
+                if (!data_copy) {
+                    pthread_mutex_unlock(&cache->lock);
+                    return NULL;
                 }
+                memcpy(data_copy, entry->response_data, data_len);
+                pthread_mutex_unlock(&cache->lock);
+
+                struct Packet* pkt = parse_response(data_copy, data_len);
+                free(data_copy);
                 return pkt;
             } else {
                 pthread_mutex_unlock(&cache->lock);
-                printf("  [Answer Cache] EXPIRED: %s (Type: %u)\n", domain, qtype);
+                //printf("  [Answer Cache] EXPIRED: %s (Type: %u)\n", domain, qtype);
                 return NULL;
             }
         }
         entry = entry->next;
     }
-    
+
     pthread_mutex_unlock(&cache->lock);
-    printf("  [Answer Cache] MISS: %s (Type: %u)\n", domain, qtype);
+    //printf("  [Answer Cache] MISS: %s (Type: %u)\n", domain, qtype);
     return NULL;
 }
 
@@ -328,9 +348,9 @@ void answer_cache_cleanup_expired(AnswerCache* cache) {
     
     pthread_mutex_unlock(&cache->lock);
     
-    if (removed > 0) {
-        printf("[Answer Cache] Cleaned up %d expired entries\n", removed);
-    }
+    // if (removed > 0) {
+    //    printf("[Answer Cache] Cleaned up %d expired entries\n", removed);
+    //}
 }
 
 uint32_t extract_min_ttl_from_response(struct Packet* response) {
@@ -398,7 +418,7 @@ uint32_t extract_min_ttl_from_response(struct Packet* response) {
                     // Use the smaller of SOA TTL or SOA minimum
                     uint32_t negative_ttl = (ttl < soa_minimum) ? ttl : soa_minimum;
                     
-                    printf("  [TTL] SOA minimum for NXDOMAIN: %u seconds\n", negative_ttl);
+                    //printf("  [TTL] SOA minimum for NXDOMAIN: %u seconds\n", negative_ttl);
                     return negative_ttl;
                 }
             }

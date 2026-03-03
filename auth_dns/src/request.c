@@ -1,4 +1,5 @@
 #include "request.h"
+#include <ctype.h>
 
 static void parse_domain_components(struct Packet* pkt, const char* domain);
 
@@ -55,6 +56,18 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
     pkt->cd = (pkt->flags >> 4) & 0x1;
     pkt->rcode = pkt->flags & 0xF;
 
+    // Drop response packets — a QR=1 packet arriving as a query is invalid
+    if (pkt->qr == 1) {
+        free_packet(pkt);
+        return NULL;
+    }
+
+    // Only standard queries (opcode=0) supported; flag others for NOTIMP reply
+    if (pkt->opcode != 0) {
+        pkt->rcode = RCODE_NOTIMP;
+        return pkt;
+    }
+
     // Validate question count
     if (pkt->qdcount == 0) {
         fprintf(stderr, "Error: No questions in DNS query\n");
@@ -108,7 +121,10 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
             return NULL;
         }
         
-        memcpy(domain + domain_len, buffer + pos, label_len);
+        /* Lowercase each byte while copying — DNS names are case-insensitive
+         * (RFC 1035 §3.1) and auth_domains.txt stores only lowercase. */
+        for (int j = 0; j < label_len; j++)
+            domain[domain_len + j] = (char)tolower((unsigned char)buffer[pos + j]);
         domain_len += label_len;
         pos += label_len;
     }
@@ -135,6 +151,46 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
     
     pkt->q_type = ntohs(*(uint16_t*)(buffer + pos));
     pkt->q_class = ntohs(*(uint16_t*)(buffer + pos + 2));
+
+    // Validate QCLASS — only IN (1) and ANY/QCLASS_ANY (255) are valid (RFC 1035)
+    if (pkt->q_class != 1 && pkt->q_class != 255) {
+        fprintf(stderr, "Warning: Unsupported QCLASS %u — returning FORMERR\n", pkt->q_class);
+        pkt->rcode = RCODE_FORMAT_ERROR;
+        return pkt;
+    }
+
+    /* Scan additional section for EDNS0 OPT record to detect DO bit.
+     * arcount additional RRs immediately follow the question section
+     * (ancount and nscount are always 0 in a standard query).
+     * OPT owner = root (0x00), type = 41; DO = bit 15 of OPT TTL flags. */
+    pos += 4; /* advance past QTYPE + QCLASS */
+    for (int rri = 0; rri < (int)pkt->arcount && pos < recv_len; rri++) {
+        /* Skip owner name */
+        if ((uint8_t)buffer[pos] == 0) {
+            pos++;                             /* root label */
+        } else {
+            while (pos < recv_len) {
+                uint8_t llen = (uint8_t)buffer[pos];
+                if (llen == 0)              { pos++; break; }
+                if ((llen & 0xC0) == 0xC0) { pos += 2; break; }
+                pos += 1 + llen;
+            }
+        }
+        if (pos + 10 > recv_len) break;
+        uint16_t rr_type  = ntohs(*(uint16_t*)(buffer + pos));     pos += 2;
+        uint16_t rr_class = ntohs(*(uint16_t*)(buffer + pos));     pos += 2;
+        uint32_t rr_ttl   = ntohl(*(uint32_t*)(buffer + pos));     pos += 4;
+        uint16_t rr_rdlen = ntohs(*(uint16_t*)(buffer + pos));     pos += 2;
+        if (rr_type == 41 /* OPT */) {
+            pkt->edns_present  = 1;
+            pkt->edns_udp_size = rr_class ? rr_class : 512; /* CLASS = UDP payload size */
+            pkt->edns_version  = (uint8_t)((rr_ttl >> 16) & 0xFF);
+            pkt->do_bit        = (rr_ttl >> 15) & 1;
+            break;
+        }
+        if (pos + rr_rdlen > recv_len) break;
+        pos += rr_rdlen;
+    }
 
     return pkt;
 }

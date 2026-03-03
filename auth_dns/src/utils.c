@@ -46,12 +46,33 @@ int load_config(int argc, char** argv) {
                 g_config.queue_size = atoi(optarg);
                 break;
             default:
-                printf("Uasge: ./auth_dns/bin/dns <-p Upstream DNS port> <-t thread_count> <-u upstream_dns> <-q queue_size>\n");
+                printf("Usage: ./auth_dns/bin/dns <-p Upstream DNS port> <-t thread_count> <-u upstream_dns> <-q queue_size>\n");
                 return -1;
         }
     }
     
     return 0;
+}
+
+/**
+ * Write a domain name (e.g. "mail.example.com") into DNS wire-format label
+ * encoding at buf[*pos], advancing *pos.  Each dot-separated label is written
+ * as: <length-byte> <label-bytes>.  A final zero-length byte terminates the name.
+ */
+void write_dns_labels(const char* name, char* buf, int* pos) {
+    if (!name || !buf || !pos) return;
+    char copy[256];
+    strncpy(copy, name, sizeof(copy) - 1);
+    copy[sizeof(copy) - 1] = '\0';
+    char* label = strtok(copy, ".");
+    while (label) {
+        uint8_t label_len = (uint8_t)strlen(label);
+        buf[(*pos)++] = (char)label_len;
+        memcpy(buf + *pos, label, label_len);
+        *pos += label_len;
+        label = strtok(NULL, ".");
+    }
+    buf[(*pos)++] = 0;  // Null terminator
 }
 
 /**

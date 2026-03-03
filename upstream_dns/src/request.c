@@ -1,4 +1,5 @@
 #include "request.h"
+#include <ctype.h>
 
 /**
  * Parse DNS request headers and question section
@@ -42,6 +43,18 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
     pkt->ad = (pkt->flags >> 5) & 0x1;
     pkt->cd = (pkt->flags >> 4) & 0x1;
     pkt->rcode = pkt->flags & 0xF;
+
+    // Drop response packets — a QR=1 packet arriving as a query is invalid
+    if (pkt->qr == 1) {
+        free_packet(pkt);
+        return NULL;
+    }
+
+    // Only standard queries (opcode=0) supported; flag others for NOTIMP reply
+    if (pkt->opcode != 0) {
+        pkt->rcode = RCODE_NOTIMP;
+        return pkt;
+    }
 
     // Validate question count
     if (pkt->qdcount == 0) {
@@ -97,7 +110,9 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
             return NULL;
         }
         
-        memcpy(domain + domain_len, buffer + pos, label_len);
+        /* Lowercase while copying — DNS names are case-insensitive (RFC 1035 §3.1). */
+        for (int j = 0; j < label_len; j++)
+            domain[domain_len + j] = (char)tolower((unsigned char)buffer[pos + j]);
         domain_len += label_len;
         pos += label_len;
     }
@@ -125,13 +140,60 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
     pkt->q_type = ntohs(*(uint16_t*)(buffer + pos));
     pkt->q_class = ntohs(*(uint16_t*)(buffer + pos + 2));
     pos += 4;
-    
+
+    // Validate QCLASS — only IN (1) and ANY/QCLASS_ANY (255) are valid (RFC 1035)
+    if (pkt->q_class != 1 && pkt->q_class != 255) {
+        fprintf(stderr, "Warning: Unsupported QCLASS %u — returning FORMERR\n", pkt->q_class);
+        pkt->rcode = RCODE_FORMAT_ERROR;
+        return pkt;
+    }
+
     int question_end = pos;  // End of question section
+
+    // Scan additional section for EDNS OPT record (type=41, RFC 6891).
+    // We do this before rebuilding the clean buffer so we can capture the
+    // client's UDP payload size, EDNS version, and DO bit.
+    {
+        int scan = question_end;
+        int rr_idx = 0;
+        int total_rrs = (int)pkt->ancount + (int)pkt->nscount + (int)pkt->arcount;
+        while (scan < recv_len - 10 && rr_idx < total_rrs) {
+            // Skip owner name (may be 0x00 for root, or label sequence)
+            if ((uint8_t)buffer[scan] == 0x00) {
+                scan++;  // root label
+            } else if (((uint8_t)buffer[scan] & 0xC0) == 0xC0) {
+                scan += 2;  // compression pointer
+            } else {
+                // Walk labels
+                while (scan < recv_len) {
+                    uint8_t ll = (uint8_t)buffer[scan];
+                    if (ll == 0) { scan++; break; }
+                    if ((ll & 0xC0) == 0xC0) { scan += 2; break; }
+                    scan += 1 + ll;
+                }
+            }
+            if (scan + 10 > recv_len) break;
+            uint16_t rr_type  = ntohs(*(uint16_t*)(buffer + scan));
+            uint16_t rr_class = ntohs(*(uint16_t*)(buffer + scan + 2));
+            uint32_t rr_ttl   = ntohl(*(uint32_t*)(buffer + scan + 4));
+            uint16_t rr_rdlen = ntohs(*(uint16_t*)(buffer + scan + 8));
+            scan += 10;
+            if (rr_type == 41) {  // OPT
+                pkt->edns_present  = true;
+                pkt->edns_udp_size = rr_class;  // CLASS field = UDP payload size
+                pkt->edns_version  = (uint8_t)((rr_ttl >> 16) & 0xFF);
+                pkt->do_bit        = (rr_ttl & 0x00008000) ? true : false;
+            }
+            if (scan + rr_rdlen > recv_len) break;
+            scan += rr_rdlen;
+            rr_idx++;
+        }
+    }
 
     // Copy ONLY header + question section, zero out AN/NS/AR counts
     if (pkt->ancount > 0 || pkt->nscount > 0 || pkt->arcount > 0) {
-        printf("  [EDNS0] Client sent AN=%u NS=%u AR=%u, rebuilding clean query\n", 
-               pkt->ancount, pkt->nscount, pkt->arcount);
+        //printf("  [EDNS0] Client sent AN=%u NS=%u AR=%u, rebuilding clean query\n", 
+        //       pkt->ancount, pkt->nscount, pkt->arcount);
         
         // Calculate question section length
         int question_len = question_end - question_start;
@@ -168,8 +230,8 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
         pkt->nscount = 0;
         pkt->arcount = 0;
         
-        printf("  [EDNS0] Rebuilt clean query: %d bytes (was %zd bytes)\n", 
-               new_packet_len, recv_len);
+        //printf("  [EDNS0] Rebuilt clean query: %d bytes (was %zd bytes)\n", 
+        //       new_packet_len, recv_len);
     } else {
         // Normal query without EDNS0 - copy as-is
         pkt->request = malloc(recv_len);
@@ -293,67 +355,75 @@ struct Packet* parse_response(char* buffer, ssize_t recv_len) {
     pkt->rcode = pkt->flags & 0xF;
 
     // For responses, we don't need to parse the question section in detail
+    /*
     if (pkt->qdcount == 0) {
         fprintf(stderr, "Warning: Response has no question section\n");
     }
+    */
 
     // Parse domain from question section (for logging)
     if (pkt->qdcount > 0) {
         char domain[MAXLINE];
         memset(domain, 0, sizeof(domain));
-        
+
         int pos = HEADER_LEN;
         int domain_len = 0;
-        
+        bool qname_compressed = false;
+
         // Parse DNS label format
         while (pos < recv_len) {
             uint8_t label_len = (uint8_t)buffer[pos];
-            
+
             if (label_len == 0) {
                 break;
             }
-            
-            // Handle compression
+
+            // Handle compression pointer: 2 bytes total, no null terminator follows.
             if ((label_len & 0xC0) == 0xC0) {
-                // Skip compression pointer
                 pos += 2;
+                qname_compressed = true;
                 break;
             }
-            
+
             if (label_len > 63) {
                 break;
             }
-            
+
             if (domain_len > 0 && domain_len < MAXLINE - 1) {
                 domain[domain_len++] = '.';
             }
-            
+
             pos++;
-            
+
             if (pos + label_len > recv_len) {
                 break;
             }
-            
+
             if (domain_len + label_len >= MAXLINE) {
                 break;
             }
-            
+
             memcpy(domain + domain_len, buffer + pos, label_len);
             domain_len += label_len;
             pos += label_len;
         }
-        
+
         domain[domain_len] = '\0';
-        
+
         if (domain_len > 0) {
             pkt->full_domain = strdup(domain);
             parse_domain_components(pkt, domain);
         }
-        
-        // Parse question type and class if space available
-        pos++; // Skip null terminator
+
+        // Advance past the QNAME terminator.  For plain-label format the loop
+        // stops at the zero-length byte which we must skip.  For compressed
+        // names the compression pointer already consumed both bytes — there is
+        // no trailing null, so skip nothing extra.
+        if (!qname_compressed) {
+            pos++; // Skip null terminator
+        }
         if (pos + 4 <= recv_len) {
-            pkt->q_type = ntohs(*(uint16_t*)(buffer + pos));
+            pkt->q_type  = ntohs(*(uint16_t*)(buffer + pos));
             pkt->q_class = ntohs(*(uint16_t*)(buffer + pos + 2));
         }
     }

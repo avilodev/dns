@@ -1,6 +1,6 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -g -Isrc
-LDFLAGS = -pthread
+CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP
+LDFLAGS = -pthread -lssl -lcrypto
 
 # Directories
 SRC_DIR = src
@@ -12,7 +12,7 @@ SOURCES = main.c config.c thread_pool.c utils.c      \
           request.c resolve.c cache.c                \
 		  dns_wire.c dns_packet.c response_handler.c \
 		  cname_handler.c ns_resolver.c udp_client.c \
-		  ns_resolution_context.c
+		  ns_resolution_context.c dnssec.c
 
 # Full paths
 SRC_FILES = $(addprefix $(SRC_DIR)/, $(SOURCES))
@@ -49,10 +49,24 @@ rebuild: clean all
 run: $(TARGET)
 	sudo ./$(TARGET)
 
+# Install to /usr/local/sbin/upstream_dns
+INSTALL_BIN = /usr/local/sbin
+install: $(TARGET)
+	install -d $(INSTALL_BIN)
+	install -m 755 $(TARGET) $(INSTALL_BIN)/upstream_dns
+	@echo "Installed: $(INSTALL_BIN)/upstream_dns"
+
+uninstall:
+	rm -f $(INSTALL_BIN)/upstream_dns
+	@echo "Removed: $(INSTALL_BIN)/upstream_dns"
+
 # Debugging info
 debug:
 	@echo "Sources: $(SRC_FILES)"
 	@echo "Objects: $(OBJECTS)"
 	@echo "Target: $(TARGET)"
 
-.PHONY: all clean rebuild run debug directories
+# Auto-generated header dependency files (from -MMD -MP)
+-include $(OBJECTS:.o=.d)
+
+.PHONY: all clean rebuild run debug directories install uninstall

@@ -230,8 +230,8 @@ char* extract_ns_server_ip(struct Packet* response, const char* ns_name)
                 struct in_addr addr;
                 memcpy(&addr.s_addr, buffer + pos + 10, 4);
                 if (inet_ntop(AF_INET, &addr, ip, INET_ADDRSTRLEN)) {
-                    printf("    ✓ Found glue A record: %s -> %s\n", 
-                           record_name ? record_name : "unknown", ip);
+                    //printf("    Found glue A record: %s -> %s\n", 
+                    //       record_name ? record_name : "unknown", ip);
                     free(record_name);
                     return ip;
                 }
@@ -268,7 +268,7 @@ char* extract_ns_server_ip(struct Packet* response, const char* ns_name)
         if (name_matches && type == QTYPE_AAAA && rdlength == 16 && 
             pos + 10 + 16 <= buffer_len) {
             // Skip IPv6 for now since query_server() doesn't support it
-            printf("    ! Skipping IPv6 glue record (not supported yet)\n");
+            //printf("    ! Skipping IPv6 glue record (not supported yet)\n");
         }
         
         free(record_name);
@@ -324,7 +324,7 @@ char* extract_ns_name(struct Packet* response)
             int rdata_pos = pos + 10;
             char* ns_name = parse_dns_name_from_wire(buffer, buffer_len, rdata_pos);
             if (ns_name) {
-                printf("    ✓ Found NS name: %s\n", ns_name);
+                //printf("    ✓ Found NS name: %s\n", ns_name);
                 return ns_name;
             }
         }
@@ -426,7 +426,7 @@ NSCandidateList* extract_all_ns_with_glue(struct Packet* response)
                     memcpy(&addr.s_addr, buffer + pos + 10, 4);
                     if (inet_ntop(AF_INET, &addr, ip, INET_ADDRSTRLEN)) {
                         list->candidates[i].ns_ip = ip;
-                        printf("    ✓ Found glue: %s -> %s\n", record_name, ip);
+                        //printf("    Found glue: %s -> %s\n", record_name, ip);
                     } else {
                         free(ip);
                     }
@@ -452,6 +452,42 @@ void free_ns_candidate_list(NSCandidateList* list)
     
     free(list->candidates);
     free(list);
+}
+
+/**
+ * Extract the zone apex from the authority section of a referral.
+ * The owner name of the first NS record in the authority section IS the zone
+ * that the referral is for (e.g. "example.com" in a delegation to example.com).
+ * Caller must free the returned string.
+ */
+char* extract_zone_apex(struct Packet* response)
+{
+    if (!response || !response->request || response->recv_len < HEADER_LEN) return NULL;
+    if (response->nscount == 0) return NULL;
+
+    unsigned char* buffer = (unsigned char*)response->request;
+    int pos = HEADER_LEN;
+    int buffer_len = response->recv_len;
+
+    // Skip question section
+    for (int i = 0; i < response->qdcount && pos < buffer_len; i++) {
+        skip_dns_name(buffer, buffer_len, &pos);
+        pos += 4;
+    }
+
+    // Skip answer section
+    for (int i = 0; i < response->ancount && pos < buffer_len; i++) {
+        skip_dns_name(buffer, buffer_len, &pos);
+        if (pos + 10 > buffer_len) break;
+        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        pos += 10 + rdlength;
+    }
+
+    // The owner name of the first record in the authority section is the zone apex
+    if (pos < buffer_len) {
+        return parse_dns_name_from_wire(buffer, buffer_len, pos);
+    }
+    return NULL;
 }
 
 /**
@@ -516,9 +552,10 @@ struct Packet* build_root_hints_response(struct Packet* query)
     unsigned char* buf = (unsigned char*)response->request;
     int pos = 0;
     
-    // Copy header from query
+    // Copy full query (header + question) so skip_dns_name can navigate past QNAME
     if (query->request && query->recv_len >= HEADER_LEN) {
-        memcpy(buf, query->request, HEADER_LEN);
+        size_t copy_len = (size_t)query->recv_len < MAXLINE ? (size_t)query->recv_len : MAXLINE;
+        memcpy(buf, query->request, copy_len);
     }
     
     // Update header flags

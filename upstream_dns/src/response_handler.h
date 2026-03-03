@@ -36,6 +36,10 @@ NSCandidateList* extract_all_ns_with_glue(struct Packet* response);
 void free_ns_candidate_list(NSCandidateList* list);
 bool test_nameserver_reachable(const char* ns_ip, struct Packet* query);
 
+/* Return the zone apex (owner name of the first NS record in the authority
+   section of a referral response).  Caller must free the returned string. */
+char* extract_zone_apex(struct Packet* response);
+
 struct Packet* build_root_hints_response(struct Packet* query);
 
 #endif /* RESPONSE_HANDLER_H */

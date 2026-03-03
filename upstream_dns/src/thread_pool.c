@@ -243,8 +243,8 @@ int threadpool_add_work(struct ThreadPool* pool, work_func_t func, void* arg) {
     
     // Check queue size limit
     if (pool->max_queue_size > 0 && pool->queue_size >= pool->max_queue_size) {
-        pthread_mutex_unlock(&pool->queue_mutex);
         pool->rejected_work++;
+        pthread_mutex_unlock(&pool->queue_mutex);
         free(item);
         fprintf(stderr, "Work queue full, rejecting work\n");
         return -1;
@@ -326,11 +326,13 @@ void threadpool_destroy(struct ThreadPool* pool) {
         pthread_join(pool->threads[i], NULL);
     }
     
-    // Free remaining work items
+    /* Free remaining work items.  DO NOT free item->arg — each arg is a
+     * UDPQueryContext/TCPQueryContext whose sub-allocations we can't know.
+     * threadpool_wait() is always called before destroy, draining the queue,
+     * so this loop is dead code in practice. */
     struct WorkItem* item = pool->work_queue_head;
     while (item) {
         struct WorkItem* next = item->next;
-        free(item->arg);  // Assumes arg was malloc'd
         free(item);
         item = next;
     }
