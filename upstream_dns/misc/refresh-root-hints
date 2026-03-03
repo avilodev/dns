@@ -1,0 +1,51 @@
+#!/bin/bash
+# refresh-root-hints — download and install the current IANA root hints file.
+#
+# Install:
+#   sudo cp upstream_dns/misc/refresh-root-hints /etc/cron.daily/refresh-dns-root-hints
+#   sudo chmod +x /etc/cron.daily/refresh-dns-root-hints
+#
+# To trigger a reload without restarting, the upstream_dns server handles SIGHUP:
+#   kill -HUP $(pgrep -x dns)
+#
+# Can also be run manually: sudo bash upstream_dns/misc/refresh-root-hints
+
+set -euo pipefail
+
+URL="https://www.internic.net/domain/named.root"
+DEST="/home/avilo/dns/upstream_dns/misc/root_hints.txt"
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+
+# Download with a hard timeout
+if ! curl -fsSL --max-time 30 --retry 2 "$URL" -o "$TMP"; then
+    echo "refresh-root-hints: curl failed to fetch $URL" >&2
+    exit 1
+fi
+
+# Sanity check: file must reference at least one root server
+if ! grep -qE "ROOT-SERVERS\.NET" "$TMP"; then
+    echo "refresh-root-hints: downloaded file looks invalid (no ROOT-SERVERS.NET entry)" >&2
+    exit 1
+fi
+
+# Only replace the installed file if content actually changed
+if diff -q "$TMP" "$DEST" > /dev/null 2>&1; then
+    echo "refresh-root-hints: root hints already up to date"
+    exit 0
+fi
+
+cp "$TMP" "$DEST"
+echo "refresh-root-hints: root hints updated at $DEST"
+
+# Signal the running upstream_dns to reload hints (SIGHUP).
+# Tries a PID file first, then falls back to pgrep.
+PIDFILE="/run/upstream_dns.pid"
+if [ -f "$PIDFILE" ]; then
+    kill -HUP "$(cat "$PIDFILE")" 2>/dev/null && \
+        echo "refresh-root-hints: sent SIGHUP to upstream_dns (pid file)" || true
+else
+    pkill -HUP -x dns 2>/dev/null && \
+        echo "refresh-root-hints: sent SIGHUP to upstream_dns (pgrep)" || \
+        echo "refresh-root-hints: could not signal upstream_dns (not running?)"
+fi

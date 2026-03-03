@@ -1,6 +1,6 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -g -Isrc
-LDFLAGS = -pthread
+CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP
+LDFLAGS = -pthread -lssl -lcrypto
 
 # Directories
 SRC_DIR = src
@@ -9,7 +9,7 @@ BIN_DIR = bin
 
 # Source files (just the names)
 SOURCES = main.c auth.c logger.c request.c resolve.c \
-          response.c utils.c thread_pool.c
+          response.c utils.c thread_pool.c dnssec.c
 
 # Full paths
 SRC_FILES = $(addprefix $(SRC_DIR)/, $(SOURCES))
@@ -46,10 +46,24 @@ rebuild: clean all
 run: $(TARGET)
 	sudo ./$(TARGET)
 
+# Install to /usr/local/sbin/auth_dns
+INSTALL_BIN = /usr/local/sbin
+install: $(TARGET)
+	install -d $(INSTALL_BIN)
+	install -m 755 $(TARGET) $(INSTALL_BIN)/auth_dns
+	@echo "Installed: $(INSTALL_BIN)/auth_dns"
+
+uninstall:
+	rm -f $(INSTALL_BIN)/auth_dns
+	@echo "Removed: $(INSTALL_BIN)/auth_dns"
+
 # Debugging info
 debug:
 	@echo "Sources: $(SRC_FILES)"
 	@echo "Objects: $(OBJECTS)"
 	@echo "Target: $(TARGET)"
 
-.PHONY: all clean rebuild run debug directories
+# Auto-generated header dependency files (from -MMD -MP)
+-include $(OBJECTS:.o=.d)
+
+.PHONY: all clean rebuild run debug directories install uninstall

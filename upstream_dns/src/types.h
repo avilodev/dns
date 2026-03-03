@@ -17,9 +17,6 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include <openssl/err.h>
-
-
 #define VERSION "v2.1"
 /*
     1.0 - Basic Functionality
@@ -30,45 +27,49 @@
 #define MAXLINE 4096
 #define HEADER_LEN 12
 #define SOCKET_TIMEOUT 5
-#define MAX_INTERNAL_HOSTS 100
-
 #define DNS_PORT 53
 
 // DNS Query Types
-#define QTYPE_A 1
-#define QTYPE_NS 2
-#define QTYPE_CNAME 5
-#define QTYPE_SOA 6 
-#define QTYPE_PTR 12
-#define QTYPE_MX 15
-#define QTYPE_TXT 16
-#define QTYPE_AAAA 28
+#define QTYPE_A          1
+#define QTYPE_NS         2
+#define QTYPE_CNAME      5
+#define QTYPE_SOA        6
+#define QTYPE_PTR        12
+#define QTYPE_MX         15
+#define QTYPE_TXT        16
+#define QTYPE_AAAA       28
+#define QTYPE_SRV        33   // Service Locator (RFC 2782)
+#define QTYPE_DS         43   // Delegation Signer (RFC 4034)
+#define QTYPE_RRSIG      46   // Resource Record Signature (RFC 4034)
+#define QTYPE_NSEC       47   // Next Secure (RFC 4034)
+#define QTYPE_DNSKEY     48   // DNS Key (RFC 4034)
+#define QTYPE_NSEC3      50   // Next Secure v3 (RFC 5155)
+#define QTYPE_NSEC3PARAM 51   // NSEC3 Parameters (RFC 5155)
+#define QTYPE_ANY        255  // Any type (RFC 1035 §3.2.3)
 
 // DNS Response Codes
-#define RCODE_NO_ERROR 0
-#define RCODE_FORMAT_ERROR 1
+#define RCODE_NO_ERROR       0
+#define RCODE_FORMAT_ERROR   1
 #define RCODE_SERVER_FAILURE 2
-#define RCODE_NAME_ERROR 3
+#define RCODE_NAME_ERROR     3
+#define RCODE_NOTIMP         4
+#define RCODE_NOTAUTH        9   // Not Authoritative (RFC 2136)
+#define RCODE_BADVERS        16  // Bad OPT Version (RFC 6891)
 
 //Timeout for Parallel Queries
 #define TIMEOUT_PARALLEL_FAST 1    // Timeout for parallel queries
-#define TIMEOUT_SEQUENTIAL 2       // Timeout for sequential query 
+#define TIMEOUT_SEQUENTIAL 2       // Timeout for sequential query
 #define MAX_PARALLEL_QUERIES 3     // Query 3 servers simultaneously
-#define SOCKET_TIMEOUT 5           // Timeout
 
 #define SERVER_PATH "/home/avilo/dns/upstream_dns"
 #define HINTS_FILE "/misc/root_hints.txt"
-#define LOG_FILE_PATH "/server.log"
+#define LOG_FILE_PATH "/home/avilo/dns/logs/upstream.log"
 
 #define PORT 5335
 #define NUM_THREADS 20
 #define QUEUE_SIZE 100
 
-#define SEED_RANDOM() do { \
-    struct timeval tv; \
-    gettimeofday(&tv, NULL); \
-    srand(tv.tv_usec ^ getpid()); \
-} while(0)
+/* SEED_RANDOM removed — TX IDs use getrandom(), srand() is not needed. */
 
 struct Packet {
     char* request;
@@ -102,6 +103,12 @@ struct Packet {
 
     uint16_t q_type;   // Query type
     uint16_t q_class;  // Query class (1=IN)
+
+    // EDNS0 fields (RFC 6891) — populated by parse_request_headers()
+    bool     edns_present;    // Client sent an OPT record
+    uint8_t  edns_version;    // Client's EDNS version (must be 0)
+    uint16_t edns_udp_size;   // Client's advertised UDP payload size
+    bool     do_bit;          // DNSSEC OK bit from client OPT
 };
 
 typedef struct ServerConfig {

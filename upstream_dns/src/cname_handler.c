@@ -128,7 +128,7 @@ struct Packet* reconstruct_cname_response(
         return final_answer;
     }
     
-    printf("→ Reconstructing CNAME chain (%d hops) with compression\n", chain_data->count);
+    //printf("→ Reconstructing CNAME chain (%d hops) with compression\n", chain_data->count);
     
     // Allocate new response packet
     struct Packet* reconstructed = calloc(1, sizeof(struct Packet));
@@ -214,7 +214,7 @@ struct Packet* reconstruct_cname_response(
     int name_len = write_dns_name(original_query->full_domain, buffer, 
                                   buffer_size, pos);
     if (name_len < 0) {
-        fprintf(stderr, "✗ Failed to write question name\n");
+        fprintf(stderr, "Failed to write question name\n");
         free(reconstructed->request);
         free(reconstructed->full_domain);
         free(reconstructed);
@@ -233,10 +233,10 @@ struct Packet* reconstruct_cname_response(
     
     // Answer with CNAME compression
     for (int i = 0; i < chain_data->count; i++) {
-        printf("  Adding CNAME #%d: %s -> %s\n", 
-               i + 1, 
-               chain_data->entries[i].name ? chain_data->entries[i].name : "?",
-               chain_data->entries[i].target ? chain_data->entries[i].target : "?");
+       // printf("  Adding CNAME #%d: %s -> %s\n", 
+       //        i + 1, 
+       //        chain_data->entries[i].name ? chain_data->entries[i].name : "?",
+       //        chain_data->entries[i].target ? chain_data->entries[i].target : "?");
         
         if (!chain_data->entries[i].name || !chain_data->entries[i].target) {
             continue;
@@ -301,14 +301,14 @@ struct Packet* reconstruct_cname_response(
     }
     
     // Answer section 
-    // Note: Even if ancount=0 (NODATA), still need to preserve the response flags
-    if (final_answer->request) {
+    // Even if ancount=0 (NODATA), still need to preserve the response flags
+    //if (final_answer->request) {
         // For NODATA (ancount=0), we just show the CNAME chain
         // The AA and RCODE flags are already set in the header
-        if (final_answer->ancount == 0) {
-            printf("  Final answer is NODATA (ancount=0), will include authority section\n");
-        }
-    }
+        //if (final_answer->ancount == 0) {
+        //    printf("  Final answer is NODATA (ancount=0), will include authority section\n");
+        //}
+    //}
     
     if (final_answer->ancount > 0 && final_answer->request) {
         unsigned char* final_buffer = (unsigned char*)final_answer->request;
@@ -330,7 +330,7 @@ struct Packet* reconstruct_cname_response(
                                                         final_answer->recv_len, 
                                                         final_pos);
             if (!owner_name) {
-                fprintf(stderr, "✗ Failed to parse owner name for answer RR %d\n", i);
+                fprintf(stderr, "Failed to parse owner name for answer RR %d\n", i);
                 break;
             }
             
@@ -365,13 +365,13 @@ struct Packet* reconstruct_cname_response(
             free(owner_name);
             
             if (name_len < 0) {
-                fprintf(stderr, "✗ Failed to write owner name\n");
+                fprintf(stderr, "Failed to write owner name\n");
                 break;
             }
             pos += name_len;
             
             if (pos + 10 + rdlength > buffer_size) {
-                fprintf(stderr, "✗ Buffer overflow prevented\n");
+                fprintf(stderr, "Buffer overflow prevented\n");
                 break;
             }
             
@@ -416,7 +416,7 @@ struct Packet* reconstruct_cname_response(
                     free(rdata_name);
                     
                     if (rdata_name_len < 0) {
-                        fprintf(stderr, "✗ Failed to write RDATA name\n");
+                        fprintf(stderr, "Failed to write RDATA name\n");
                         break;
                     }
                     pos += rdata_name_len;
@@ -439,7 +439,7 @@ struct Packet* reconstruct_cname_response(
             final_pos += rdlength;
         }
         
-        printf("  Added %u final answer record(s)\n", final_answer->ancount);
+        //("  Added %u final answer record(s)\n", final_answer->ancount);
     }
     
     // Authority
@@ -468,7 +468,7 @@ struct Packet* reconstruct_cname_response(
                                                         final_answer->recv_len, 
                                                         final_pos);
             if (!owner_name) {
-                fprintf(stderr, "✗ Failed to parse authority RR owner name\n");
+                fprintf(stderr, "Failed to parse authority RR owner name\n");
                 break;
             }
             
@@ -580,19 +580,19 @@ struct Packet* reconstruct_cname_response(
             final_pos += rdlength;
         }
         
-        printf("  Added %u authority record(s) (SOA for NODATA)\n", final_answer->nscount);
+        //printf("  Added %u authority record(s) (SOA for NODATA)\n", final_answer->nscount);
     }
     
     reconstructed->recv_len = pos;
     reconstructed->ancount = total_answers;
     reconstructed->nscount = nscount;
     
-    printf("✓ Reconstructed response: %ld bytes, %u answers + %u authority\n",
-           pos, total_answers, nscount);
+    //printf("✓ Reconstructed response: %ld bytes, %u answers + %u authority\n",
+           //pos, total_answers, nscount);
     
     // Check if response exceeds UDP limit
     if (pos > 512) {
-        printf("⚠ Warning: Response size %ld bytes exceeds UDP limit (512 bytes)\n", pos);
+        //printf("Warning: Response size %ld bytes exceeds UDP limit (512 bytes)\n", pos);
         reconstructed->tc = 1;  // Set truncation bit
         // Update TC bit in buffer
         buffer[2] |= 0x02;

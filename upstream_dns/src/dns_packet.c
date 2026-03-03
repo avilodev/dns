@@ -151,10 +151,12 @@ int construct_dns_packet(struct Packet* pkt)
         *ptr++ = 0x10;
         *ptr++ = 0x00;
         
-        // TTL: Extended RCODE and flags (4 bytes, all zeros)
+        // TTL: Extended RCODE and flags (4 bytes)
+        // Byte 0: extended RCODE, Byte 1: EDNS version
+        // Bytes 2-3: EDNS flags — bit 15 (0x8000) = DO (DNSSEC OK)
         *ptr++ = 0x00;
         *ptr++ = 0x00;
-        *ptr++ = 0x00;
+        *ptr++ = 0x80;  // DO bit set: request DNSSEC records
         *ptr++ = 0x00;
         
         // RDLENGTH: 0 - no EDNS options (2 bytes)
@@ -195,8 +197,7 @@ int free_packet(struct Packet* pkt) {
     if(pkt->top_level_domain)
         free(pkt->top_level_domain);
 
-    if(pkt)
-        free(pkt);
+    free(pkt);
 
     return 0;
 }

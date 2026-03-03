@@ -1,3 +1,6 @@
 logs/
 .vscode/
 .git/
+testing/
+http_server/keys
+upstream_dns/config
