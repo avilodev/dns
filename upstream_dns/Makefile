@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP
-LDFLAGS = -pthread -lssl -lcrypto
+LDFLAGS = -pthread -lssl -lcrypto -latomic
 
 # Directories
 SRC_DIR = src
