@@ -1,5 +1,7 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP
+CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP \
+         -DSERVER_PATH='"$(abspath .)"' \
+         -DLOG_FILE_PATH='"$(abspath ..)/logs/server.log"'
 LDFLAGS = -pthread -lssl -lcrypto -latomic
 
 # Directories

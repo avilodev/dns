@@ -54,9 +54,13 @@
 #define RCODE_NOTAUTH       9   // Not Authoritative (RFC 2136)
 #define RCODE_BADVERS       16  // Bad OPT Version (RFC 6891)
 
+#ifndef SERVER_PATH
 #define SERVER_PATH "/home/avilo/dns/auth_dns"
+#endif
+#ifndef LOG_FILE_PATH
+#define LOG_FILE_PATH "/home/avilo/dns/logs/server.log"
+#endif
 #define AUTH_FILE_PATH "/misc/auth_domains.txt"
-#define LOG_FILE_PATH "/home/avilo/dns/logs/server.log" 
 
 #define DEFAULT_UPSTREAM_DNS "1.1.1.1"
 #define UPSTREAM_PORT 53

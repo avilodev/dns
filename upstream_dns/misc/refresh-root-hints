@@ -1,19 +1,10 @@
 #!/bin/bash
 # refresh-root-hints — download and install the current IANA root hints file.
-#
-# Install:
-#   sudo cp upstream_dns/misc/refresh-root-hints /etc/cron.daily/refresh-dns-root-hints
-#   sudo chmod +x /etc/cron.daily/refresh-dns-root-hints
-#
-# To trigger a reload without restarting, the upstream_dns server handles SIGHUP:
-#   kill -HUP $(pgrep -x dns)
-#
-# Can also be run manually: sudo bash upstream_dns/misc/refresh-root-hints
 
 set -euo pipefail
 
 URL="https://www.internic.net/domain/named.root"
-DEST="/home/avilo/dns/upstream_dns/misc/root_hints.txt"
+DEST="@HINTS_DEST@"
 TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
 

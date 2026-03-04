@@ -56,9 +56,13 @@
 #define TIMEOUT_SEQUENTIAL 2       // Timeout for sequential query
 #define MAX_PARALLEL_QUERIES 3     // Query 3 servers simultaneously
 
+#ifndef SERVER_PATH
 #define SERVER_PATH "/home/avilo/dns/upstream_dns"
-#define HINTS_FILE "/misc/root_hints.txt"
+#endif
+#ifndef LOG_FILE_PATH
 #define LOG_FILE_PATH "/home/avilo/dns/logs/upstream.log"
+#endif
+#define HINTS_FILE "/misc/root_hints.txt"
 
 #define PORT 5335
 #define NUM_THREADS 20
