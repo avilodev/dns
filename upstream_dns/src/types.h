@@ -18,11 +18,6 @@
 #include <arpa/inet.h>
 
 #define VERSION "v2.1"
-/*
-    1.0 - Basic Functionality
-    2.0 - Full Functionality
-    2.1 - Parallel Requests
-*/
 
 #define MAXLINE 4096
 #define HEADER_LEN 12
@@ -56,7 +51,7 @@
 #define RCODE_NOTAUTH        9   // Not Authoritative (RFC 2136)
 #define RCODE_BADVERS        16  // Bad OPT Version (RFC 6891)
 
-//Timeout for Parallel Queries
+// Timeouts and concurrency limits for parallel query strategies
 #define TIMEOUT_PARALLEL_FAST 1    // Timeout for parallel queries
 #define TIMEOUT_SEQUENTIAL 2       // Timeout for sequential query
 #define MAX_PARALLEL_QUERIES 3     // Query 3 servers simultaneously
@@ -68,8 +63,6 @@
 #define PORT 5335
 #define NUM_THREADS 20
 #define QUEUE_SIZE 100
-
-/* SEED_RANDOM removed — TX IDs use getrandom(), srand() is not needed. */
 
 struct Packet {
     char* request;

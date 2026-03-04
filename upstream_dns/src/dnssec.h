@@ -2,21 +2,18 @@
 #define DNSSEC_H
 
 /*
- * DNSSEC validation skeleton for upstream_dns.
+ * DNSSEC response validation for upstream_dns.
  *
- * Implementation is stubbed — functions return -1 (not yet implemented).
- * Full implementation requires:
- *   1. Walking the chain of trust from root anchors down to the queried zone.
- *   2. Verifying RRSIG records against the matching DNSKEY (via OpenSSL EVP).
- *   3. Validating DS records link parent zone DNSKEY to child zone DNSKEY.
- *   4. Returning SERVFAIL to client when validation fails (RFC 4035 §5.5).
+ * Verifies RRSIG records against DNSKEY records using OpenSSL EVP,
+ * anchored at the root trust anchor loaded at startup.
+ * Returns SERVFAIL to the client when validation fails (RFC 4035 §5.5).
  *
- * Algorithms to support (per plan):
- *   8  = RSASHA256   (RFC 5702)
- *   10 = RSASHA512   (RFC 5702)
- *   13 = ECDSAP256SHA256 (RFC 6605)
- *   14 = ECDSAP384SHA384 (RFC 6605)
- *   15 = Ed25519     (RFC 8080)
+ * Supported algorithms:
+ *   8  = RSASHA256        (RFC 5702)
+ *   10 = RSASHA512        (RFC 5702)
+ *   13 = ECDSAP256SHA256  (RFC 6605)
+ *   14 = ECDSAP384SHA384  (RFC 6605)
+ *   15 = Ed25519          (RFC 8080)
  */
 
 #include "types.h"
@@ -28,7 +25,7 @@
  * rrset_data / rrset_len: canonical wire-format RRset to be signed.
  * Returns  1 on successful verification,
  *          0 on signature mismatch,
- *         -1 on unsupported algorithm or internal error (stub).
+ *         -1 on unsupported algorithm or internal error.
  */
 int dnssec_verify_rrsig(const RrsigRdata* rrsig,
                         const DnskeyRdata* dnskey,

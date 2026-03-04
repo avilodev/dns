@@ -29,23 +29,16 @@ char* resolve_ns_name_internal(const char* ns_name, uint16_t qtype,
     
     // Check depth limit
     if (context->depth >= MAX_NS_RESOLUTION_DEPTH) {
-        //fprintf(stderr, "    [NS Resolution] ✗ Maximum depth (%d) reached for %s\n",
-        //        MAX_NS_RESOLUTION_DEPTH, ns_name);
         return NULL;
     }
-    
+
     // Check for resolution loop
     if (already_resolving_ns(context, ns_name)) {
-        //fprintf(stderr, "    [NS Resolution] ✗ Loop detected for %s\n", ns_name);
         return NULL;
     }
-    
-    //printf("    [NS Resolution] Resolving %s for %s record (depth=%d)\n", 
-    //       ns_name, qtype_to_string(qtype), context->depth);
-    
+
     // Add to context
     if (!add_ns_to_context(context, ns_name)) {
-        //fprintf(stderr, "    [NS Resolution] ✗ Failed to track %s\n", ns_name);
         return NULL;
     }
     
@@ -94,15 +87,6 @@ char* resolve_ns_name_internal(const char* ns_name, uint16_t qtype,
     // Extract IP from answer section
     char* ip = extract_ip_from_answer(ns_response, qtype);
     free_packet(ns_response);
-    
-    /*
-    if (ip) {
-        printf("    [NS Resolution] ✓ Resolved %s -> %s\n", ns_name, ip);
-    } else {
-        fprintf(stderr, "    [NS Resolution] ✗ No IP found for %s\n", ns_name);
-    }
-    */
-    
     return ip;
 }
 

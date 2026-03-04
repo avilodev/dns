@@ -11,18 +11,10 @@ static void init_default_config(void) {
 }
 
 /**
- * Updates the arguments for the server startup configuration.
- * 
- * Calls init_default_config() to set default server configuration, then
- * update webroot, ports, and thread sizes through server flags. If a 
- * parameter is unknown, it returns an error. Otherwise successful.
- * 
- * @param argc Counts how many argument were passed in when executed
- * @param argv Stores the arguments passed in on execution
+ * Parse command-line arguments and populate the server configuration.
  *
- * @return 0 on successful updates, -1 on unknown parameters.
- *
- * @see init_default_config()
+ * Initializes defaults then applies -p (port), -t (thread count),
+ * and -q (queue size) flags. Returns -1 on unrecognized flags.
  */
 int load_config(int argc, char** argv) {
     // Initialize defaults
@@ -67,7 +59,6 @@ int load_config(int argc, char** argv) {
  *
  * @return File Descriptor for the new socket opened
  *
- * @note This function is called by both the HTTP and HTTPS sockets
  * @warning Caller must close() the returned socket when done
  */
 int create_server_socket(int port) {
