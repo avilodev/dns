@@ -41,18 +41,10 @@ static const char* rcode_name(uint8_t rcode) {
     }
 }
 
-/**
+/*
  * Log a DNS query result (thread-safe).
- * Keeps log file descriptor open across calls to avoid per-query open/close overhead.
- *
+ * Keeps the log fd open for the server's lifetime to avoid per-query open/close overhead.
  * Format: [timestamp] client_ip:port QTYPE domain RCODE [-> info]
- *
- * @param client_ip  Source IP of the client
- * @param port       Source port of the client
- * @param qtype      DNS QTYPE (e.g. 1=A, 28=AAAA, 15=MX)
- * @param domain     Queried domain name (may be NULL)
- * @param rcode      DNS response code (e.g. 0=NOERROR, 3=NXDOMAIN)
- * @param info       Extra info to append after "->" (e.g. resolved IP); may be NULL
  */
 int log_entry(const char* client_ip, uint16_t port, uint16_t qtype,
               const char* domain, uint8_t rcode, const char* info) {

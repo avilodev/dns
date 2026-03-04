@@ -10,20 +10,7 @@ static void init_default_config(void) {
     g_config.queue_size = QUEUE_SIZE;
 }
 
-/**
- * Updates the arguments for the server startup configuration.
- * 
- * Calls init_default_config() to set default server configuration, then
- * update webroot, ports, and thread sizes through server flags. If a 
- * parameter is unknown, it returns an error. Otherwise successful.
- * 
- * @param argc Counts how many argument were passed in when executed
- * @param argv Stores the arguments passed in on execution
- *
- * @return 0 on successful updates, -1 on unknown parameters.
- *
- * @see init_default_config()
- */
+/* Parse command-line flags (-p/-t/-u/-q) into g_config. Returns 0 on success, -1 on unknown flag. */
 int load_config(int argc, char** argv) {
     // Initialize defaults
     init_default_config();
@@ -54,7 +41,7 @@ int load_config(int argc, char** argv) {
     return 0;
 }
 
-/**
+/*
  * Write a domain name (e.g. "mail.example.com") into DNS wire-format label
  * encoding at buf[*pos], advancing *pos.  Each dot-separated label is written
  * as: <length-byte> <label-bytes>.  A final zero-length byte terminates the name.
@@ -75,9 +62,9 @@ void write_dns_labels(const char* name, char* buf, int* pos) {
     buf[(*pos)++] = 0;  // Null terminator
 }
 
-/**
- * Extract ALL IP addresses from DNS response packet
- * Returns comma-separated IPs, record type info, or NULL if error
+/*
+ * Extract IP addresses from a DNS response packet.
+ * Returns comma-separated IPs, a record type label (e.g. "MX_RECORD"), or NULL.
  */
 char* extract_ip_from_response(struct Packet* response) {
     if (!response || !response->request || response->recv_len < HEADER_LEN) {
@@ -117,7 +104,7 @@ char* extract_ip_from_response(struct Packet* response) {
     // Build result with all IPs
     char result[1024] = "";
     int ip_count = 0;
-    uint16_t first_non_ip_type = 0;  //Tracks first either A or AAAA
+    uint16_t first_non_ip_type = 0;  /* first non-A/AAAA record type seen */
 
     // Parse answer section
     for (int i = 0; i < ancount && ptr < end; i++) {
@@ -211,9 +198,7 @@ char* extract_ip_from_response(struct Packet* response) {
     return NULL;
 }
 
-/**
- * Print packet information for debugging
- */
+/* Print packet header fields (for debugging). */
 void print_packet_info(const char* label, struct Packet* pkt) {
     if (!pkt) {
         return;
@@ -234,9 +219,7 @@ void print_packet_info(const char* label, struct Packet* pkt) {
     printf("========================\n\n");
 }
 
-/**
- * Print hex dump of data
- */
+/* Print a hex dump of data (for debugging). */
 void print_hex_dump(const char* data, ssize_t len) {
     printf("Hex dump (%zd bytes): ", len);
     for (ssize_t i = 0; i < len && i < 4096; i++) {
@@ -251,9 +234,7 @@ void print_hex_dump(const char* data, ssize_t len) {
     printf("\n");
 }
 
-/**
- * Free packet structure and all allocated memory
- */
+/* Free a Packet and all its heap-allocated fields. */
 int free_packet(struct Packet* pkt) {
     if (!pkt) {
         return -1;

@@ -5,7 +5,7 @@
 
 int load_config(int argc, char** argv);
 
-/**
+/*
  * Write a domain name in DNS wire-format label encoding.
  * e.g. "mail.example.com" -> \x04mail\x07example\x03com\x00
  * Appends a null-terminator label at the end.
