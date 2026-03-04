@@ -39,7 +39,7 @@ static void append_soa_authority(char* buf, int* pos, const struct AuthDomain* s
 }
 
 
-/**
+/*
  * Send DNS response to client over UDP.
  * Works for both IPv4 (sockaddr_in) and IPv6 (sockaddr_in6) clients.
  */
@@ -67,7 +67,7 @@ int send_response(int sock, struct Packet* response,
     return 0;
 }
 
-/**
+/*
  * Send DNS response over an established TCP connection.
  * DNS-over-TCP prepends a 2-byte big-endian message length.
  */
@@ -105,7 +105,7 @@ int send_tcp_response(int fd, struct Packet* response) {
     return 0;
 }
 
-/**
+/*
  * Build NXDOMAIN response (domain does not exist).
  * soa: if non-NULL, a SOA record is added to the authority section (RFC 2308).
  */
@@ -175,7 +175,7 @@ struct Packet* build_nxdomain_response(struct Packet* request,
     return response;
 }
 
-/**
+/*
  * Build NODATA response (domain exists, but no records of the requested type).
  * AA=1, RCODE=NOERROR, ancount=0.
  * soa: if non-NULL, a SOA record is added to the authority section (RFC 2308).
@@ -244,9 +244,7 @@ struct Packet* build_nodata_response(struct Packet* request,
     return response;
 }
 
-/**
- * Build SERVFAIL response (RCODE=2, server failure)
- */
+/* Build SERVFAIL response (RCODE=2, server failure). */
 struct Packet* build_servfail_response(struct Packet* request) {
     if (!request) {
         return NULL;
@@ -303,7 +301,7 @@ struct Packet* build_servfail_response(struct Packet* request) {
     return response;
 }
 
-/**
+/*
  * Build BADVERS response (extended RCODE=16, RFC 6891 §6.1.3).
  * Sent when the client uses an EDNS version > 0 that we don't support.
  * Header RCODE = 0; extended RCODE = 16 lives in the OPT RR TTL high byte.

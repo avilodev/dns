@@ -3,12 +3,8 @@
 
 static void parse_domain_components(struct Packet* pkt, const char* domain);
 
-/**
- * Parse DNS request headers and question section
- * @param buffer Raw DNS packet buffer
- * @param recv_len Length of received data
- * @return Parsed packet structure or NULL on error
- */
+/* Parse a raw DNS request buffer into a Packet struct.
+ * Returns the populated Packet, or NULL if the request is malformed. */
 struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
     if (!buffer) {
         fprintf(stderr, "Error: NULL buffer provided\n");
@@ -195,9 +191,7 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
     return pkt;
 }
 
-/**
- * Parse domain into TLD, domain, and subdomain components
- */
+/* Split a FQDN into top_level_domain, domain, and authoritative_domain components. */
 static void parse_domain_components(struct Packet* pkt, const char* domain) {
     if (!pkt || !domain) {
         return;

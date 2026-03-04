@@ -3,11 +3,7 @@
 
 extern Config g_config;
 
-/**
- * Resolve DNS query recursively using upstream DNS server 
- * @param pkt Parsed DNS request
- * @return Response packet from upstream server or NULL on error
- */
+/* Forward pkt to the configured upstream DNS server and return the response, or NULL on error. */
 struct Packet* resolve_recursive(struct Packet* pkt) {
     if (!pkt || !pkt->request) {
         fprintf(stderr, "Error: Invalid packet for recursive resolution\n");
