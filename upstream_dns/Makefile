@@ -1,5 +1,7 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP
+CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP \
+         -DSERVER_PATH='"$(abspath .)"' \
+         -DLOG_FILE_PATH='"$(abspath ..)/logs/upstream.log"'
 LDFLAGS = -pthread -lssl -lcrypto -latomic
 
 # Directories
@@ -60,6 +62,22 @@ uninstall:
 	rm -f $(INSTALL_BIN)/upstream_dns
 	@echo "Removed: $(INSTALL_BIN)/upstream_dns"
 
+# Install the root-hints refresh cron script to /etc/cron.daily/,
+# substituting @HINTS_DEST@ with the current absolute path to root_hints.txt.
+CRON_DAILY   = /etc/cron.daily
+CRON_SCRIPT  = $(CRON_DAILY)/refresh-root-hints
+HINTS_DEST   = $(abspath .)/misc/root_hints.txt
+
+install-cron:
+	sed 's|@HINTS_DEST@|$(HINTS_DEST)|g' misc/refresh-root-hints \
+	    > $(CRON_SCRIPT)
+	chmod 755 $(CRON_SCRIPT)
+	@echo "Installed: $(CRON_SCRIPT) (DEST=$(HINTS_DEST))"
+
+uninstall-cron:
+	rm -f $(CRON_SCRIPT)
+	@echo "Removed: $(CRON_SCRIPT)"
+
 # Debugging info
 debug:
 	@echo "Sources: $(SRC_FILES)"
@@ -69,4 +87,4 @@ debug:
 # Auto-generated header dependency files (from -MMD -MP)
 -include $(OBJECTS:.o=.d)
 
-.PHONY: all clean rebuild run debug directories install uninstall
+.PHONY: all clean rebuild run debug directories install uninstall install-cron uninstall-cron
