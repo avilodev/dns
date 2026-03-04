@@ -61,6 +61,7 @@ void answer_cache_cleanup_expired(AnswerCache* cache);
 
 // Utility functions
 uint32_t extract_min_ttl_from_response(struct Packet* response);
+uint32_t extract_referral_ns_ttl(struct Packet* response);
 void print_cache_stats(NSCache* ns_cache, AnswerCache* answer_cache);
 
 #endif /* CACHE_H */

@@ -20,7 +20,7 @@ int get_random_server()
     return rand() % 13;
 }
 
-/**
+/*
  * Convert QTYPE to name string.  Returns NULL for unrecognised types so
  * callers can fall back to a "TYPE%u" numeric format.
  */

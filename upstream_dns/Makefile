@@ -35,8 +35,8 @@ $(TARGET): $(OBJECTS)
 	$(CC) $(OBJECTS) -o $(TARGET) $(LDFLAGS)
 	@echo "Build complete: $(TARGET)"
 
-# Compile source files to object files
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
+# Compile source files to object files (| directories = order-only: create dirs first)
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | directories
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Clean build artifacts
@@ -51,16 +51,10 @@ rebuild: clean all
 run: $(TARGET)
 	sudo ./$(TARGET)
 
-# Install to /usr/local/sbin/upstream_dns
-INSTALL_BIN = /usr/local/sbin
-install: $(TARGET)
-	install -d $(INSTALL_BIN)
-	install -m 755 $(TARGET) $(INSTALL_BIN)/upstream_dns
-	@echo "Installed: $(INSTALL_BIN)/upstream_dns"
+# Install cron script to /etc/cron.daily/ (requires root)
+install: install-cron
 
-uninstall:
-	rm -f $(INSTALL_BIN)/upstream_dns
-	@echo "Removed: $(INSTALL_BIN)/upstream_dns"
+uninstall: uninstall-cron
 
 # Install the root-hints refresh cron script to /etc/cron.daily/,
 # substituting @HINTS_DEST@ with the current absolute path to root_hints.txt.

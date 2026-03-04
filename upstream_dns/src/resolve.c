@@ -19,8 +19,8 @@ extern TrustAnchor* g_trust_anchors;
  * to prevent g_ns_cache being destroyed under us during a SIGHUP swap. */
 extern pthread_rwlock_t g_ns_cache_rwlock;
 
-/**
- * Public entry point for DNS resolution
+/*
+ * Public entry point for DNS resolution.
  * Holds g_ns_cache rdlock for the lifetime of the resolution call so the
  * SIGHUP handler cannot free the old cache while we are using it.
  */
@@ -34,9 +34,7 @@ struct Packet* send_resolver(struct Packet* query)
     return result;
 }
 
-/**
- * Public entry point with NS context (for NS resolution)
- */
+/* Public entry point with NS context (for NS name resolution). */
 struct Packet* send_resolver_with_ns_context(struct Packet* query,
                                              NSResolutionContext* ns_context)
 {
@@ -48,9 +46,7 @@ struct Packet* send_resolver_with_ns_context(struct Packet* query,
     return result;
 }
 
-/**
- * Internal resolver with CNAME and NS tracking
- */
+/* Internal resolver: handles CNAME following, NS referral walking, and caching. */
 struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                                      CnameChain* chain,
                                      NSResolutionContext* ns_context)
@@ -126,7 +122,8 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
     // Deferred NS caching: record the zone apex at referral time but only
     // write the cache entry once query_server succeeds, so we never store an
     // unreachable IP in the NS cache.
-    char* pending_cache_key = NULL;
+    char*    pending_cache_key = NULL;
+    uint32_t pending_cache_ttl = DEFAULT_NS_TTL; /* actual NS TTL from referral */
 
 // Free pending_ns_list and pending_cache_key without touching anything else.
 #define RESOLVE_CLEANUP() do { \
@@ -224,7 +221,7 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
         // query_server succeeded: commit the pending NS cache entry using the
         // IP that actually responded, then clear it.
         if (g_ns_cache && pending_cache_key) {
-            ns_cache_put(g_ns_cache, pending_cache_key, current_server_ip, DEFAULT_NS_TTL);
+            ns_cache_put(g_ns_cache, pending_cache_key, current_server_ip, pending_cache_ttl);
             free(pending_cache_key);
             pending_cache_key = NULL;
         }
@@ -520,6 +517,9 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                 }
             }
 
+            /* Capture the actual NS TTL before freeing the referral response. */
+            pending_cache_ttl = extract_referral_ns_ttl(response);
+
             free(current_server_ip);
             current_server_ip = next_server_ip;
             free_packet(response);
@@ -547,7 +547,7 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
 #undef RESOLVE_CLEANUP
 }
 
-/**
+/*
  * Check if server was already queried (referral loop detection)
  */
 bool already_queried(ServerHistory* history, const char* server)
@@ -562,7 +562,7 @@ bool already_queried(ServerHistory* history, const char* server)
     return false;
 }
 
-/**
+/*
  * Free server history memory
  */
 void free_server_history(ServerHistory* history)

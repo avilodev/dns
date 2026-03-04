@@ -1,7 +1,7 @@
 #include "ns_resolution_context.h"
 #include "response_handler.h"
 
-/**
+/*
  * Initialize NS resolution context
  */
 void init_ns_context(NSResolutionContext* context)
@@ -13,7 +13,7 @@ void init_ns_context(NSResolutionContext* context)
     context->depth = 0;
 }
 
-/**
+/*
  * Check if NS name is already being resolved
  */
 bool already_resolving_ns(NSResolutionContext* context, const char* ns_name)
@@ -28,7 +28,7 @@ bool already_resolving_ns(NSResolutionContext* context, const char* ns_name)
     return false;
 }
 
-/**
+/*
  * Add NS name to resolution context
  */
 bool add_ns_to_context(NSResolutionContext* context, const char* ns_name)
@@ -53,7 +53,7 @@ bool add_ns_to_context(NSResolutionContext* context, const char* ns_name)
     return true;
 }
 
-/**
+/*
  * Remove NS name from resolution context
  */
 void remove_ns_from_context(NSResolutionContext* context, const char* ns_name)
@@ -76,7 +76,7 @@ void remove_ns_from_context(NSResolutionContext* context, const char* ns_name)
     }
 }
 
-/**
+/*
  * Free NS resolution context
  */
 void free_ns_context(NSResolutionContext* context)

@@ -3,7 +3,7 @@
 #include "resolve.h"        
  
 
-/**
+/*
  * Resolve a nameserver name to an IP address
  */
 char* resolve_ns_name(const char* ns_name, uint16_t qtype)
@@ -19,7 +19,7 @@ char* resolve_ns_name(const char* ns_name, uint16_t qtype)
     return result;
 }
 
-/**
+/*
  * Internal NS resolution with depth and loop tracking
  */
 char* resolve_ns_name_internal(const char* ns_name, uint16_t qtype, 
@@ -90,7 +90,7 @@ char* resolve_ns_name_internal(const char* ns_name, uint16_t qtype,
     return ip;
 }
 
-/**
+/*
  * Extract TLD from domain name
  */
 char* get_tld_from_domain(const char* domain)

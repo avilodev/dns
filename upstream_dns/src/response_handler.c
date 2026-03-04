@@ -1,7 +1,7 @@
 #include "response_handler.h"
 
 
-/**
+/*
  * Check if response contains only CNAME (no final answer)
  */
 bool is_cname_only_answer(struct Packet* response, uint16_t original_qtype)
@@ -48,7 +48,7 @@ bool is_cname_only_answer(struct Packet* response, uint16_t original_qtype)
     return has_cname && !has_final;
 }
 
-/**
+/*
  * Extract CNAME target from answer section
  */
 char* extract_cname_target(struct Packet* response)
@@ -95,7 +95,7 @@ char* extract_cname_target(struct Packet* response)
     return NULL;
 }
 
-/**
+/*
  * Extract IP address (A or AAAA) from answer section
  */
 char* extract_ip_from_answer(struct Packet* response, uint16_t qtype)
@@ -161,7 +161,7 @@ char* extract_ip_from_answer(struct Packet* response, uint16_t qtype)
     return NULL;
 }
 
-/**
+/*
  * Extract nameserver IP from additional section (glue records)
  * Validates that the glue record matches the NS name
  */
@@ -201,8 +201,7 @@ char* extract_ns_server_ip(struct Packet* response, const char* ns_name)
         pos += 10 + rdlength;
     }
 
-    // Parse additional section - prefer IPv4 (A records)
-    int saved_pos = pos;
+    /* Parse additional section for A glue records (IPv4 only). */
     for (int i = 0; i < response->arcount && pos < buffer_len; i++) {
         char* record_name = parse_dns_name_from_wire(buffer, buffer_len, pos);
         
@@ -241,38 +240,12 @@ char* extract_ns_server_ip(struct Packet* response, const char* ns_name)
         pos += 10 + rdlength;
     }
 
-    // Second pass: Look for AAAA records if no A records found
-    pos = saved_pos;
-    for (int i = 0; i < response->arcount && pos < buffer_len; i++) {
-        char* record_name = parse_dns_name_from_wire(buffer, buffer_len, pos);
-        
-        skip_dns_name(buffer, buffer_len, &pos);
-        
-        if (pos + 10 > buffer_len) {
-            free(record_name);
-            break;
-        }
-        
-        uint16_t type = ntohs(*(uint16_t*)(buffer + pos));
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
-        
-        // Check if this glue record is for our NS
-        bool name_matches = true;
-        if (ns_name && record_name) {
-            name_matches = (strcasecmp(record_name, ns_name) == 0);
-        }
-        
-        /* AAAA glue records are not used — outgoing queries are IPv4 only. */
-        
-        free(record_name);
-        pos += 10 + rdlength;
-    }
-
+    /* AAAA glue records are not used — outgoing queries are IPv4 only. */
     return NULL;
 }
 
 
-/**
+/*
  * Extract first NS name from authority section
  */
 char* extract_ns_name(struct Packet* response)
@@ -327,7 +300,7 @@ char* extract_ns_name(struct Packet* response)
     return NULL;
 }
 
-/**
+/*
  * Extract ALL nameservers with their glue records
  */
 NSCandidateList* extract_all_ns_with_glue(struct Packet* response)
@@ -445,7 +418,7 @@ void free_ns_candidate_list(NSCandidateList* list)
     free(list);
 }
 
-/**
+/*
  * Extract the zone apex from the authority section of a referral.
  * The owner name of the first NS record in the authority section IS the zone
  * that the referral is for (e.g. "example.com" in a delegation to example.com).
@@ -481,7 +454,7 @@ char* extract_zone_apex(struct Packet* response)
     return NULL;
 }
 
-/**
+/*
  * Test if a nameserver responds (quick probe)
  */
 bool test_nameserver_reachable(const char* ns_ip, struct Packet* query)

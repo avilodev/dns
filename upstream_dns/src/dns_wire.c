@@ -1,6 +1,6 @@
 #include "dns_wire.h"
 
-/**
+/*
  * Skip over a DNS name in wire format
  * Handles both labels and compression pointers
  */
@@ -32,7 +32,7 @@ void skip_dns_name(unsigned char* buffer, int buffer_len, int* pos)
     }
 }
 
-/**
+/*
  * Parse a DNS name from wire format into a readable string
  * Handles compression pointers with loop detection
  */
@@ -93,7 +93,7 @@ char* parse_dns_name_from_wire(unsigned char* buffer, int buffer_len, int pos)
     return name_len > 0 ? strdup(name) : NULL;
 }
 
-/**
+/*
  * Write DNS name in wire format to buffer
  */
 int write_dns_name(const char* name, unsigned char* buffer, 

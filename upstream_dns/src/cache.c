@@ -409,6 +409,51 @@ uint32_t extract_min_ttl_from_response(struct Packet* response) {
     return found_ttl ? min_ttl : DEFAULT_NS_TTL;
 }
 
+/*
+ * Return the TTL of the first NS record in the authority section of a referral
+ * response (rcode=NOERROR, ancount=0, nscount>0), clamped to [MIN_CACHE_TTL,
+ * MAX_CACHE_TTL].  Falls back to DEFAULT_NS_TTL if no NS record is found.
+ */
+uint32_t extract_referral_ns_ttl(struct Packet* response) {
+    if (!response || !response->request || response->recv_len < HEADER_LEN)
+        return DEFAULT_NS_TTL;
+
+    unsigned char* buf = (unsigned char*)response->request;
+    int blen = (int)response->recv_len;
+    int pos = HEADER_LEN;
+
+    /* Skip question section */
+    for (int i = 0; i < (int)response->qdcount && pos < blen; i++) {
+        skip_dns_name(buf, blen, &pos);
+        pos += 4; /* QTYPE + QCLASS */
+    }
+
+    /* Skip answer section (should be empty for a referral) */
+    for (int i = 0; i < (int)response->ancount && pos < blen; i++) {
+        skip_dns_name(buf, blen, &pos);
+        if (pos + 10 > blen) break;
+        uint16_t rdlen = ntohs(*(uint16_t*)(buf + pos + 8));
+        pos += 10 + rdlen;
+    }
+
+    /* Read TTL of the first NS record in the authority section */
+    for (int i = 0; i < (int)response->nscount && pos < blen; i++) {
+        skip_dns_name(buf, blen, &pos);
+        if (pos + 10 > blen) break;
+        uint16_t type  = ntohs(*(uint16_t*)(buf + pos));
+        uint32_t ttl   = ntohl(*(uint32_t*)(buf + pos + 4));
+        uint16_t rdlen = ntohs(*(uint16_t*)(buf + pos + 8));
+        if (type == QTYPE_NS) {
+            if (ttl < MIN_CACHE_TTL) ttl = MIN_CACHE_TTL;
+            if (ttl > MAX_CACHE_TTL) ttl = MAX_CACHE_TTL;
+            return ttl;
+        }
+        pos += 10 + rdlen;
+    }
+
+    return DEFAULT_NS_TTL;
+}
+
 void print_cache_stats(NSCache* ns_cache, AnswerCache* answer_cache) {
     if (!ns_cache || !answer_cache) return;
     

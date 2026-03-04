@@ -10,7 +10,7 @@ static void init_default_config(void) {
     g_config.queue_size = QUEUE_SIZE;
 }
 
-/**
+/*
  * Parse command-line arguments and populate the server configuration.
  *
  * Initializes defaults then applies -p (port), -t (thread count),
@@ -23,15 +23,32 @@ int load_config(int argc, char** argv) {
     // Parse command line arguments
     int opt;
     while ((opt = getopt(argc, argv, "p:t:q:")) != -1) {
+        char *end;
+        long v;
         switch (opt) {
             case 'p':
-                g_config.port = atoi(optarg);
+                v = strtol(optarg, &end, 10);
+                if (*end != '\0' || v < 1 || v > 65535) {
+                    fprintf(stderr, "Invalid port: %s\n", optarg);
+                    return -1;
+                }
+                g_config.port = (int)v;
                 break;
             case 't':
-                g_config.thread_count = atoi(optarg);
+                v = strtol(optarg, &end, 10);
+                if (*end != '\0' || v < 1 || v > 1024) {
+                    fprintf(stderr, "Invalid thread count: %s\n", optarg);
+                    return -1;
+                }
+                g_config.thread_count = (int)v;
                 break;
             case 'q':
-                g_config.queue_size = atoi(optarg);
+                v = strtol(optarg, &end, 10);
+                if (*end != '\0' || v < 1 || v > 1048576) {
+                    fprintf(stderr, "Invalid queue size: %s\n", optarg);
+                    return -1;
+                }
+                g_config.queue_size = (int)v;
                 break;
             default:
                 printf("Usage: ./upstream_dns/bin/dns <-p Upstream DNS port> <-t thread_count> <-q queue_size>\n");
@@ -49,7 +66,7 @@ int load_config(int argc, char** argv) {
     return 0;
 }
 
-/**
+/*
  * Sets up and opens a new socket on a specified port
  *
  * Creates a socket, and specifies the option to rebind to the port if still open.
@@ -99,7 +116,7 @@ int create_server_socket(int port) {
     return dns_sock;
 }
 
-/**
+/*
  * Create an IPv6 UDP socket bound to port with IPV6_V6ONLY.
  * Returns -1 (without exiting) if the kernel has no IPv6 support.
  */
@@ -126,7 +143,7 @@ int create_server_socket_v6(int port) {
     return sock;
 }
 
-/**
+/*
  * Create an IPv4 TCP listener bound to port.
  * Returns -1 on failure (without exiting).
  */
@@ -153,7 +170,7 @@ int create_tcp_socket_v4(int port) {
     return sock;
 }
 
-/**
+/*
  * Create an IPv6 TCP listener bound to port with IPV6_V6ONLY.
  * Returns -1 if IPv6 is unavailable (without exiting).
  */

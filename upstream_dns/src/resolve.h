@@ -19,7 +19,7 @@
 // Forward declaration only
 struct NSResolutionContext;
 
-/**
+/*
  * Server history for loop detection
  */
 typedef struct {

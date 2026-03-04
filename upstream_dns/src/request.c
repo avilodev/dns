@@ -1,7 +1,7 @@
 #include "request.h"
 #include <ctype.h>
 
-/**
+/*
  * Parse DNS request headers and question section
  * @param buffer Raw DNS packet buffer
  * @param recv_len Length of received data
@@ -241,7 +241,7 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
     return pkt;
 }
 
-/**
+/*
  * Parse domain into TLD, domain, and subdomain components
  */
 void parse_domain_components(struct Packet* pkt, const char* domain) {
@@ -296,7 +296,7 @@ void parse_domain_components(struct Packet* pkt, const char* domain) {
     }
 }
 
-/**
+/*
  * Parse DNS response
  * Handles responses from upstream DNS servers
  * It does NOT strip EDNS0 because responses can legitimately have NS/AR records
