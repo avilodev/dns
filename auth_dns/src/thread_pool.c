@@ -35,23 +35,9 @@ struct ThreadPool {
     int rejected_work;
 };
 
-/**
- * Worker thread main loop - processes work items from queue
- *
- * Continuously waits for work items in the thread pool queue and executes
- * them. Each worker thread runs this function in an infinite loop until
- * the pool is shut down. Properly handles synchronization using mutex locks
- * and condition variables to coordinate with other threads.
- *
- * @param arg Pointer to ThreadPool structure
- *
- * @return NULL when thread exits on pool shutdown
- *
- * @note Function runs indefinitely until pool->shutdown is set to true
- * @note Updates active_workers count while executing work items
- * @note Signals work_done condition variable after completing each item
- *
- * @see threadpool_create(), threadpool_add_work()
+/*
+ * Worker thread main loop — waits on the queue condition variable and
+ * executes work items until pool->shutdown is set.
  */
 static void* worker_thread(void* arg) {
     struct ThreadPool* pool = (struct ThreadPool*)arg;
@@ -100,26 +86,10 @@ static void* worker_thread(void* arg) {
     return NULL;
 }
 
-/**
- * Creates and initializes a new thread pool
- *
- * Allocates and initializes a thread pool with the specified configuration.
- * Creates worker threads, initializes synchronization primitives (mutexes
- * and condition variables), and sets up the work queue. All worker threads
- * are started immediately and begin waiting for work.
- *
- * @param config ThreadPoolConfig structure:
- *               - num_threads: Number of worker threads to create
- *               - max_queue_size: Maximum queued work items where: 0 = unlimited
- *
- * @return Pointer to initialized ThreadPool structure, or NULL on error
- *
- * @note Returns NULL if num_threads <= 0 or allocation fails
- * @note All created threads are joined and resources freed on partial failure
- * @note Prints confirmation message on successful creation
- * @warning Caller must destroy pool with threadpool_destroy() when done
- *
- * @see threadpool_destroy(), threadpool_add_work()
+/*
+ * Allocate and start a thread pool.  Returns NULL on error.
+ * config.max_queue_size = 0 means unlimited queue depth.
+ * Caller must call threadpool_destroy() when done.
  */
 struct ThreadPool* threadpool_create(struct ThreadPoolConfig config) {
     if (config.num_threads <= 0) {
@@ -197,25 +167,9 @@ struct ThreadPool* threadpool_create(struct ThreadPoolConfig config) {
     return pool;
 }
 
-/**
- * Adds a work item to the thread pool queue
- *
- * Queues a function and its argument for execution by an available worker
- * thread. If the queue is at maximum capacity, the work is rejected.
- * Work items are executed in FIFO order by the first available thread.
- *
- * @param pool Pointer to ThreadPool structure
- * @param func Function pointer to execute (work_func_t signature)
- * @param arg Argument to pass to the function 
- *
- * @return 0 on success, -1 on failure
- *
- * @note Returns -1 if pool is NULL, func is NULL, allocation fails,
- *       pool is shutting down, or queue is full
- * @note Increments rejected_work counter when queue is full
- * @note Signals one waiting worker thread when work is added
- *
- * @see threadpool_create(), threadpool_wait()
+/*
+ * Enqueue a work item.  Returns 0 on success, -1 if the pool is shut down,
+ * the queue is full, or allocation fails.
  */
 int threadpool_add_work(struct ThreadPool* pool, work_func_t func, void* arg) {
     if (!pool || !func) {
@@ -266,20 +220,8 @@ int threadpool_add_work(struct ThreadPool* pool, work_func_t func, void* arg) {
     return 0;
 }
 
-/**
- * Waits for all queued and active work to complete
- *
- * Blocks the calling thread until the work queue is empty and all worker
- * threads have finished their current tasks. Does not prevent new work
- * from being added during the wait.
- *
- * @param pool Pointer to ThreadPool structure
- *
- * @note Returns immediately if pool is NULL
- * @note Does not shut down the pool - workers remain ready for new work
- * @note Useful for synchronization points in multi-phase processing
- *
- * @see threadpool_add_work(), threadpool_destroy()
+/*
+ * Block until the work queue is empty and all workers are idle.
  */
 void threadpool_wait(struct ThreadPool* pool) {
     if (!pool) return;
@@ -293,25 +235,9 @@ void threadpool_wait(struct ThreadPool* pool) {
     pthread_mutex_unlock(&pool->queue_mutex);
 }
 
-/**
- * Shuts down and destroys a thread pool
- *
- * Signals all worker threads to shut down, waits for them to complete
- * their current work, and frees all resources including threads,
- * synchronization primitives, and remaining queued work items. Prints
- * statistics about completed and rejected work.
- *
- * @param pool Pointer to ThreadPool structure to destroy
- *
- * @note Returns immediately if pool is NULL
- * @note Broadcasts shutdown signal to wake all waiting threads
- * @note Joins all worker threads before cleanup
- * @note Frees work item arguments 
-            - Assuming they were malloced 
- * @note Prints completion statistics before destruction
- * @warning After calling, pool pointer is invalid and must not be used
- *
- * @see threadpool_create(), threadpool_wait()
+/*
+ * Signal all workers to shut down, join them, and free all resources.
+ * After this call the pool pointer is invalid.
  */
 void threadpool_destroy(struct ThreadPool* pool) {
     if (!pool) return;
@@ -350,25 +276,9 @@ void threadpool_destroy(struct ThreadPool* pool) {
     free(pool);
 }
 
-/**
- * Retrieves current thread pool statistics
- *
- * Thread-safe retrieval of pool statistics including active workers,
- * queued work items, and counters for completed and rejected work.
- * Provides a snapshot of the pool's current state.
- *
- * @param pool Pointer to ThreadPool structure
- * @param stats Pointer to ThreadPoolStats structure to fill with data
- *
- * @note Returns immediately if pool or stats is NULL
- * @note Statistics include:
- *       - active_threads: Workers currently executing tasks
- *       - queued_work: Items waiting in queue
- *       - completed_work: Total tasks completed since creation
- *       - rejected_work: Tasks rejected due to full queue
- * @note Thread-safe - uses mutex to ensure consistent snapshot
- *
- * @see threadpool_create(), threadpool_add_work()
+/*
+ * Thread-safe snapshot of pool statistics (active workers, queue depth,
+ * completed and rejected task counts).
  */
 void threadpool_get_stats(struct ThreadPool* pool, struct ThreadPoolStats* stats) {
     if (!pool || !stats) return;

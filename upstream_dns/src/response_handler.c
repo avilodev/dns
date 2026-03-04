@@ -230,8 +230,6 @@ char* extract_ns_server_ip(struct Packet* response, const char* ns_name)
                 struct in_addr addr;
                 memcpy(&addr.s_addr, buffer + pos + 10, 4);
                 if (inet_ntop(AF_INET, &addr, ip, INET_ADDRSTRLEN)) {
-                    //printf("    Found glue A record: %s -> %s\n", 
-                    //       record_name ? record_name : "unknown", ip);
                     free(record_name);
                     return ip;
                 }
@@ -264,12 +262,7 @@ char* extract_ns_server_ip(struct Packet* response, const char* ns_name)
             name_matches = (strcasecmp(record_name, ns_name) == 0);
         }
         
-        // Found matching AAAA record
-        if (name_matches && type == QTYPE_AAAA && rdlength == 16 && 
-            pos + 10 + 16 <= buffer_len) {
-            // Skip IPv6 for now since query_server() doesn't support it
-            //printf("    ! Skipping IPv6 glue record (not supported yet)\n");
-        }
+        /* AAAA glue records are not used — outgoing queries are IPv4 only. */
         
         free(record_name);
         pos += 10 + rdlength;
@@ -324,7 +317,6 @@ char* extract_ns_name(struct Packet* response)
             int rdata_pos = pos + 10;
             char* ns_name = parse_dns_name_from_wire(buffer, buffer_len, rdata_pos);
             if (ns_name) {
-                //printf("    ✓ Found NS name: %s\n", ns_name);
                 return ns_name;
             }
         }
@@ -419,14 +411,13 @@ NSCandidateList* extract_all_ns_with_glue(struct Packet* response)
             // Found matching A record
             if (record_name && strcasecmp(record_name, list->candidates[i].ns_name) == 0 &&
                 type == QTYPE_A && rdlength == 4 && pos + 10 + 4 <= buffer_len) {
-                
+
                 char* ip = malloc(INET_ADDRSTRLEN);
                 if (ip) {
                     struct in_addr addr;
                     memcpy(&addr.s_addr, buffer + pos + 10, 4);
                     if (inet_ntop(AF_INET, &addr, ip, INET_ADDRSTRLEN)) {
                         list->candidates[i].ns_ip = ip;
-                        //printf("    Found glue: %s -> %s\n", record_name, ip);
                     } else {
                         free(ip);
                     }

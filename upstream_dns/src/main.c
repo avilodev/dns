@@ -150,9 +150,9 @@ static int stats_pipe[2] = {-1, -1};
 
 /**
  * Signal handler — async-signal-safe only.
- * Sets g_shutdown flag for SIGINT/SIGTERM/SIGQUIT.
- * Writes one byte to stats_pipe for SIGUSR1 so the main loop
- * can safely call print_cache_stats() outside signal context.
+ * Clears g_running for SIGINT/SIGTERM/SIGQUIT (triggers graceful shutdown).
+ * Writes one byte to stats_pipe for SIGUSR1/SIGUSR2 so the main loop
+ * can safely call print_qtype_stats() outside signal context.
  */
 void signal_handler(int signum) {
     switch (signum) {

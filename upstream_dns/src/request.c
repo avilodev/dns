@@ -192,9 +192,6 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
 
     // Copy ONLY header + question section, zero out AN/NS/AR counts
     if (pkt->ancount > 0 || pkt->nscount > 0 || pkt->arcount > 0) {
-        //printf("  [EDNS0] Client sent AN=%u NS=%u AR=%u, rebuilding clean query\n", 
-        //       pkt->ancount, pkt->nscount, pkt->arcount);
-        
         // Calculate question section length
         int question_len = question_end - question_start;
         int new_packet_len = HEADER_LEN + question_len;
@@ -224,14 +221,11 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
         // Replace packet buffer with clean version
         pkt->request = clean_buffer;
         pkt->recv_len = new_packet_len;
-        
+
         // Update counts
         pkt->ancount = 0;
         pkt->nscount = 0;
         pkt->arcount = 0;
-        
-        //printf("  [EDNS0] Rebuilt clean query: %d bytes (was %zd bytes)\n", 
-        //       new_packet_len, recv_len);
     } else {
         // Normal query without EDNS0 - copy as-is
         pkt->request = malloc(recv_len);
@@ -353,13 +347,6 @@ struct Packet* parse_response(char* buffer, ssize_t recv_len) {
     pkt->ad = (pkt->flags >> 5) & 0x1;
     pkt->cd = (pkt->flags >> 4) & 0x1;
     pkt->rcode = pkt->flags & 0xF;
-
-    // For responses, we don't need to parse the question section in detail
-    /*
-    if (pkt->qdcount == 0) {
-        fprintf(stderr, "Warning: Response has no question section\n");
-    }
-    */
 
     // Parse domain from question section (for logging)
     if (pkt->qdcount > 0) {

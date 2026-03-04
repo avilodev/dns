@@ -2,24 +2,18 @@
 #define DNSSEC_H
 
 /*
- * DNSSEC online-signing skeleton for auth_dns.
+ * DNSSEC online signing for auth_dns.
  *
- * Implementation is stubbed — functions return -1 (not yet implemented).
- * Full implementation requires:
- *   1. Loading KSK + ZSK private keys from PEM files (EVP_PKEY).
- *   2. For each answer, computing the canonical sorted RRset wire format
- *      (RFC 4034 §6.2), then signing it with the ZSK via EVP_DigestSign.
- *   3. Encoding the resulting RRSIG RR and appending it to the response.
- *   4. Serving DNSKEY and NSEC3 records as additional data.
+ * Loads KSK and ZSK private keys from auth_dns/config/dnssec.conf and
+ * signs RRsets on the fly using EVP_DigestSign per RFC 4034 §6.2.
+ * RRSIG records are appended to responses only when the client sends
+ * an EDNS OPT record with the DO bit set (RFC 4035 §3.2.1).
  *
- * Algorithms to support (per plan):
- *   8  = RSASHA256
- *   10 = RSASHA512
- *   13 = ECDSAP256SHA256
- *   14 = ECDSAP384SHA384
- *   15 = Ed25519
- *
- * Key files are referenced from auth_dns/config/dnssec.conf.
+ * Supported algorithms:
+ *   8  = RSASHA256        (RFC 5702)
+ *   13 = ECDSAP256SHA256  (RFC 6605)
+ *   14 = ECDSAP384SHA384  (RFC 6605)
+ *   15 = Ed25519          (RFC 8080)
  */
 
 #include "types.h"
