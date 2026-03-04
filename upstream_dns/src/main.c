@@ -148,7 +148,7 @@ struct TCPQueryContext {
 // main loop reads from [0] and calls print_cache_stats() from normal context.
 static int stats_pipe[2] = {-1, -1};
 
-/**
+/*
  * Signal handler — async-signal-safe only.
  * Clears g_running for SIGINT/SIGTERM/SIGQUIT (triggers graceful shutdown).
  * Writes one byte to stats_pipe for SIGUSR1/SIGUSR2 so the main loop
@@ -177,7 +177,7 @@ void signal_handler(int signum) {
     }
 }
 
-/**
+/*
  * Setup signal handlers for server management.
  */
 void setup_signals(void) {
@@ -200,7 +200,7 @@ void setup_signals(void) {
 static pthread_mutex_t g_cleanup_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cleanup_cond  = PTHREAD_COND_INITIALIZER;
 
-/**
+/*
  * Background thread: sweep expired entries from both caches every 60 seconds.
  * Uses a condition variable so shutdown wakes it immediately instead of
  * waiting up to 60 seconds for the sleep() to expire.
@@ -222,7 +222,7 @@ static void* cache_cleanup_thread(void* arg) {
     return NULL;
 }
 
-/**
+/*
  * Send a minimal SERVFAIL response to the client.
  * Used when resolution fails so the client fails fast instead of timing out.
  */
@@ -453,7 +453,7 @@ void* process_query(void* arg) {
     return NULL;
 }
 
-/**
+/*
  * Worker function for TCP queries.
  * Reads DNS-over-TCP messages (2-byte length prefix + payload) and resolves
  * them iteratively. Supports connection reuse / pipelining (RFC 7766).

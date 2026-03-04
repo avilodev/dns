@@ -174,7 +174,7 @@ int construct_dns_packet(struct Packet* pkt)
     return ptr - (unsigned char*)pkt->request;
 }
 
-/**
+/*
  * Free packet structure and all allocated memory
  */
 int free_packet(struct Packet* pkt) {
@@ -203,7 +203,7 @@ int free_packet(struct Packet* pkt) {
 }
 
 
-/**
+/*
  * Format a DNS query packet for iterative resolution
  * Sets RD=0 (no recursion desired) for iterative queries
  */
@@ -234,7 +234,7 @@ struct Packet* format_resolver(struct Packet* pkt)
 }
 
 
-/**
+/*
  * Set packet fields for iterative DNS query (non-recursive)
  */
 void set_packet_fields(struct Packet* pkt)

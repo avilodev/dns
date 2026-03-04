@@ -1,7 +1,7 @@
 #include "udp_client.h"
 #include <sys/random.h>
 
-/**
+/*
  * Bind sockfd to a random source port in [1024, 65535] (RFC 5452 §3.3).
  * Retries on EADDRINUSE; falls back to port 0 (OS-chosen) if all fail.
  */
@@ -42,7 +42,7 @@ static void bind_random_port(int sockfd, int addr_family)
     }
 }
 
-/**
+/*
  * Query server, retrying recvfrom on source-IP or transaction-ID mismatch
  * until the deadline expires.  Prevents spoofed packets from causing the
  * real response to be silently dropped.
@@ -227,7 +227,7 @@ struct Packet* query_server_with_timeout(const char* server_ip, struct Packet* q
     return NULL;
 }
 
-/**
+/*
  * Default query_server with standard timeout
  */
 struct Packet* query_server(const char* server_ip, struct Packet* query)

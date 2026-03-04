@@ -1,6 +1,6 @@
 #include "cname_handler.h"
 
-/**
+/*
  * Check if domain is already in CNAME chain (loop detection)
  */
 bool check_cname_loop(CnameChain* chain, const char* domain)
@@ -15,7 +15,7 @@ bool check_cname_loop(CnameChain* chain, const char* domain)
     return false;
 }
 
-/**
+/*
  * Write DNS name with compression support
  * Searches for existing labels in buffer and creates compression pointers when possible
  */
@@ -105,7 +105,7 @@ static int write_dns_name_compressed(const char* name, unsigned char* buffer,
     return pos - start_pos;
 }
 
-/**
+/*
  * Reconstruct complete DNS response with CNAME chain
  * Uses DNS compression to keep packet size under 512 bytes
  */
@@ -579,7 +579,7 @@ struct Packet* reconstruct_cname_response(
     return reconstructed;
 }
 
-/**
+/*
  * Free CNAME chain memory
  */
 void free_cname_chain(CnameChain* chain)
@@ -593,7 +593,7 @@ void free_cname_chain(CnameChain* chain)
     chain->count = 0;
 }
 
-/**
+/*
  * Free CnameChainData
  */
 void free_cname_chain_data(CnameChainData* chain_data)
