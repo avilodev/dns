@@ -683,7 +683,7 @@ int main(int argc, char** argv)
     // Load DNSSEC trust anchors (non-fatal if missing — DNSSEC validation skipped)
     char trust_anchor_file[256];
     snprintf(trust_anchor_file, sizeof(trust_anchor_file),
-             "%s/config/root-trust-anchor.key", SERVER_PATH);
+             "%s" TRUST_ANCHOR_FILE, SERVER_PATH);
     g_trust_anchors = load_trust_anchors(trust_anchor_file);
     if (!g_trust_anchors) {
         fprintf(stderr, "Warning: No trust anchors loaded — DNSSEC validation disabled\n");

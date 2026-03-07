@@ -54,13 +54,21 @@
 #define RCODE_NOTAUTH       9   // Not Authoritative (RFC 2136)
 #define RCODE_BADVERS       16  // Bad OPT Version (RFC 6891)
 
+/*
+ * Paths — set at compile time by the Makefile via -D flags.
+ * Fallbacks below assume the binary is run from its own server directory.
+ * Override by passing -DSERVER_PATH='"..."' and -DLOG_FILE_PATH='"..."' to gcc.
+ */
 #ifndef SERVER_PATH
-#define SERVER_PATH "/home/avilo/dns/auth_dns"
+#define SERVER_PATH "."                      /* run from auth_dns/ */
 #endif
 #ifndef LOG_FILE_PATH
-#define LOG_FILE_PATH "/home/avilo/dns/logs/server.log"
+#define LOG_FILE_PATH "../logs/server.log"   /* logs/ sits next to auth_dns/ */
 #endif
+
+/* Paths relative to SERVER_PATH — do not make these absolute. */
 #define AUTH_FILE_PATH "/misc/auth_domains.txt"
+#define DNSSEC_CONFIG_DIR "/config"
 
 #define DEFAULT_UPSTREAM_DNS "1.1.1.1"
 #define UPSTREAM_PORT 53

@@ -56,13 +56,21 @@
 #define TIMEOUT_SEQUENTIAL 2       // Timeout for sequential query
 #define MAX_PARALLEL_QUERIES 3     // Query 3 servers simultaneously
 
+/*
+ * Paths — set at compile time by the Makefile via -D flags.
+ * Fallbacks below assume the binary is run from its own server directory.
+ * Override by passing -DSERVER_PATH='"..."' and -DLOG_FILE_PATH='"..."' to gcc.
+ */
 #ifndef SERVER_PATH
-#define SERVER_PATH "/home/avilo/dns/upstream_dns"
+#define SERVER_PATH "."                        /* run from upstream_dns/ */
 #endif
 #ifndef LOG_FILE_PATH
-#define LOG_FILE_PATH "/home/avilo/dns/logs/upstream.log"
+#define LOG_FILE_PATH "../logs/upstream.log"   /* logs/ sits next to upstream_dns/ */
 #endif
-#define HINTS_FILE "/misc/root_hints.txt"
+
+/* Paths relative to SERVER_PATH — do not make these absolute. */
+#define HINTS_FILE       "/misc/root_hints.txt"
+#define TRUST_ANCHOR_FILE "/config/root-trust-anchor.key"
 
 #define PORT 5335
 #define NUM_THREADS 20
