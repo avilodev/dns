@@ -1,17 +1,49 @@
-logs/*
-.vscode/
+# ============================================================
+# Build artifacts
+# ============================================================
+
+# Compiled binaries
+auth_dns/bin/
+upstream_dns/bin/
+
+# Object files and auto-generated dependency files
+auth_dns/obj/
+upstream_dns/obj/
+
+# Catch stray .o/.d files if ever compiled outside the standard obj/ directory
+*.o
+*.d
+
+# ============================================================
+# Runtime / data files
+# ============================================================
+
+# Query logs (daily-rotating, can be large)
+logs/
+
+# Testing scripts and results
 testing/
 
-# auth_dns build artifacts
-auth_dns/bin
-auth_dns/obj
+# ============================================================
+# Credentials and private keys
+# ============================================================
 
-# upstream_dns build artifacts
-upstream_dns/bin
-upstream_dns/obj
-
-# DNSSEC private keys
+# DNSSEC zone signing keys (private — never commit)
 auth_dns/config/*.pem
 auth_dns/config/*.key
+
+# Upstream trust anchor key (public IANA key — excluded to avoid
+# accidentally committing a modified/compromised version; fetch from
+# https://data.iana.org/root-anchors/root-anchors.xml instead)
 upstream_dns/config/*.pem
 upstream_dns/config/*.key
+
+# ============================================================
+# Editor / IDE
+# ============================================================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
