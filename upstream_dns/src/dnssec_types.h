@@ -9,6 +9,7 @@
  */
 
 #include <stdint.h>
+#include <stdlib.h>   /* free() used in inline free_*_rdata helpers below */
 
 /* DNSKEY RDATA (RFC 4034 §2.1) */
 typedef struct {

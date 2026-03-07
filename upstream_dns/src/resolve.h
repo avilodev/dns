@@ -8,6 +8,7 @@
 #include "response_handler.h"
 #include "dns_packet.h"
 #include "utils.h"
+#include "dnssec_chain.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +33,8 @@ struct Packet* send_resolver_with_ns_context(struct Packet* query,
                                              struct NSResolutionContext* ns_context);
 struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                                      CnameChain* chain,
-                                     struct NSResolutionContext* ns_context);
+                                     struct NSResolutionContext* ns_context,
+                                     DnssecChainCtx* dnssec_chain);
 bool already_queried(ServerHistory* history, const char* server);
 void free_server_history(ServerHistory* history);
 

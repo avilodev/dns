@@ -92,7 +92,7 @@ int log_entry(const char* client_ip, uint16_t port, uint16_t qtype,
     return 0;
 }
 
-/**
+/*
  * Close the persistent log file descriptor.
  * Call once on server shutdown; safe to call if never opened.
  */

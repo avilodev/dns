@@ -18,7 +18,8 @@
 
 #include "types.h"
 #include "dnssec_types.h"
-#include "config.h"   /* TrustAnchor */
+#include "config.h"        /* TrustAnchor */
+#include "dnssec_chain.h"  /* DnssecChainCtx — no circular dependency */
 
 /*
  * Verify a single RRSIG against a DNSKEY.
@@ -40,5 +41,18 @@ int dnssec_verify_rrsig(const RrsigRdata* rrsig,
  */
 int dnssec_validate_response(struct Packet* response,
                              const TrustAnchor* anchors);
+
+/*
+ * Extended variant that also consults a per-resolution chain context for
+ * keys validated at intermediate delegation hops (RFC 4035 §5 chain-of-trust).
+ *
+ * chain: accumulated by dnssec_chain_process_referral() during the iterative
+ *        resolution walk.  May be NULL (equivalent to dnssec_validate_response).
+ *
+ * Returns the same codes as dnssec_validate_response.
+ */
+int dnssec_validate_with_chain(struct Packet* response,
+                               const TrustAnchor* anchors,
+                               const DnssecChainCtx* chain);
 
 #endif /* DNSSEC_H */

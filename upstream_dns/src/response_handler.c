@@ -38,7 +38,8 @@ bool is_cname_only_answer(struct Packet* response, uint16_t original_qtype)
         
         if (type == QTYPE_CNAME) {
             has_cname = true;
-        } else if (type == original_qtype) {
+        } else if (type == original_qtype || original_qtype == QTYPE_ANY) {
+            /* For QTYPE_ANY any non-CNAME record counts as a final answer. */
             has_final = true;
         }
         
