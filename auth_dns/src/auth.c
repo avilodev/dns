@@ -1064,8 +1064,9 @@ static int _load_domains_from_file(const char *filename)
         return -1;
     }
 
-    int count = 0;
+    int  count               = 0;
     char line[1024];
+    char current_domain[256] = {0};  /* set by [domain] section headers */
 
     while (fgets(line, sizeof(line), fp)) {
         /* Strip trailing whitespace / newline. */
@@ -1076,6 +1077,23 @@ static int _load_domains_from_file(const char *filename)
 
         if (llen == 0 || line[0] == '#') continue;
 
+        /* --- Section header: [domain.name] -------------------------------- */
+        if (line[0] == '[') {
+            char *close = strchr(line, ']');
+            if (close && close > line + 1) {
+                size_t dlen = (size_t)(close - line - 1);
+                if (dlen >= sizeof(current_domain))
+                    dlen = sizeof(current_domain) - 1;
+                memcpy(current_domain, line + 1, dlen);
+                current_domain[dlen] = '\0';
+                strlower(current_domain);
+            }
+            continue;
+        }
+
+        /* Ignore record lines that appear before any [domain] header. */
+        if (current_domain[0] == '\0') continue;
+
         if (count >= MAX_INTERNAL_HOSTS) {
             fprintf(stderr,
                     "Warning: auth_domains limit (%d) reached; skipping rest\n",
@@ -1083,16 +1101,14 @@ static int _load_domains_from_file(const char *filename)
             break;
         }
 
-        char domain[256]   = {0};
-        char type_kw[64]   = {0};
-        if (sscanf(line, "%255s %63s", domain, type_kw) < 2) continue;
+        char type_kw[64] = {0};
+        if (sscanf(line, "%63s", type_kw) < 1) continue;
 
-        strlower(domain);
-        bool is_wc = (domain[0] == '*');
+        bool is_wc = (current_domain[0] == '*');
 
         struct AuthDomain *d = &auth_domains[count];
         memset(d, 0, sizeof(*d));
-        snprintf(d->domain, sizeof(d->domain), "%s", domain);
+        snprintf(d->domain, sizeof(d->domain), "%s", current_domain);
         d->is_wildcard = is_wc;
 
         /* --- SOA -------------------------------------------------------- */
@@ -1100,7 +1116,7 @@ static int _load_domains_from_file(const char *filename)
             char mname[256] = {0}, rname[256] = {0};
             unsigned int serial = 0, refresh = 0, retry = 0,
                          expire = 0, minimum = 0;
-            if (sscanf(line, "%*s SOA %255s %255s %u %u %u %u %u",
+            if (sscanf(line, "%*s %255s %255s %u %u %u %u %u",
                        mname, rname,
                        &serial, &refresh, &retry, &expire, &minimum) != 7) {
                 fprintf(stderr, "Warning: Bad SOA line: %s\n", line);
@@ -1118,13 +1134,13 @@ static int _load_domains_from_file(const char *filename)
             d->soa_ttl     = refresh;   /* default TTL = refresh interval */
             strcpy(d->ip, "0.0.0.0");
             fprintf(stderr, "  Loaded: %-32s -> SOA serial=%u\n",
-                    domain, serial);
+                    current_domain, serial);
             count++;
 
         /* --- NS --------------------------------------------------------- */
         } else if (strcasecmp(type_kw, "NS") == 0) {
             char ns[256] = {0};
-            if (sscanf(line, "%*s NS %255s", ns) != 1) {
+            if (sscanf(line, "%*s %255s", ns) != 1) {
                 fprintf(stderr, "Warning: Bad NS line: %s\n", line);
                 continue;
             }
@@ -1132,14 +1148,14 @@ static int _load_domains_from_file(const char *filename)
             d->has_ns = true;
             snprintf(d->ns_name, sizeof(d->ns_name), "%s", ns);
             strcpy(d->ip, "0.0.0.0");
-            fprintf(stderr, "  Loaded: %-32s -> NS %s\n", domain, ns);
+            fprintf(stderr, "  Loaded: %-32s -> NS %s\n", current_domain, ns);
             count++;
 
         /* --- MX --------------------------------------------------------- */
         } else if (strcasecmp(type_kw, "MX") == 0) {
             unsigned int prio = 0;
             char mx_host[256] = {0};
-            if (sscanf(line, "%*s MX %u %255s", &prio, mx_host) != 2) {
+            if (sscanf(line, "%*s %u %255s", &prio, mx_host) != 2) {
                 fprintf(stderr, "Warning: Bad MX line: %s\n", line);
                 continue;
             }
@@ -1149,13 +1165,13 @@ static int _load_domains_from_file(const char *filename)
             snprintf(d->mx_hostname, sizeof(d->mx_hostname), "%s", mx_host);
             strcpy(d->ip, "0.0.0.0");
             fprintf(stderr, "  Loaded: %-32s -> MX %u %s\n",
-                    domain, prio, mx_host);
+                    current_domain, prio, mx_host);
             count++;
 
         /* --- CNAME ------------------------------------------------------ */
         } else if (strcasecmp(type_kw, "CNAME") == 0) {
             char target[256] = {0};
-            if (sscanf(line, "%*s CNAME %255s", target) != 1) {
+            if (sscanf(line, "%*s %255s", target) != 1) {
                 fprintf(stderr, "Warning: Bad CNAME line: %s\n", line);
                 continue;
             }
@@ -1163,16 +1179,14 @@ static int _load_domains_from_file(const char *filename)
             d->has_cname = true;
             snprintf(d->cname_target, sizeof(d->cname_target), "%s", target);
             strcpy(d->ip, "0.0.0.0");
-            fprintf(stderr, "  Loaded: %-32s -> CNAME %s\n", domain, target);
+            fprintf(stderr, "  Loaded: %-32s -> CNAME %s\n",
+                    current_domain, target);
             count++;
 
         /* --- TXT -------------------------------------------------------- */
         } else if (strcasecmp(type_kw, "TXT") == 0) {
-            /* Advance past "domain" token */
+            /* Advance past the "TXT" keyword to the text content. */
             const char *p = line;
-            while (*p && !isspace((unsigned char)*p)) p++;
-            while (*p &&  isspace((unsigned char)*p)) p++;
-            /* Advance past "TXT" keyword */
             while (*p && !isspace((unsigned char)*p)) p++;
             while (*p &&  isspace((unsigned char)*p)) p++;
             /* p now points to the text data (possibly quoted) */
@@ -1184,14 +1198,15 @@ static int _load_domains_from_file(const char *filename)
             d->has_txt = true;
             snprintf(d->txt_data, sizeof(d->txt_data), "%s", txt);
             strcpy(d->ip, "0.0.0.0");
-            fprintf(stderr, "  Loaded: %-32s -> TXT \"%s\"\n", domain, txt);
+            fprintf(stderr, "  Loaded: %-32s -> TXT \"%s\"\n",
+                    current_domain, txt);
             count++;
 
         /* --- SRV -------------------------------------------------------- */
         } else if (strcasecmp(type_kw, "SRV") == 0) {
             unsigned int prio = 0, weight = 0, port = 0;
             char target[256] = {0};
-            if (sscanf(line, "%*s SRV %u %u %u %255s",
+            if (sscanf(line, "%*s %u %u %u %255s",
                        &prio, &weight, &port, target) != 4) {
                 fprintf(stderr, "Warning: Bad SRV line: %s\n", line);
                 continue;
@@ -1204,42 +1219,58 @@ static int _load_domains_from_file(const char *filename)
             snprintf(d->srv_target, sizeof(d->srv_target), "%s", target);
             strcpy(d->ip, "0.0.0.0");
             fprintf(stderr, "  Loaded: %-32s -> SRV %u %u %u %s\n",
-                    domain, prio, weight, port, target);
+                    current_domain, prio, weight, port, target);
             count++;
 
         /* --- NXDOMAIN --------------------------------------------------- */
         } else if (strcasecmp(type_kw, "NXDOMAIN") == 0) {
             d->is_blocked = true;
             strcpy(d->ip, "0.0.0.0");
-            fprintf(stderr, "  Loaded: %-32s -> BLOCKED (NXDOMAIN)\n", domain);
+            fprintf(stderr, "  Loaded: %-32s -> BLOCKED (NXDOMAIN)\n",
+                    current_domain);
             count++;
 
-        /* --- AAAA (detected by ':' in token) ---------------------------- */
-        } else if (strchr(type_kw, ':') != NULL) {
+        /* --- AAAA ------------------------------------------------------- */
+        } else if (strcasecmp(type_kw, "AAAA") == 0) {
+            char ip6[64] = {0};
+            if (sscanf(line, "%*s %63s", ip6) != 1) {
+                fprintf(stderr, "Warning: Bad AAAA line: %s\n", line);
+                continue;
+            }
             struct in6_addr ia6;
-            if (inet_pton(AF_INET6, type_kw, &ia6) != 1) {
-                fprintf(stderr,
-                        "Warning: Invalid IPv6 '%s' for '%s'\n",
-                        type_kw, domain);
+            if (inet_pton(AF_INET6, ip6, &ia6) != 1) {
+                fprintf(stderr, "Warning: Invalid IPv6 '%s' for '%s'\n",
+                        ip6, current_domain);
                 continue;
             }
             d->has_ipv6 = true;
-            snprintf(d->ipv6, sizeof(d->ipv6), "%s", type_kw);
+            snprintf(d->ipv6, sizeof(d->ipv6), "%s", ip6);
             strcpy(d->ip, "0.0.0.0");
-            fprintf(stderr, "  Loaded: %-32s -> %s (AAAA)\n", domain, type_kw);
+            fprintf(stderr, "  Loaded: %-32s -> %s (AAAA)\n",
+                    current_domain, ip6);
             count++;
 
-        /* --- A record (default) ----------------------------------------- */
-        } else {
-            struct in_addr ia;
-            if (inet_pton(AF_INET, type_kw, &ia) != 1) {
-                fprintf(stderr,
-                        "Warning: Unrecognized record line: %s\n", line);
+        /* --- A ---------------------------------------------------------- */
+        } else if (strcasecmp(type_kw, "A") == 0) {
+            char ip4[20] = {0};
+            if (sscanf(line, "%*s %19s", ip4) != 1) {
+                fprintf(stderr, "Warning: Bad A line: %s\n", line);
                 continue;
             }
-            snprintf(d->ip, sizeof(d->ip), "%s", type_kw);
-            fprintf(stderr, "  Loaded: %-32s -> %s\n", domain, type_kw);
+            struct in_addr ia;
+            if (inet_pton(AF_INET, ip4, &ia) != 1) {
+                fprintf(stderr, "Warning: Invalid IPv4 '%s' for '%s'\n",
+                        ip4, current_domain);
+                continue;
+            }
+            snprintf(d->ip, sizeof(d->ip), "%s", ip4);
+            fprintf(stderr, "  Loaded: %-32s -> %s\n", current_domain, ip4);
             count++;
+
+        } else {
+            fprintf(stderr, "Warning: Unknown record type '%s' for [%s]\n",
+                    type_kw, current_domain);
+            continue;
         }
     }
 

@@ -164,11 +164,19 @@ static uint16_t keytag_compute(const unsigned char *rdata, size_t rdlen)
  * Returns NULL if no keys could be loaded.
  * ========================================================================== */
 
-static void flush_key(const char *path, uint8_t algorithm, uint16_t flags,
+static void flush_key(const char *path, const char *config_dir,
+                      uint8_t algorithm, uint16_t flags,
                       const char *zone,
                       ZoneKey **head, ZoneKey **tail)
 {
     if (!path || path[0] == '\0' || algorithm == 0) return;
+
+    /* Support relative paths: resolve them against config_dir. */
+    char resolved[512];
+    if (path[0] != '/' && config_dir) {
+        snprintf(resolved, sizeof(resolved), "%s/%s", config_dir, path);
+        path = resolved;
+    }
 
     FILE *fp = fopen(path, "r");
     if (!fp) {
@@ -255,8 +263,8 @@ ZoneKey *load_zone_keys(const char *config_dir)
 
         if (*p == '[') {
             /* Flush accumulated keys for the previous zone */
-            flush_key(cur_ksk_file, cur_ksk_alg, 257, cur_zone, &head, &tail);
-            flush_key(cur_zsk_file, cur_zsk_alg, 256, cur_zone, &head, &tail);
+            flush_key(cur_ksk_file, config_dir, cur_ksk_alg, 257, cur_zone, &head, &tail);
+            flush_key(cur_zsk_file, config_dir, cur_zsk_alg, 256, cur_zone, &head, &tail);
             cur_ksk_alg = cur_zsk_alg = 0;
             cur_ksk_file[0] = cur_zsk_file[0] = '\0';
             /* Extract zone name between '[' and ']' */
@@ -301,8 +309,8 @@ ZoneKey *load_zone_keys(const char *config_dir)
     fclose(fp);
 
     /* Flush the last zone's keys */
-    flush_key(cur_ksk_file, cur_ksk_alg, 257, cur_zone, &head, &tail);
-    flush_key(cur_zsk_file, cur_zsk_alg, 256, cur_zone, &head, &tail);
+    flush_key(cur_ksk_file, config_dir, cur_ksk_alg, 257, cur_zone, &head, &tail);
+    flush_key(cur_zsk_file, config_dir, cur_zsk_alg, 256, cur_zone, &head, &tail);
 
     if (!head)
         fprintf(stderr, "DNSSEC: no signing keys loaded from %s\n", conf_path);

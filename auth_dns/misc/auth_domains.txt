@@ -1,59 +1,91 @@
-# Authoritative DNS zone records
-# Format:
-#   A:       domain ip_address
-#   AAAA:    domain ipv6_address
-#   NXDOMAIN: domain NXDOMAIN
-#   MX:      domain MX priority hostname
-#   NS:      domain NS nameserver-hostname
-#   CNAME:   domain CNAME canonical-name
-#   TXT:     domain TXT "text data"   (quotes optional)
-#   SRV:     domain SRV priority weight port target
-#   SOA:     domain SOA primary-ns admin-email serial refresh retry expire minimum
+# Authoritative DNS Zone Records
 #
-# SOA fields:
-#   serial   = YYYYMMDDNN (increment on every zone change)
-#   refresh  = how often secondaries poll for updates (seconds)
-#   retry    = secondary retry interval after a failed refresh
-#   expire   = secondary discards zone data after this many seconds without refresh
-#   minimum  = negative caching TTL (RFC 2308); also floor for all other TTLs
+# Group records by domain using [domain] section headers.
+# Each line inside a section is:   TYPE   value(s)
 #
-# Wildcards: use *.zone syntax for the domain (A and AAAA only)
+# Supported record types:
+#   A        <ipv4-address>
+#   AAAA     <ipv6-address>
+#   NS       <nameserver>
+#   MX       <priority>  <hostname>
+#   CNAME    <target>
+#   TXT      "text content"
+#   SRV      <priority>  <weight>  <port>  <target>
+#   SOA      <mname>  <rname>  <serial>  <refresh>  <retry>  <expire>  <minimum>
+#   NXDOMAIN  (blocks the domain — returns NXDOMAIN, not forwarded upstream)
+#
+# SOA field meanings:
+#   mname   = primary nameserver hostname
+#   rname   = admin email address (replace @ with .)
+#   serial  = zone version, format YYYYMMDDNN — increment on every change
+#   refresh = how often secondaries poll for updates (seconds)
+#   retry   = how long secondaries wait before retrying a failed refresh (seconds)
+#   expire  = secondaries stop serving after this many seconds without contact
+#   minimum = negative-caching TTL: how long NXDOMAIN/NODATA answers are cached
+#
+# Wildcards: use [*.zone] as the section header (A and AAAA only)
 
-# avilo.com zone
-avilo.com SOA ns1.avilo.com hostmaster.avilo.com 2026022802 3600 900 604800 300
-avilo.com NS ns1.avilo.com
-avilo.com NS ns2.avilo.com
-avilo.com 192.168.1.2
-avilo.com 2001:db8::1
-avilo.com MX 10 mail.avilo.com
-avilo.com TXT "v=spf1 mx -all"
-www.avilo.com CNAME avilo.com
-mail.avilo.com 192.168.1.4
-ns1.avilo.com 192.168.1.2
-ns2.avilo.com 192.168.1.2
-_imaps._tcp.avilo.com SRV 10 1 993 mail.avilo.com
 
-# avilo.priv zone
-avilo.priv SOA ns1.avilo.priv hostmaster.avilo.priv 2026022802 3600 900 604800 300
-avilo.priv NS ns1.avilo.priv
-avilo.priv NS ns2.avilo.priv
-avilo.priv MX 10 mail.avilo.priv
-mail.avilo.priv 192.168.1.3
-ns1.avilo.priv 192.168.1.2
-ns2.avilo.priv 192.168.1.2
+# Zone: avilo.com
+[avilo.com]
+SOA    ns1.avilo.com  hostmaster.avilo.com  2026022802  3600  900  604800  300
+NS     ns1.avilo.com
+NS     ns2.avilo.com
+A      192.168.1.2
+AAAA   2001:db8::1
+MX     10  mail.avilo.com
+TXT    "v=spf1 mx -all"
 
-# adoliva.com zone
-adoliva.com SOA ns1.adoliva.com hostmaster.adoliva.com 2026022802 3600 900 604800 300
-adoliva.com NS ns1.adoliva.com
-adoliva.com NS ns2.adoliva.com
-adoliva.com 192.168.1.3
-ns1.adoliva.com 192.168.1.3
-ns2.adoliva.com 192.168.1.3
+[www.avilo.com]
+CNAME  avilo.com
 
-# Single-host entries (no zone SOA — NXDOMAIN responses will lack authority section)
-pi5.priv 192.168.1.2
-pi3.priv 192.168.1.3
+[mail.avilo.com]
+A      192.168.1.4
 
-# Blocked domains (NXDOMAIN)
-ads.google.com NXDOMAIN
-doubleclick.net NXDOMAIN
+[ns1.avilo.com]
+A      192.168.1.2
+
+[ns2.avilo.com]
+A      192.168.1.2
+
+[_imaps._tcp.avilo.com]
+SRV    10  1  993  mail.avilo.com
+
+
+# ============================================================
+# Zone: avilo.priv
+# ============================================================
+[avilo.priv]
+SOA    ns1.avilo.priv  hostmaster.avilo.priv  2026022802  3600  900  604800  300
+NS     ns1.avilo.priv
+NS     ns2.avilo.priv
+MX     10  mail.avilo.priv
+
+[mail.avilo.priv]
+A      192.168.1.3
+
+[ns1.avilo.priv]
+A      192.168.1.2
+
+[ns2.avilo.priv]
+A      192.168.1.2 
+
+
+# ============================================================
+# Single-host entries (no zone SOA)
+# ============================================================
+[pi5.priv]
+A      192.168.1.2
+
+[pi3.priv]
+A      192.168.1.3
+
+
+# ============================================================
+# Blocked domains (return NXDOMAIN — not forwarded upstream)
+# ============================================================
+[ads.google.com]
+NXDOMAIN
+
+[doubleclick.net]
+NXDOMAIN
