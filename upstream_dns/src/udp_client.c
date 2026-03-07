@@ -234,3 +234,83 @@ struct Packet* query_server(const char* server_ip, struct Packet* query)
 {
     return query_server_with_timeout(server_ip, query, SOCKET_TIMEOUT);
 }
+
+/*
+ * Send a DNS query over TCP (RFC 1035 §4.2.2) and return the response.
+ * Used as a fallback when a UDP response arrives with TC=1 (truncated).
+ * Returns NULL on timeout or error.
+ */
+struct Packet* query_server_tcp(const char* server_ip, struct Packet* query)
+{
+    if (!server_ip || !query || !query->request || query->recv_len <= 0) return NULL;
+
+    bool is_ipv6 = strchr(server_ip, ':') != NULL;
+    int addr_family = is_ipv6 ? AF_INET6 : AF_INET;
+
+    int sockfd = socket(addr_family, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        perror("  TCP socket creation failed");
+        return NULL;
+    }
+
+    struct timeval tv = { .tv_sec = SOCKET_TIMEOUT, .tv_usec = 0 };
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    int connected = -1;
+    if (is_ipv6) {
+        struct sockaddr_in6 addr = {0};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_port   = htons(DNS_PORT);
+        if (inet_pton(AF_INET6, server_ip, &addr.sin6_addr) > 0)
+            connected = connect(sockfd, (struct sockaddr*)&addr, sizeof(addr));
+    } else {
+        struct sockaddr_in addr = {0};
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons(DNS_PORT);
+        if (inet_pton(AF_INET, server_ip, &addr.sin_addr) > 0)
+            connected = connect(sockfd, (struct sockaddr*)&addr, sizeof(addr));
+    }
+
+    if (connected < 0) {
+        perror("  TCP connect failed");
+        close(sockfd);
+        return NULL;
+    }
+
+    /* DNS-over-TCP: 2-byte big-endian message length prefix, then query. */
+    uint16_t qlen_net = htons((uint16_t)query->recv_len);
+    const uint8_t* p = (const uint8_t*)&qlen_net;
+    size_t rem = 2;
+    while (rem > 0) {
+        ssize_t nw = write(sockfd, p, rem);
+        if (nw <= 0) { close(sockfd); return NULL; }
+        p += nw; rem -= (size_t)nw;
+    }
+    p = (const uint8_t*)query->request;
+    rem = (size_t)query->recv_len;
+    while (rem > 0) {
+        ssize_t nw = write(sockfd, p, rem);
+        if (nw <= 0) { close(sockfd); return NULL; }
+        p += nw; rem -= (size_t)nw;
+    }
+
+    /* Read 2-byte response length prefix. */
+    uint16_t rlen_net = 0;
+    ssize_t n = recv(sockfd, &rlen_net, 2, MSG_WAITALL);
+    if (n != 2) { close(sockfd); return NULL; }
+    uint16_t rlen = ntohs(rlen_net);
+    if (rlen < HEADER_LEN || rlen > MAXLINE) { close(sockfd); return NULL; }
+
+    char* rbuf = malloc(rlen);
+    if (!rbuf) { close(sockfd); return NULL; }
+
+    n = recv(sockfd, rbuf, rlen, MSG_WAITALL);
+    close(sockfd);
+
+    if (n != rlen) { free(rbuf); return NULL; }
+
+    struct Packet* response = parse_response(rbuf, rlen);
+    free(rbuf);
+    return response;
+}

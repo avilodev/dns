@@ -57,8 +57,8 @@ static int write_dns_name_compressed(const char* name, unsigned char* buffer,
                         return -1;
                     }
                     
-                    uint16_t offset = i;
-                    if (offset < 0x3FFF) {  // Max offset for compression
+                    uint16_t offset = (uint16_t)i;
+                    if (offset < 0x4000) {  // Max 14-bit offset (0x0000–0x3FFF)
                         buffer[pos++] = 0xC0 | ((offset >> 8) & 0x3F);
                         buffer[pos++] = offset & 0xFF;
                         compressed = true;
@@ -220,15 +220,17 @@ struct Packet* reconstruct_cname_response(
         return NULL;
     }
     pos += name_len;
-    
+
     uint16_t qtype_net = htons(original_query->q_type);
     memcpy(buffer + pos, &qtype_net, 2);
     pos += 2;
-    
+
     uint16_t qclass_net = htons(original_query->q_class);
     memcpy(buffer + pos, &qclass_net, 2);
     pos += 2;
-    
+
+    int question_end_pos = (int)pos;  /* used to truncate TC=1 responses */
+
     // Answer with CNAME compression
     for (int i = 0; i < chain_data->count; i++) {
         if (!chain_data->entries[i].name || !chain_data->entries[i].target) {
@@ -566,11 +568,19 @@ struct Packet* reconstruct_cname_response(
     reconstructed->ancount = total_answers;
     reconstructed->nscount = nscount;
 
-    // Set TC=1 if the reconstructed response exceeds the DNS UDP limit
-    if (pos > 512) {
+    // If the reconstructed response exceeds the non-EDNS UDP limit, truncate
+    // to the question section only and set TC=1 so the client retries over TCP
+    // (RFC 1035 §4.1.1).  The full data must NOT be sent with TC=1.
+    if ((int)pos > 512) {
+        pos = question_end_pos;
+        reconstructed->recv_len = pos;
+        reconstructed->ancount = 0;
+        reconstructed->nscount = 0;
         reconstructed->tc = 1;
-        // Update TC bit in buffer
-        buffer[2] |= 0x02;
+        buffer[2] |= 0x02;          /* TC bit */
+        buffer[6] = 0; buffer[7] = 0;   /* ANCOUNT = 0 */
+        buffer[8] = 0; buffer[9] = 0;   /* NSCOUNT = 0 */
+        buffer[10] = 0; buffer[11] = 0; /* ARCOUNT = 0 */
     }
     
     // Free final_answer

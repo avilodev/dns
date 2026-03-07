@@ -1,4 +1,5 @@
 #include "dnssec.h"
+#include "dnssec_chain.h"
 #include "dns_wire.h"
 
 #include <ctype.h>
@@ -241,6 +242,54 @@ static int build_signed_data(const struct Packet *response,
                                         owner_wire, sizeof(owner_wire));
     if (owner_wire_len < 0) return -1;
 
+    /*
+     * RFC 4034 §6.2 step 3: wildcard owner name reconstruction.
+     *
+     * The RRSIG labels field counts the number of labels in the ORIGINAL
+     * unsigned owner name, not counting the root label (the trailing zero
+     * byte) or any leading wildcard label.
+     *
+     * When a wildcard record (e.g. *.example.com) is expanded to match a
+     * query (e.g. foo.example.com), the RR that appears in the response
+     * carries the expanded owner name.  The RRSIG, however, was computed
+     * over the wildcard owner.  Detecting this condition:
+     *
+     *   label_count(owner_wire) > rrsig->labels
+     *
+     * When true, the canonical owner used in the signed data must be:
+     *
+     *   \x01 '*' | rightmost rrsig->labels labels of owner_wire
+     *
+     * The expanded owner (owner_wire) is still used below for RR matching
+     * so we collect the correct records from the response packet.
+     */
+    int label_count = 0;
+    for (int lp = 0; lp < owner_wire_len && owner_wire[lp] != 0; ) {
+        label_count++;
+        lp += 1 + owner_wire[lp];
+    }
+
+    uint8_t effective_owner[256];
+    int     effective_owner_len;
+
+    if (label_count > (int)rrsig->labels) {
+        /* Locate where the rightmost rrsig->labels labels start */
+        int skip_pos = 0;
+        for (int s = 0; s < label_count - (int)rrsig->labels; s++)
+            skip_pos += 1 + owner_wire[skip_pos];
+        int suffix_len = owner_wire_len - skip_pos;
+        /* suffix_len includes at least the root label (1 byte); prefix is 2 */
+        if (suffix_len < 1 || 2 + suffix_len > (int)sizeof(effective_owner))
+            return -1;
+        effective_owner[0] = 1;    /* length of wildcard label */
+        effective_owner[1] = '*';  /* the wildcard label itself */
+        memcpy(effective_owner + 2, owner_wire + skip_pos, (size_t)suffix_len);
+        effective_owner_len = 2 + suffix_len;
+    } else {
+        memcpy(effective_owner, owner_wire, (size_t)owner_wire_len);
+        effective_owner_len = owner_wire_len;
+    }
+
     /* --- Collect covered RRs from all sections --- */
     int pos = HEADER_LEN;
     for (int q = 0; q < response->qdcount && pos < buf_len; q++) {
@@ -300,8 +349,10 @@ static int build_signed_data(const struct Packet *response,
         }
         rrs[rr_count].rdata     = crdata;
         rrs[rr_count].rdata_len = crdata_len;
-        memcpy(rrs[rr_count].owner, owner_wire, (size_t)owner_wire_len);
-        rrs[rr_count].owner_len = owner_wire_len;
+        /* Store the effective owner (wildcard form if applicable) — this is
+         * what RFC 4034 §6.2 mandates for the signed-data construction. */
+        memcpy(rrs[rr_count].owner, effective_owner, (size_t)effective_owner_len);
+        rrs[rr_count].owner_len = effective_owner_len;
         rr_count++;
         pos = rdata_off + rdl;
     }
@@ -605,13 +656,24 @@ int dnssec_verify_rrsig(const RrsigRdata *rrsig,
  * ========================================================================== */
 
 /*
- * Search the entire response for a DNSKEY matching key_tag + algorithm.
- * Falls back to the trust anchor list.
+ * Search for a DNSKEY matching (key_tag, algorithm) in three places, in order:
+ *
+ *  1. The response packet itself — covers the common case where the DNSKEY
+ *     is returned alongside the answer (e.g. explicit DNSKEY query).
+ *
+ *  2. The root trust anchor list — covers RRSIG(DNSKEY) at the root zone.
+ *
+ *  3. The per-resolution chain context (optional, may be NULL) — covers
+ *     intermediate-zone keys validated earlier in the delegation walk.
+ *     The signer_name (dot-notation) identifies which zone to look up.
+ *
  * On success, fills *dk_out (caller must free_dnskey_rdata on it) and
  * returns 1.  Returns 0 if not found.
  */
 static int find_dnskey(const struct Packet *response,
                        const TrustAnchor *anchors,
+                       const DnssecChainCtx *chain,   /* may be NULL */
+                       const char *signer_name,        /* for chain lookup; may be NULL */
                        uint16_t key_tag, uint8_t algorithm,
                        DnskeyRdata *dk_out)
 {
@@ -663,15 +725,40 @@ check_anchors:
             return 1;
         }
     }
+
+    /*
+     * 3. Consult the per-resolution chain context (RFC 4035 §5 chain-of-trust).
+     *
+     * During iterative resolution each referral step may have validated a zone
+     * DNSKEY against its parent DS record.  Those keys are accumulated in
+     * the chain context and used here to verify RRSIGs in deeper zones.
+     */
+    if (chain && signer_name &&
+        dnssec_chain_find_key(chain, signer_name, key_tag, algorithm, dk_out))
+        return 1;
+
     return 0;
 }
 
 /* ==========================================================================
- * Section 7: dnssec_validate_response  (public)
+ * Section 7: dnssec_validate_with_chain / dnssec_validate_response  (public)
  * ========================================================================== */
 
-int dnssec_validate_response(struct Packet *response,
-                             const TrustAnchor *anchors)
+/*
+ * Core validation loop shared by both public entry points.
+ *
+ * chain: the per-resolution DnssecChainCtx accumulated during the iterative
+ *        delegation walk.  May be NULL, in which case key lookup falls back
+ *        to the response packet and root trust anchors only.
+ *
+ * Returns  1 if at least one RRSIG validated and none failed,
+ *          0 if at least one RRSIG failed verification (caller: SERVFAIL),
+ *         -1 if the response carries no RRSIG, or no matching DNSKEY was
+ *            found for any RRSIG (treat as unsigned / unverifiable).
+ */
+int dnssec_validate_with_chain(struct Packet *response,
+                               const TrustAnchor *anchors,
+                               const DnssecChainCtx *chain)
 {
     if (!response || !response->request || response->recv_len < HEADER_LEN)
         return -1;
@@ -687,9 +774,9 @@ int dnssec_validate_response(struct Packet *response,
         pos = e + 4;
     }
 
-    int has_rrsig  = 0;
-    int validated  = 0;
-    int failed     = 0;
+    int has_rrsig = 0;
+    int validated = 0;
+    int failed    = 0;
 
     for (int a = 0; a < total_rrs && pos < buf_len; a++) {
         int name_pos = pos;
@@ -710,12 +797,17 @@ int dnssec_validate_response(struct Packet *response,
             }
 
             DnskeyRdata dk;
-            if (!find_dnskey(response, anchors,
+            if (!find_dnskey(response, anchors, chain, rrsig.signer_name,
                              rrsig.key_tag, rrsig.algorithm, &dk)) {
-                /* No matching DNSKEY in response or trust anchors — unverifiable */
+                /*
+                 * No matching DNSKEY found in the response, trust anchors,
+                 * or chain context — treat as "unverifiable", not "failed".
+                 * RFC 4035 §4.7: a validating resolver SHOULD NOT set AD bit
+                 * when it cannot obtain the necessary DNSKEY.
+                 */
                 free_rrsig_rdata(&rrsig);
                 pos = rdata_off + rdl;
-                continue;   /* treat as "unverifiable", not "failed" */
+                continue;
             }
 
             uint8_t *signed_data = NULL;
@@ -742,14 +834,24 @@ int dnssec_validate_response(struct Packet *response,
                         type_covered);
                 failed++;
             }
-            /* result == -1: unsupported algorithm — skip */
+            /* result == -1: unsupported algorithm — skip silently */
         }
 
         pos = rdata_off + rdl;
     }
 
-    if (!has_rrsig) return -1;    /* unsigned or DO bit ignored by upstream */
-    if (failed > 0) return 0;     /* at least one explicit failure */
-    if (validated > 0) return 1;  /* all attempted verifications passed */
-    return -1;                    /* had RRSIG(s) but no matching DNSKEY */
+    if (!has_rrsig) return -1;    /* unsigned or DO bit not honoured by upstream */
+    if (failed > 0) return 0;     /* at least one explicit failure              */
+    if (validated > 0) return 1;  /* all attempted verifications passed         */
+    return -1;                    /* had RRSIGs but no matching DNSKEY found    */
+}
+
+/*
+ * Convenience wrapper: validate without a chain context (root zone or cases
+ * where chain-of-trust was not accumulated).
+ */
+int dnssec_validate_response(struct Packet *response,
+                             const TrustAnchor *anchors)
+{
+    return dnssec_validate_with_chain(response, anchors, NULL);
 }

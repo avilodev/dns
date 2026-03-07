@@ -4,6 +4,7 @@
 #include "cache.h"
 #include "udp_client.h"
 #include "dnssec.h"
+#include "dnssec_chain.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -23,33 +24,54 @@ extern pthread_rwlock_t g_ns_cache_rwlock;
  * Public entry point for DNS resolution.
  * Holds g_ns_cache rdlock for the lifetime of the resolution call so the
  * SIGHUP handler cannot free the old cache while we are using it.
+ *
+ * A fresh DnssecChainCtx is created here and threaded through the entire
+ * resolution walk (including CNAME hops) so that DNSKEYs validated at one
+ * delegation level are available to verify RRSIGs deeper in the tree.
  */
 struct Packet* send_resolver(struct Packet* query)
 {
-    CnameChain chain = {0};
+    CnameChain    cname_chain   = {0};
+    DnssecChainCtx dnssec_chain;
+    dnssec_chain_init(&dnssec_chain);
+
     pthread_rwlock_rdlock(&g_ns_cache_rwlock);
-    struct Packet* result = send_resolver_internal(query, 0, &chain, NULL);
+    struct Packet* result = send_resolver_internal(query, 0, &cname_chain,
+                                                   NULL, &dnssec_chain);
     pthread_rwlock_unlock(&g_ns_cache_rwlock);
-    free_cname_chain(&chain);
+
+    free_cname_chain(&cname_chain);
+    dnssec_chain_free(&dnssec_chain);
     return result;
 }
 
-/* Public entry point with NS context (for NS name resolution). */
+/*
+ * Public entry point with NS context (for NS name resolution).
+ * Uses a separate DnssecChainCtx — NS sub-resolutions are independent
+ * resolution trees that should not share the parent's chain state.
+ */
 struct Packet* send_resolver_with_ns_context(struct Packet* query,
                                              NSResolutionContext* ns_context)
 {
-    CnameChain chain = {0};
+    CnameChain    cname_chain   = {0};
+    DnssecChainCtx dnssec_chain;
+    dnssec_chain_init(&dnssec_chain);
+
     pthread_rwlock_rdlock(&g_ns_cache_rwlock);
-    struct Packet* result = send_resolver_internal(query, 0, &chain, ns_context);
+    struct Packet* result = send_resolver_internal(query, 0, &cname_chain,
+                                                   ns_context, &dnssec_chain);
     pthread_rwlock_unlock(&g_ns_cache_rwlock);
-    free_cname_chain(&chain);
+
+    free_cname_chain(&cname_chain);
+    dnssec_chain_free(&dnssec_chain);
     return result;
 }
 
 /* Internal resolver: handles CNAME following, NS referral walking, and caching. */
 struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                                      CnameChain* chain,
-                                     NSResolutionContext* ns_context)
+                                     NSResolutionContext* ns_context,
+                                     DnssecChainCtx* dnssec_chain)
 {
     if (cname_depth >= MAX_CNAME_DEPTH) {
         fprintf(stderr, "Maximum CNAME chain depth (%d) reached\n", MAX_CNAME_DEPTH);
@@ -218,6 +240,34 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
             continue;
         }
 
+        // If we started from a cached NS and the very first query comes back
+        // SERVFAIL or REFUSED, the cached entry is likely stale (the zone may
+        // have been re-delegated to different nameservers).  Retry from fresh
+        // root hints, just as we do when the cached NS is unreachable.
+        if (started_from_cache && iteration == 1 &&
+            (response->rcode == RCODE_SERVER_FAILURE ||
+             response->rcode == RCODE_NOTIMP)) {
+            fprintf(stderr, "  Stale NS cache: cached NS returned rcode=%u,"
+                    " retrying from root hints\n", response->rcode);
+            free_packet(response);
+            response = NULL;
+            free(current_server_ip);
+            current_server_ip = NULL;
+            free_server_history(&visited);
+            memset(&visited, 0, sizeof(visited));
+            RESOLVE_CLEANUP();
+            started_from_cache = false;
+            iteration = 0;
+            int ridx = get_random_server();
+            if (ridx < 0 || ridx >= 13 || !g_hints[ridx] ||
+                !g_hints[ridx]->ipv4_record || !g_hints[ridx]->ipv4_record->ip) {
+                return NULL;
+            }
+            current_server_ip = strdup(g_hints[ridx]->ipv4_record->ip);
+            if (!current_server_ip) return NULL;
+            continue;
+        }
+
         // query_server succeeded: commit the pending NS cache entry using the
         // IP that actually responded, then clear it.
         if (g_ns_cache && pending_cache_key) {
@@ -229,12 +279,24 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
         // After the first successful query we no longer need the cache-fallback guard.
         started_from_cache = false;
 
-        // Warn on truncated responses.  For answer responses the client will
-        // see TC=1 and can retry over TCP.  For referrals we continue with
-        // whatever NS/AR records were returned; resolution may still succeed if
-        // glue or NS-name resolution provides a usable address.
-        if (response->tc) {
-            fprintf(stderr, "Warning: Truncated response (TC=1) from %s for %s"
+        // If the UDP response was truncated (TC=1), retry over TCP to get the
+        // full answer (RFC 1035 §4.2.2).  For referral responses (ancount==0,
+        // nscount>0) continue with partial glue data — a TCP fallback for a
+        // referral is uncommon and would delay resolution unnecessarily.
+        if (response->tc && response->ancount > 0) {
+            fprintf(stderr, "Warning: Truncated UDP answer from %s for %s"
+                    " — retrying over TCP\n",
+                    current_server_ip,
+                    query->full_domain ? query->full_domain : "?");
+            struct Packet* tcp_resp = query_server_tcp(current_server_ip, query);
+            if (tcp_resp) {
+                free_packet(response);
+                response = tcp_resp;
+            } else {
+                fprintf(stderr, "  TCP fallback failed, proceeding with truncated UDP answer\n");
+            }
+        } else if (response->tc) {
+            fprintf(stderr, "Warning: Truncated referral (TC=1) from %s for %s"
                     " — partial data, NS resolution may fall back to name lookup\n",
                     current_server_ip,
                     query->full_domain ? query->full_domain : "?");
@@ -352,12 +414,15 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                     return NULL;
                 }
 
-                // Recursively resolve CNAME target (pass ns_context through)
+                /* Recursively resolve CNAME target.  Pass the same dnssec_chain
+                 * so keys validated during this delegation walk are also
+                 * available when verifying RRSIGs in the CNAME target zone. */
                 struct Packet* final_answer = send_resolver_internal(
                     formatted,
                     cname_depth + 1,
                     chain,
-                    ns_context
+                    ns_context,
+                    dnssec_chain
                 );
 
                 free_packet(formatted);
@@ -399,8 +464,17 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
             // (result 0).  Missing DNSKEY or unsigned zone (result -1) is
             // treated as "unverifiable" and allowed through per RFC 4035 §4.7
             // (validating resolver behaviour when CD bit is not set).
-            if (g_trust_anchors) {
-                int dv = dnssec_validate_response(response, g_trust_anchors);
+            //
+            // dnssec_validate_with_chain() consults the per-resolution chain
+            // context so that intermediate-zone DNSKEYs validated at earlier
+            // delegation hops are used to verify RRSIGs in the final answer.
+            //
+            // RFC 4035 §3.1.6: if the client set CD (Checking Disabled), skip
+            // validation entirely and return data as-is.  The client takes
+            // responsibility for its own DNSSEC validation.
+            if (g_trust_anchors && !query->cd) {
+                int dv = dnssec_validate_with_chain(response, g_trust_anchors,
+                                                    dnssec_chain);
                 if (dv == 0) {
                     fprintf(stderr,
                             "DNSSEC: validation FAILED for %s — returning SERVFAIL\n",
@@ -519,6 +593,67 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
 
             /* Capture the actual NS TTL before freeing the referral response. */
             pending_cache_ttl = extract_referral_ns_ttl(response);
+
+            /*
+             * DNSSEC chain-of-trust: validate the referral's RRSIGs first
+             * (RFC 4035 §5), then scan for DS and DNSKEY records.
+             *
+             * referral_validated tells dnssec_chain_process_referral whether
+             * to store DS records.  We only store DS when the referral packet
+             * itself is signed and verified (result == 1).  Accepting DS from
+             * an unsigned referral would allow an on-path attacker to inject
+             * fake DS records that bypass validation of a signed child zone.
+             */
+            int referral_validated = -1;
+            if (dnssec_chain && g_trust_anchors)
+                referral_validated = dnssec_validate_with_chain(
+                    response, g_trust_anchors, dnssec_chain);
+
+            if (dnssec_chain)
+                dnssec_chain_process_referral(dnssec_chain, response,
+                                              g_trust_anchors, referral_validated);
+
+            /*
+             * Explicit DNSKEY query (RFC 4035 §5, chain completion).
+             *
+             * If DS records were stored for the delegated zone, the chain
+             * cannot be completed until we have the child zone's DNSKEY to
+             * match against those DS digests.  Referral packets rarely carry
+             * the child zone's DNSKEY, so we query for it explicitly now —
+             * before issuing the actual record query — using the already-
+             * chosen nameserver IP.
+             *
+             * This adds one extra UDP round-trip per signed delegation hop,
+             * which is the standard behaviour of DNSSEC-validating resolvers.
+             */
+            if (dnssec_chain && pending_cache_key && g_trust_anchors) {
+                int has_pending = 0;
+                for (PendingDS *pd = dnssec_chain->pending_ds; pd; pd = pd->next) {
+                    if (strcasecmp(pd->zone, pending_cache_key) == 0) {
+                        has_pending = 1;
+                        break;
+                    }
+                }
+                if (has_pending) {
+                    struct Packet dnskey_q = {0};
+                    dnskey_q.full_domain = strdup(pending_cache_key);
+                    dnskey_q.q_type  = QTYPE_DNSKEY;
+                    dnskey_q.q_class = 1;   /* IN */
+                    dnskey_q.qdcount = 1;
+                    struct Packet *dnskey_qfmt = format_resolver(&dnskey_q);
+                    free(dnskey_q.full_domain);
+                    if (dnskey_qfmt) {
+                        struct Packet *dnskey_resp =
+                            query_server(next_server_ip, dnskey_qfmt);
+                        if (dnskey_resp) {
+                            dnssec_chain_try_validate_dnskeys(
+                                dnssec_chain, dnskey_resp, pending_cache_key);
+                            free_packet(dnskey_resp);
+                        }
+                        free_packet(dnskey_qfmt);
+                    }
+                }
+            }
 
             free(current_server_ip);
             current_server_ip = next_server_ip;

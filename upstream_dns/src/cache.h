@@ -20,6 +20,7 @@ typedef struct AnswerCacheEntry {
     char* response_data;       // Raw DNS response packet
     ssize_t response_len;      // Length of response
     time_t expiry;             // Expiration timestamp
+    time_t stored_at;          // Time the entry was stored (for TTL decrement)
     struct AnswerCacheEntry* next;
 } AnswerCacheEntry;
 

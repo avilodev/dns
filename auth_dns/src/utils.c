@@ -18,19 +18,36 @@ int load_config(int argc, char** argv) {
     // Parse command line arguments
     int opt;
     while ((opt = getopt(argc, argv, "p:t:u:q:")) != -1) {
+        char *end;
+        long v;
         switch (opt) {
             case 'p':
-                g_config.upstream_port = atoi(optarg);
+                v = strtol(optarg, &end, 10);
+                if (*end != '\0' || v < 1 || v > 65535) {
+                    fprintf(stderr, "Invalid upstream port: %s\n", optarg);
+                    return -1;
+                }
+                g_config.upstream_port = (int)v;
                 break;
             case 't':
-                g_config.thread_count = atoi(optarg);
+                v = strtol(optarg, &end, 10);
+                if (*end != '\0' || v < 1 || v > 1024) {
+                    fprintf(stderr, "Invalid thread count: %s\n", optarg);
+                    return -1;
+                }
+                g_config.thread_count = (int)v;
                 break;
             case 'u':
                 free(g_config.upstream_dns);
                 g_config.upstream_dns = strdup(optarg);
                 break;
             case 'q':
-                g_config.queue_size = atoi(optarg);
+                v = strtol(optarg, &end, 10);
+                if (*end != '\0' || v < 1 || v > 1048576) {
+                    fprintf(stderr, "Invalid queue size: %s\n", optarg);
+                    return -1;
+                }
+                g_config.queue_size = (int)v;
                 break;
             default:
                 printf("Usage: ./auth_dns/bin/dns <-p Upstream DNS port> <-t thread_count> <-u upstream_dns> <-q queue_size>\n");
@@ -51,13 +68,14 @@ void write_dns_labels(const char* name, char* buf, int* pos) {
     char copy[256];
     strncpy(copy, name, sizeof(copy) - 1);
     copy[sizeof(copy) - 1] = '\0';
-    char* label = strtok(copy, ".");
+    char *saveptr;
+    char* label = strtok_r(copy, ".", &saveptr);
     while (label) {
         uint8_t label_len = (uint8_t)strlen(label);
         buf[(*pos)++] = (char)label_len;
         memcpy(buf + *pos, label, label_len);
         *pos += label_len;
-        label = strtok(NULL, ".");
+        label = strtok_r(NULL, ".", &saveptr);
     }
     buf[(*pos)++] = 0;  // Null terminator
 }

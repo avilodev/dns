@@ -1,7 +1,48 @@
 #include "cache.h"
 #include "request.h"
+#include "dns_wire.h"
 #include <string.h>
 #include <stdlib.h>
+
+/*
+ * Walk all RRs in a wire-format DNS response and clamp every TTL to max_ttl.
+ * OPT records (type 41) carry extended-RCODE/EDNS flags in their TTL field —
+ * skip them so EDNS negotiation is not corrupted.
+ */
+static void patch_response_ttls(unsigned char* buf, int len, uint32_t max_ttl)
+{
+    if (!buf || len < HEADER_LEN || max_ttl == 0) return;
+
+    uint16_t qdcount = ntohs(*(uint16_t*)(buf + 4));
+    uint16_t ancount = ntohs(*(uint16_t*)(buf + 6));
+    uint16_t nscount = ntohs(*(uint16_t*)(buf + 8));
+    uint16_t arcount = ntohs(*(uint16_t*)(buf + 10));
+    int pos = HEADER_LEN;
+
+    /* Skip question section */
+    for (int i = 0; i < qdcount && pos < len; i++) {
+        skip_dns_name(buf, len, &pos);
+        pos += 4; /* QTYPE + QCLASS */
+    }
+
+    int total_rrs = (int)ancount + nscount + arcount;
+    for (int i = 0; i < total_rrs && pos < len; i++) {
+        skip_dns_name(buf, len, &pos);
+        if (pos + 10 > len) break;
+
+        uint16_t rr_type = ntohs(*(uint16_t*)(buf + pos));
+        if (rr_type != 41) { /* skip OPT pseudo-RR */
+            uint32_t rr_ttl = ntohl(*(uint32_t*)(buf + pos + 4));
+            if (rr_ttl > max_ttl) {
+                uint32_t clamped = htonl(max_ttl);
+                memcpy(buf + pos + 4, &clamped, 4);
+            }
+        }
+
+        uint16_t rdlen = ntohs(*(uint16_t*)(buf + pos + 8));
+        pos += 10 + rdlen;
+    }
+}
 
 // Simple hash function
 static unsigned long hash_string(const char* str) {
@@ -230,7 +271,8 @@ int answer_cache_put(AnswerCache* cache, const char* domain, uint16_t qtype,
             entry->response_data = new_data;
             memcpy(entry->response_data, response_data, response_len);
             entry->response_len = response_len;
-            entry->expiry = time(NULL) + ttl;
+            entry->stored_at = time(NULL);
+            entry->expiry = entry->stored_at + ttl;
             pthread_mutex_unlock(&cache->lock);
             return 0;
         }
@@ -256,7 +298,8 @@ int answer_cache_put(AnswerCache* cache, const char* domain, uint16_t qtype,
     
     memcpy(new_entry->response_data, response_data, response_len);
     new_entry->response_len = response_len;
-    new_entry->expiry = time(NULL) + ttl;
+    new_entry->stored_at = time(NULL);
+    new_entry->expiry = new_entry->stored_at + ttl;
     new_entry->next = cache->buckets[index];
     cache->buckets[index] = new_entry;
     
@@ -277,8 +320,8 @@ struct Packet* answer_cache_get(AnswerCache* cache, const char* domain, uint16_t
     while (entry) {
         if (strcmp(entry->domain, domain) == 0 && entry->qtype == qtype) {
             if (entry->expiry > now) {
-                // Copy raw response data under the lock, then parse outside
-                // critical section to avoid holding mutex during allocation.
+                // Copy raw response data under the lock, then patch outside
+                // the critical section to avoid holding mutex during allocation.
                 ssize_t data_len = entry->response_len;
                 char* data_copy = malloc(data_len);
                 if (!data_copy) {
@@ -286,7 +329,15 @@ struct Packet* answer_cache_get(AnswerCache* cache, const char* domain, uint16_t
                     return NULL;
                 }
                 memcpy(data_copy, entry->response_data, data_len);
+                /* Compute remaining TTL: how many seconds until expiry. */
+                uint32_t remaining = (entry->expiry > now)
+                    ? (uint32_t)(entry->expiry - now) : 0;
                 pthread_mutex_unlock(&cache->lock);
+
+                /* RFC 1034 §4.1.3: decrement all RR TTLs by elapsed time
+                 * before returning the cached response to the client. */
+                patch_response_ttls((unsigned char*)data_copy, (int)data_len,
+                                    remaining);
 
                 struct Packet* pkt = parse_response(data_copy, data_len);
                 free(data_copy);
