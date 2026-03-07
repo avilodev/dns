@@ -1,7 +1,19 @@
 CC = gcc
+
+# ----------------------------------------------------------------------------
+# Paths (set here; passed to the compiler as -D defines so no path is
+# hardcoded in source files).
+#
+#   SERVER_PATH    — absolute path to this server's root directory.
+#                    Used to locate misc/ and config/ subdirectories at runtime.
+#   LOG_FILE_PATH  — where query logs are written.
+# ----------------------------------------------------------------------------
+SERVER_PATH   := $(abspath .)
+LOG_FILE_PATH := $(abspath ..)/logs/server.log
+
 CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP \
-         -DSERVER_PATH='"$(abspath .)"' \
-         -DLOG_FILE_PATH='"$(abspath ..)/logs/server.log"'
+         -DSERVER_PATH='"$(SERVER_PATH)"' \
+         -DLOG_FILE_PATH='"$(LOG_FILE_PATH)"'
 LDFLAGS = -pthread -lssl -lcrypto -latomic
 
 # Directories
