@@ -1,7 +1,3 @@
-# ============================================================
-# Build artifacts
-# ============================================================
-
 # Compiled binaries
 auth_dns/bin/
 upstream_dns/bin/
@@ -14,9 +10,6 @@ upstream_dns/obj/
 *.o
 *.d
 
-# ============================================================
-# Runtime / data files
-# ============================================================
 
 # Query logs (daily-rotating, can be large)
 logs/
@@ -24,23 +17,15 @@ logs/
 # Testing scripts and results
 testing/
 
-# ============================================================
-# Credentials and private keys
-# ============================================================
-
 # DNSSEC zone signing keys (private — never commit)
 auth_dns/config/*.pem
 auth_dns/config/*.key
 
-# Upstream trust anchor key (public IANA key — excluded to avoid
-# accidentally committing a modified/compromised version; fetch from
-# https://data.iana.org/root-anchors/root-anchors.xml instead)
+# Upstream trust anchor key
 upstream_dns/config/*.pem
 upstream_dns/config/*.key
 
-# ============================================================
 # Editor / IDE
-# ============================================================
 
 .vscode/
 .idea/
