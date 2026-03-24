@@ -13,7 +13,8 @@ LOG_FILE_PATH := $(abspath ..)/logs/server.log
 
 CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP \
          -DSERVER_PATH='"$(SERVER_PATH)"' \
-         -DLOG_FILE_PATH='"$(LOG_FILE_PATH)"'
+         -DLOG_FILE_PATH='"$(LOG_FILE_PATH)"' \
+         -DPID_FILE_PATH='"$(PID_FILE_PATH)"'
 LDFLAGS = -pthread -lssl -lcrypto -latomic
 
 # Directories
@@ -29,7 +30,8 @@ SOURCES = main.c auth.c logger.c request.c resolve.c \
 SRC_FILES = $(addprefix $(SRC_DIR)/, $(SOURCES))
 OBJECTS = $(addprefix $(OBJ_DIR)/, $(SOURCES:.c=.o))
 
-TARGET = $(BIN_DIR)/dns
+TARGET = $(BIN_DIR)/auth_dns
+PID_FILE_PATH = /run/auth_dns.pid
 
 # Default target
 all: directories $(TARGET)
@@ -60,16 +62,27 @@ rebuild: clean all
 run: $(TARGET)
 	sudo ./$(TARGET)
 
-# Install to /usr/local/sbin/auth_dns
-INSTALL_BIN = /usr/local/sbin
+# Install binary, systemd service, and logrotate config
+INSTALL_BIN  = /usr/local/sbin
+SYSTEMD_DIR  = /etc/systemd/system
+LOGROTATE_DIR = /etc/logrotate.d
+
 install: $(TARGET)
 	install -d $(INSTALL_BIN)
 	install -m 755 $(TARGET) $(INSTALL_BIN)/auth_dns
-	@echo "Installed: $(INSTALL_BIN)/auth_dns"
+	install -m 644 auth_dns.service $(SYSTEMD_DIR)/auth_dns.service
+	install -m 644 misc/logrotate-auth $(LOGROTATE_DIR)/auth_dns
+	systemctl daemon-reload
+	@echo "Installed auth_dns. Enable with: systemctl enable --now auth_dns"
 
 uninstall:
+	systemctl stop auth_dns 2>/dev/null || true
+	systemctl disable auth_dns 2>/dev/null || true
 	rm -f $(INSTALL_BIN)/auth_dns
-	@echo "Removed: $(INSTALL_BIN)/auth_dns"
+	rm -f $(SYSTEMD_DIR)/auth_dns.service
+	rm -f $(LOGROTATE_DIR)/auth_dns
+	systemctl daemon-reload
+	@echo "Removed auth_dns"
 
 # Debugging info
 debug:
@@ -80,4 +93,4 @@ debug:
 # Auto-generated header dependency files (from -MMD -MP)
 -include $(OBJECTS:.o=.d)
 
-.PHONY: all clean rebuild run debug directories install uninstall
+.PHONY: all clean rebuild run debug directories install uninstall install-service uninstall-service

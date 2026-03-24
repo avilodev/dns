@@ -237,7 +237,8 @@ static int append_rrsig(char *buf, int *pos,
                          uint16_t type_covered, uint32_t ttl,
                          const unsigned char *canon_rrset, size_t canon_rrset_len,
                          const ZoneKey *zsk,
-                         bool is_wildcard)
+                         bool is_wildcard,
+                         const char *explicit_rr_owner)
 {
     if (!buf || !pos || !owner_name || !canon_rrset || !zsk) return 0;
 
@@ -286,7 +287,12 @@ static int append_rrsig(char *buf, int *pos,
     int need = 2 + 2 + 2 + 4 + 2 + (int)rrsig_rdlen;
     if (*pos + need > MAXLINE) { free(sig); return 0; }
 
-    *(uint16_t*)(buf + *pos) = htons(DNS_NAME_PTR);                     *pos += 2;
+    /* Owner name: use compression ptr for answer section, or full labels for authority. */
+    if (explicit_rr_owner) {
+        write_dns_labels(explicit_rr_owner, buf, pos);
+    } else {
+        *(uint16_t*)(buf + *pos) = htons(DNS_NAME_PTR);             *pos += 2;
+    }
     *(uint16_t*)(buf + *pos) = htons(QTYPE_RRSIG);                *pos += 2;
     *(uint16_t*)(buf + *pos) = htons(1 /* IN */);                 *pos += 2;
     *(uint32_t*)(buf + *pos) = htonl(ttl);                        *pos += 4;
@@ -295,6 +301,244 @@ static int append_rrsig(char *buf, int *pos,
     memcpy(buf + *pos, sig, sig_len);                              *pos += (int)sig_len;
     free(sig);
     return 1;
+}
+
+/* =========================================================================
+ * NSEC support — RFC 4034 §4
+ * ========================================================================= */
+
+/*
+ * is_in_zone — true if name is the zone apex or a subdomain of it.
+ * "mail.avilo.com" is in "avilo.com"; "avilo.com" is in "avilo.com".
+ */
+static bool is_in_zone(const char *name, const char *zone)
+{
+    if (!name || !zone) return false;
+    if (strcmp(name, zone) == 0) return true;
+    size_t nlen = strlen(name), zlen = strlen(zone);
+    return nlen > zlen &&
+           name[nlen - zlen - 1] == '.' &&
+           strcmp(name + nlen - zlen, zone) == 0;
+}
+
+/*
+ * dns_canon_cmp — canonical DNS name order (RFC 4034 §6.1).
+ * Labels compared right-to-left, case-insensitive.
+ * Returns <0 if a < b, 0 if equal, >0 if a > b.
+ */
+static int dns_canon_cmp(const char *a, const char *b)
+{
+    /* Split each name into label pointers by scanning for dots. */
+    char abuf[256], bbuf[256];
+    strncpy(abuf, a, 255); abuf[255] = '\0';
+    strncpy(bbuf, b, 255); bbuf[255] = '\0';
+
+    const char *la[128];  int na = 0;
+    const char *lb[128];  int nb = 0;
+
+    /* Split abuf in-place: turn dots into NULs, record label starts. */
+    la[na++] = abuf;
+    for (char *p = abuf; *p; p++) {
+        if (*p == '.' && *(p+1) != '\0') { *p = '\0'; la[na++] = p + 1; }
+    }
+    lb[nb++] = bbuf;
+    for (char *p = bbuf; *p; p++) {
+        if (*p == '.' && *(p+1) != '\0') { *p = '\0'; lb[nb++] = p + 1; }
+    }
+
+    /* Compare from rightmost label. */
+    int ia = na - 1, ib = nb - 1;
+    while (ia >= 0 && ib >= 0) {
+        int c = strcasecmp(la[ia], lb[ib]);
+        if (c != 0) return c;
+        ia--; ib--;
+    }
+    /* All compared labels matched; shorter name sorts first. */
+    if (ia < 0 && ib < 0) return 0;
+    return (ia < 0) ? -1 : 1;
+}
+
+/*
+ * nsec_set_type — set a type bit in a 32-byte window-0 bitmap.
+ * Types 0-255 only (window 0).
+ */
+static void nsec_set_type(unsigned char bm[32], int *max_type, uint16_t t)
+{
+    if (t < 256) {
+        bm[t / 8] |= (uint8_t)(0x80u >> (t % 8));
+        if ((int)t > *max_type) *max_type = (int)t;
+    }
+}
+
+/*
+ * build_nsec_type_bitmap — build NSEC type bitmap (RFC 4034 §4.1.2) for owner.
+ * Scans auth_domains[] for all record types present at owner.
+ * Returns the total length written into out[] (window-block format), 0 on error.
+ */
+static int build_nsec_type_bitmap(const char *owner,
+                                   unsigned char *out, int max_out)
+{
+    unsigned char bm[32] = {0};
+    int max_type = -1;
+
+    for (int i = 0; i < auth_domain_count; i++) {
+        const struct AuthDomain *d = &auth_domains[i];
+        if (strcmp(d->domain, owner) != 0) continue;
+
+        if (d->has_soa)    nsec_set_type(bm, &max_type, QTYPE_SOA);
+        if (d->has_ns)     nsec_set_type(bm, &max_type, QTYPE_NS);
+        if (d->has_mx)     nsec_set_type(bm, &max_type, QTYPE_MX);
+        if (d->has_txt)    nsec_set_type(bm, &max_type, QTYPE_TXT);
+        if (d->has_cname)  nsec_set_type(bm, &max_type, QTYPE_CNAME);
+        if (d->has_srv)    nsec_set_type(bm, &max_type, QTYPE_SRV);
+        if (d->has_https)  nsec_set_type(bm, &max_type, QTYPE_HTTPS);
+        if (d->has_ipv6)   nsec_set_type(bm, &max_type, QTYPE_AAAA);
+        /* A record: ip set, no typed flags, not blocked */
+        if (!d->has_mx && !d->has_ipv6 && !d->has_cname && !d->has_ns &&
+            !d->has_txt && !d->has_srv && !d->has_soa && !d->is_blocked &&
+            d->ip[0] != '\0' && strcmp(d->ip, "0.0.0.0") != 0)
+            nsec_set_type(bm, &max_type, QTYPE_A);
+    }
+
+    if (max_type < 0) return 0;  /* nothing found at this name */
+
+    /* When the zone is signed, the NSEC bitmap must include RRSIG and NSEC. */
+    if (g_zone_keys && find_zsk_for_owner(owner)) {
+        nsec_set_type(bm, &max_type, QTYPE_RRSIG);
+        nsec_set_type(bm, &max_type, QTYPE_NSEC);
+    }
+
+    int bm_bytes = (max_type / 8) + 1;
+    if (2 + bm_bytes > max_out) return 0;
+    out[0] = 0;                             /* window number (types 0-255) */
+    out[1] = (unsigned char)bm_bytes;
+    memcpy(out + 2, bm, bm_bytes);
+    return 2 + bm_bytes;
+}
+
+/*
+ * nsec_find_covering — find the NSEC owner and next-name for a denial response.
+ *
+ * is_nxdomain = true:  qname doesn't exist; find predecessor → next existing name.
+ * is_nxdomain = false: qname exists but no data of queried type (NODATA);
+ *                      owner = qname, next = next name in canonical order.
+ *
+ * zone: SOA domain (e.g. "avilo.com")
+ * Returns 1 on success, 0 if NSEC data not available.
+ */
+static int nsec_find_covering(const char *zone, const char *qname,
+                               bool is_nxdomain,
+                               char owner_out[256], char next_out[256])
+{
+    /* Collect unique names in this zone. */
+    char names[256][256];
+    int  name_count = 0;
+
+    for (int i = 0; i < auth_domain_count && name_count < 256; i++) {
+        if (auth_domains[i].is_blocked) continue;  /* blocked names not in NSEC chain */
+        const char *n = auth_domains[i].domain;
+        if (!is_in_zone(n, zone)) continue;
+
+        bool dup = false;
+        for (int j = 0; j < name_count && !dup; j++)
+            if (strcmp(names[j], n) == 0) dup = true;
+        if (!dup) {
+            memcpy(names[name_count], n, 256);
+            name_count++;
+        }
+    }
+
+    if (name_count == 0) return 0;
+
+    /* Insertion-sort by canonical order (zones are tiny). */
+    for (int i = 1; i < name_count; i++) {
+        char tmp[256];
+        memcpy(tmp, names[i], 256);
+        int j = i - 1;
+        while (j >= 0 && dns_canon_cmp(names[j], tmp) > 0) {
+            memcpy(names[j + 1], names[j], 256);
+            j--;
+        }
+        memcpy(names[j + 1], tmp, 256);
+    }
+
+    if (is_nxdomain) {
+        /*
+         * Find the last name < qname (predecessor).
+         * If qname < all names, predecessor wraps to the last name in the zone.
+         */
+        int pred_idx = name_count - 1;  /* default: wrap-around */
+        for (int i = 0; i < name_count; i++) {
+            if (dns_canon_cmp(names[i], qname) >= 0) break;
+            pred_idx = i;
+        }
+        int next_idx = (pred_idx + 1) % name_count;
+        memcpy(owner_out, names[pred_idx], 256);
+        memcpy(next_out,  names[next_idx],  256);
+    } else {
+        /* NODATA: owner is qname itself. */
+        int owner_idx = -1;
+        for (int i = 0; i < name_count; i++) {
+            if (strcmp(names[i], qname) == 0) { owner_idx = i; break; }
+        }
+        if (owner_idx < 0) return 0;
+        int next_idx = (owner_idx + 1) % name_count;
+        memcpy(owner_out, names[owner_idx], 256);
+        memcpy(next_out,  names[next_idx],  256);
+    }
+    return 1;
+}
+
+/*
+ * append_nsec_authority — append an NSEC RR (+ optional RRSIG) to the
+ * authority section of a response already in buf[0..*pos].
+ * Updates NSCOUNT at wire offset 8.
+ */
+static void append_nsec_authority(char *buf, int *pos,
+                                   const char *owner_name,
+                                   const char *next_name,
+                                   const unsigned char *type_bm, int type_bm_len,
+                                   const struct Packet *req)
+{
+    /* NSEC RDATA: next-domain-name (wire, uncompressed) + type bitmap */
+    unsigned char rdata[600];
+    int rdata_len = 0;
+    write_dns_labels(next_name, (char*)rdata, &rdata_len);
+    if (rdata_len + type_bm_len > (int)sizeof(rdata)) return;
+    memcpy(rdata + rdata_len, type_bm, type_bm_len);
+    rdata_len += type_bm_len;
+
+    uint32_t ttl = DEFAULT_RECORD_TTL;
+    int need = 300 + rdata_len;
+    if (*pos + need > MAXLINE) return;
+
+    /* Write NSEC RR: owner (full wire labels) + type + class + ttl + rdlen + rdata */
+    write_dns_labels(owner_name, buf, pos);
+    *(uint16_t*)(buf + *pos) = htons(QTYPE_NSEC);            *pos += 2;
+    *(uint16_t*)(buf + *pos) = htons(1 /* IN */);             *pos += 2;
+    *(uint32_t*)(buf + *pos) = htonl(ttl);                   *pos += 4;
+    *(uint16_t*)(buf + *pos) = htons((uint16_t)rdata_len);   *pos += 2;
+    memcpy(buf + *pos, rdata, rdata_len);                    *pos += rdata_len;
+
+    /* Increment NSCOUNT */
+    uint16_t nscount = ntohs(*(uint16_t*)(buf + 8));
+    *(uint16_t*)(buf + 8) = htons(nscount + 1);
+
+    /* Append RRSIG(NSEC) when DO=1 */
+    if (req->do_bit && g_zone_keys) {
+        const ZoneKey *zsk = find_zsk_for_owner(owner_name);
+        if (zsk) {
+            unsigned char canon[2048];
+            size_t canon_pos = 0;
+            canon_rr_append(canon, &canon_pos, sizeof(canon),
+                            owner_name, QTYPE_NSEC, ttl, rdata, rdata_len);
+            if (append_rrsig(buf, pos, owner_name, QTYPE_NSEC, ttl,
+                              canon, canon_pos, zsk, false, owner_name)) {
+                nscount = ntohs(*(uint16_t*)(buf + 8));
+                *(uint16_t*)(buf + 8) = htons(nscount + 1);
+            }
+        }
+    }
 }
 
 /* =========================================================================
@@ -350,7 +594,7 @@ static struct Packet *build_a_response(struct Packet *req, const char *owner)
                 canon_rr_append(canon, &canon_pos, sizeof(canon),
                                 owner, QTYPE_A, ttl, rdatas[i], 4);
             if (append_rrsig(r->request, &pos, owner, QTYPE_A, ttl,
-                              canon, canon_pos, zsk, false))
+                              canon, canon_pos, zsk, false, NULL))
                 *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
         }
     }
@@ -400,7 +644,7 @@ static struct Packet *build_aaaa_response(struct Packet *req, const char *owner)
                 canon_rr_append(canon, &canon_pos, sizeof(canon),
                                 owner, QTYPE_AAAA, ttl, rdatas[i], 16);
             if (append_rrsig(r->request, &pos, owner, QTYPE_AAAA, ttl,
-                              canon, canon_pos, zsk, false))
+                              canon, canon_pos, zsk, false, NULL))
                 *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
         }
     }
@@ -458,7 +702,7 @@ static struct Packet *build_mx_response(struct Packet *req, const char *owner)
     if (req->do_bit && canon_pos > 0) {
         const ZoneKey *zsk = find_zsk_for_owner(owner);
         if (zsk && append_rrsig(r->request, &pos, owner, QTYPE_MX, ttl,
-                                 canon, canon_pos, zsk, false))
+                                 canon, canon_pos, zsk, false, NULL))
             *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
     }
 
@@ -511,7 +755,7 @@ static struct Packet *build_ns_response(struct Packet *req, const char *owner)
     if (req->do_bit && canon_pos > 0) {
         const ZoneKey *zsk = find_zsk_for_owner(owner);
         if (zsk && append_rrsig(r->request, &pos, owner, QTYPE_NS, ttl,
-                                 canon, canon_pos, zsk, false))
+                                 canon, canon_pos, zsk, false, NULL))
             *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
     }
 
@@ -580,7 +824,7 @@ static struct Packet *build_txt_response(struct Packet *req, const char *owner)
     if (req->do_bit && canon_pos > 0) {
         const ZoneKey *zsk = find_zsk_for_owner(owner);
         if (zsk && append_rrsig(r->request, &pos, owner, QTYPE_TXT, ttl,
-                                 canon, canon_pos, zsk, false))
+                                 canon, canon_pos, zsk, false, NULL))
             *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
     }
 
@@ -641,7 +885,68 @@ static struct Packet *build_srv_response(struct Packet *req, const char *owner)
     if (req->do_bit && canon_pos > 0) {
         const ZoneKey *zsk = find_zsk_for_owner(owner);
         if (zsk && append_rrsig(r->request, &pos, owner, QTYPE_SRV, ttl,
-                                 canon, canon_pos, zsk, false))
+                                 canon, canon_pos, zsk, false, NULL))
+            *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
+    }
+
+    r->recv_len = pos;
+    return r;
+}
+
+/* ---- HTTPS record (RFC 9460) ---- */
+static struct Packet *build_https_response(struct Packet *req, const char *owner)
+{
+    typedef struct { uint16_t prio; char target[256]; } HTTPSEnt;
+    HTTPSEnt entries[16];
+    int rr_count = 0;
+    uint32_t ttl = DEFAULT_RECORD_TTL;
+
+    for (int i = 0; i < auth_domain_count && rr_count < 16; i++) {
+        const struct AuthDomain *d = &auth_domains[i];
+        if (!d->has_https || strcmp(d->domain, owner) != 0) continue;
+        entries[rr_count].prio = d->https_priority;
+        strncpy(entries[rr_count].target, d->https_target, 255);
+        entries[rr_count].target[255] = '\0';
+        rr_count++;
+        if (d->ttl) ttl = d->ttl;
+    }
+    if (rr_count == 0) return NULL;
+
+    int pos;
+    struct Packet *r = begin_response(req, &pos, (uint16_t)rr_count);
+    if (!r) return NULL;
+
+    unsigned char canon[4096];
+    size_t canon_pos = 0;
+
+    for (int i = 0; i < rr_count; i++) {
+        /* HTTPS RDATA: SvcPriority(2) + TargetName(wire) + SvcParams(none) */
+        unsigned char rdata[300];
+        int rdata_len = 0;
+        *(uint16_t*)(rdata + rdata_len) = htons(entries[i].prio); rdata_len += 2;
+        if (strcmp(entries[i].target, ".") == 0) {
+            rdata[rdata_len++] = 0;   /* root label: "." */
+        } else {
+            write_dns_labels(entries[i].target, (char*)rdata, &rdata_len);
+        }
+
+        if (pos + 2+2+2+4+2+rdata_len > MAXLINE) { rr_count = i; break; }
+        *(uint16_t*)(r->request + pos) = htons(DNS_NAME_PTR);              pos += 2;
+        *(uint16_t*)(r->request + pos) = htons(QTYPE_HTTPS);         pos += 2;
+        *(uint16_t*)(r->request + pos) = htons(1);                   pos += 2;
+        *(uint32_t*)(r->request + pos) = htonl(ttl);                 pos += 4;
+        *(uint16_t*)(r->request + pos) = htons((uint16_t)rdata_len); pos += 2;
+        memcpy(r->request + pos, rdata, rdata_len);                   pos += rdata_len;
+
+        canon_rr_append(canon, &canon_pos, sizeof(canon),
+                        owner, QTYPE_HTTPS, ttl, rdata, rdata_len);
+    }
+    *(uint16_t*)(r->request + 6) = htons((uint16_t)rr_count);
+
+    if (req->do_bit && canon_pos > 0) {
+        const ZoneKey *zsk = find_zsk_for_owner(owner);
+        if (zsk && append_rrsig(r->request, &pos, owner, QTYPE_HTTPS, ttl,
+                                 canon, canon_pos, zsk, false, NULL))
             *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
     }
 
@@ -688,7 +993,7 @@ static struct Packet *build_cname_response(struct Packet *req, const char *owner
             canon_rr_append(canon, &canon_pos, sizeof(canon),
                             owner, QTYPE_CNAME, ttl, rdata, rdata_len);
             if (append_rrsig(r->request, &pos, owner, QTYPE_CNAME, ttl,
-                              canon, canon_pos, zsk, false))
+                              canon, canon_pos, zsk, false, NULL))
                 *(uint16_t*)(r->request + 6) = htons(2);
         }
     }
@@ -744,7 +1049,7 @@ static struct Packet *build_soa_response(struct Packet *req, const char *owner)
             canon_rr_append(canon, &canon_pos, sizeof(canon),
                             owner, QTYPE_SOA, ttl, rdata, rdata_len);
             if (append_rrsig(r->request, &pos, owner, QTYPE_SOA, ttl,
-                              canon, canon_pos, zsk, false))
+                              canon, canon_pos, zsk, false, NULL))
                 *(uint16_t*)(r->request + 6) = htons(2);
         }
     }
@@ -816,7 +1121,7 @@ static struct Packet *build_dnskey_response(struct Packet *req, const char *owne
     if (req->do_bit && canon_pos > 0) {
         const ZoneKey *ksk = find_ksk_for_zone(owner);
         if (ksk && append_rrsig(r->request, &pos, owner, QTYPE_DNSKEY, ttl,
-                                 canon, canon_pos, ksk, false))
+                                 canon, canon_pos, ksk, false, NULL))
             *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
     }
 
@@ -924,6 +1229,20 @@ struct Packet *check_internal(struct Packet *req)
         } else {
             /* Wildcard-covered but no record of this type → NODATA */
             r = build_nodata_response(req, soa);
+            if (r && req->do_bit && soa) {
+                int pos = (int)r->recv_len;
+                char nsec_owner[256], nsec_next[256];
+                if (nsec_find_covering(soa->domain, owner, false,
+                                       nsec_owner, nsec_next)) {
+                    unsigned char type_bm[64];
+                    int bm_len = build_nsec_type_bitmap(nsec_owner,
+                                                        type_bm, sizeof(type_bm));
+                    if (bm_len > 0)
+                        append_nsec_authority(r->request, &pos, nsec_owner,
+                                              nsec_next, type_bm, bm_len, req);
+                    r->recv_len = pos;
+                }
+            }
         }
 
         pthread_rwlock_unlock(&g_auth_domains_lock);
@@ -935,8 +1254,33 @@ struct Packet *check_internal(struct Packet *req)
         if (auth_domains[i].is_blocked &&
             strcmp(auth_domains[i].domain, owner) == 0) {
             struct Packet *r = build_nxdomain_response(req, soa);
+            if (r && req->do_bit && soa) {
+                int pos = (int)r->recv_len;
+                char nsec_owner[256], nsec_next[256];
+                if (nsec_find_covering(soa->domain, owner, true,
+                                       nsec_owner, nsec_next)) {
+                    unsigned char type_bm[64];
+                    int bm_len = build_nsec_type_bitmap(nsec_owner,
+                                                        type_bm, sizeof(type_bm));
+                    if (bm_len > 0)
+                        append_nsec_authority(r->request, &pos, nsec_owner,
+                                              nsec_next, type_bm, bm_len, req);
+                    r->recv_len = pos;
+                }
+            }
             pthread_rwlock_unlock(&g_auth_domains_lock);
             return r;
+        }
+    }
+
+    /* RFC 1034 §3.6.2: if the owner is a CNAME alias, return the CNAME RR
+     * for any query type except QTYPE_CNAME (direct lookup) and QTYPE_ANY
+     * (answered with HINFO per RFC 8482 regardless of record type). */
+    if (req->q_type != QTYPE_CNAME && req->q_type != QTYPE_ANY) {
+        struct Packet *cr = build_cname_response(req, owner);
+        if (cr) {
+            pthread_rwlock_unlock(&g_auth_domains_lock);
+            return cr;
         }
     }
 
@@ -972,6 +1316,11 @@ struct Packet *check_internal(struct Packet *req)
 
     case QTYPE_SRV:
         r = build_srv_response(req, owner);
+        if (!r) r = build_nodata_response(req, soa);
+        break;
+
+    case QTYPE_HTTPS:
+        r = build_https_response(req, owner);
         if (!r) r = build_nodata_response(req, soa);
         break;
 
@@ -1019,6 +1368,28 @@ struct Packet *check_internal(struct Packet *req)
     default:
         r = build_nodata_response(req, soa);
         break;
+    }
+
+    /* For NODATA responses when DO=1: append NSEC proof of non-existence
+     * (RFC 4034 §3.1.3).  Detect NODATA by RCODE=NOERROR + ANCOUNT=0. */
+    if (r && req->do_bit && soa) {
+        uint16_t flags   = ntohs(*(uint16_t*)(r->request + 2));
+        uint16_t rcode   = flags & 0x000Fu;
+        uint16_t ancount = ntohs(*(uint16_t*)(r->request + 6));
+        if (rcode == 0 && ancount == 0) {
+            int pos = (int)r->recv_len;
+            char nsec_owner[256], nsec_next[256];
+            if (nsec_find_covering(soa->domain, owner, false,
+                                   nsec_owner, nsec_next)) {
+                unsigned char type_bm[64];
+                int bm_len = build_nsec_type_bitmap(nsec_owner,
+                                                    type_bm, sizeof(type_bm));
+                if (bm_len > 0)
+                    append_nsec_authority(r->request, &pos, nsec_owner,
+                                          nsec_next, type_bm, bm_len, req);
+                r->recv_len = pos;
+            }
+        }
     }
 
     pthread_rwlock_unlock(&g_auth_domains_lock);
@@ -1220,6 +1591,23 @@ static int _load_domains_from_file(const char *filename)
             strcpy(d->ip, "0.0.0.0");
             fprintf(stderr, "  Loaded: %-32s -> SRV %u %u %u %s\n",
                     current_domain, prio, weight, port, target);
+            count++;
+
+        /* --- HTTPS (RFC 9460) ------------------------------------------- */
+        } else if (strcasecmp(type_kw, "HTTPS") == 0) {
+            unsigned int prio = 0;
+            char target[256] = {0};
+            if (sscanf(line, "%*s %u %255s", &prio, target) != 2) {
+                fprintf(stderr, "Warning: Bad HTTPS line: %s\n", line);
+                continue;
+            }
+            strlower(target);
+            d->has_https      = true;
+            d->https_priority = (uint16_t)prio;
+            snprintf(d->https_target, sizeof(d->https_target), "%s", target);
+            strcpy(d->ip, "0.0.0.0");
+            fprintf(stderr, "  Loaded: %-32s -> HTTPS %u %s\n",
+                    current_domain, prio, target);
             count++;
 
         /* --- NXDOMAIN --------------------------------------------------- */

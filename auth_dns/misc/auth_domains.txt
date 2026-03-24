@@ -59,6 +59,7 @@ SRV    10  1  993  mail.avilo.com
 SOA    ns1.avilo.priv  hostmaster.avilo.priv  2026022802  3600  900  604800  300
 NS     ns1.avilo.priv
 NS     ns2.avilo.priv
+A      192.168.1.2
 MX     10  mail.avilo.priv
 
 [mail.avilo.priv]
@@ -69,6 +70,26 @@ A      192.168.1.2
 
 [ns2.avilo.priv]
 A      192.168.1.2 
+
+
+# ============================================================
+# Zone: adoliva.com
+# ============================================================
+[adoliva.com]
+SOA    ns1.adoliva.com  hostmaster.adoliva.com  2026030701  3600  900  604800  300
+NS     ns1.adoliva.com
+NS     ns2.adoliva.com
+A      192.168.1.2
+MX     10  mail.adoliva.com
+
+[mail.adoliva.com]
+A      192.168.1.3
+
+[ns1.adoliva.com]
+A      192.168.1.2
+
+[ns2.adoliva.com]
+A      192.168.1.2
 
 
 # ============================================================

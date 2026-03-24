@@ -19,6 +19,15 @@ Config g_config;
 /* Defined in auth.c; NULL when DNSSEC signing is not configured. */
 extern ZoneKey *g_zone_keys;
 
+/* Write PID to PID_FILE_PATH; best-effort, non-fatal. */
+static void write_pid_file(void) {
+    FILE *f = fopen(PID_FILE_PATH, "w");
+    if (!f) { perror("Warning: Cannot write PID file " PID_FILE_PATH); return; }
+    fprintf(f, "%d\n", (int)getpid());
+    fclose(f);
+}
+static void remove_pid_file(void) { unlink(PID_FILE_PATH); }
+
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_reload  = 0;
 
@@ -54,16 +63,6 @@ static void print_qtype_stats(void) {
         printf("║  %-10s %8" PRIu64 "               ║\n", "OTHER", other);
     printf("╚════════════════════════════════════════════╝\n\n");
 }
-
-/* --- UDP query context (IPv4 or IPv6) ------------------------------------ */
-struct UDPQueryContext {
-    int dns_sock;
-    struct sockaddr_storage client_addr;
-    socklen_t client_addr_len;
-    char* buffer;
-    ssize_t recv_len;
-    unsigned long query_num;
-};
 
 /* --- TCP query context --------------------------------------------------- */
 struct TCPQueryContext {
@@ -113,25 +112,6 @@ static void setup_signals(void) {
 }
 
 /* --- Socket helpers ------------------------------------------------------- */
-
-static int create_udp_socket_v4(int port) {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) { perror("Error: socket() IPv4 UDP"); exit(EXIT_FAILURE); }
-    int opt = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons(port);
-    if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("Error: bind() IPv4 UDP");
-        printf("Note: Port %d requires root privileges.\n", port);
-        close(sock);
-        exit(EXIT_FAILURE);
-    }
-    return sock;
-}
 
 /* Returns -1 if the kernel has no IPv6 support; doesn't exit. */
 static int create_udp_socket_v6(int port) {
@@ -219,109 +199,96 @@ static struct Packet* resolve_query(struct Packet* pkt) {
     return resolve_recursive(pkt);
 }
 
-/* --- Worker: UDP query --------------------------------------------------- */
+/* --- UDP packet handler — called inline by each SO_REUSEPORT worker ------- */
 
-void* process_udp_query(void* arg) {
-    struct UDPQueryContext* ctx = (struct UDPQueryContext*)arg;
-
+/*
+ * handle_udp_packet — core UDP query processing.
+ * buf is a caller-owned stack buffer; no heap allocation needed for this path.
+ */
+static void handle_udp_packet(int sock,
+                               const struct sockaddr_storage *caddr,
+                               socklen_t clen,
+                               char *buf, ssize_t n)
+{
     char client_ip[INET6_ADDRSTRLEN] = "?";
     uint16_t client_port = 0;
-    if (ctx->client_addr.ss_family == AF_INET6) {
-        struct sockaddr_in6* s6 = (struct sockaddr_in6*)&ctx->client_addr;
+    if (caddr->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6*)caddr;
         inet_ntop(AF_INET6, &s6->sin6_addr, client_ip, sizeof(client_ip));
         client_port = ntohs(s6->sin6_port);
     } else {
-        struct sockaddr_in* s4 = (struct sockaddr_in*)&ctx->client_addr;
+        const struct sockaddr_in *s4 = (const struct sockaddr_in*)caddr;
         inet_ntop(AF_INET, &s4->sin_addr, client_ip, sizeof(client_ip));
         client_port = ntohs(s4->sin_port);
     }
 
-    struct Packet* pkt = parse_request_headers(ctx->buffer, ctx->recv_len);
+    struct Packet *pkt = parse_request_headers(buf, n);
     if (!pkt) {
-        fprintf(stderr, "Failed to parse packet from %s:%u\n", client_ip, client_port);
         log_entry(client_ip, client_port, 0, "PARSE_ERROR", RCODE_SERVER_FAILURE, NULL);
-        send_servfail_udp(ctx->dns_sock,
-                          (const struct sockaddr*)&ctx->client_addr, ctx->client_addr_len,
-                          ctx->buffer, ctx->recv_len);
-        free(ctx->buffer);
-        free(ctx);
-        return NULL;
+        send_servfail_udp(sock, (const struct sockaddr*)caddr, clen, buf, n);
+        return;
     }
 
     // Non-standard opcode: special-case NOTIFY (opcode 4, RFC 1996)
     if (pkt->rcode == RCODE_NOTIMP) {
         unsigned char reply[12] = {0};
-        reply[0] = (unsigned char)ctx->buffer[0];
-        reply[1] = (unsigned char)ctx->buffer[1];
+        reply[0] = (unsigned char)buf[0];
+        reply[1] = (unsigned char)buf[1];
         if (pkt->opcode == 4) {
-            /* NOTIFY: respond NOERROR QR=1 OPCODE=4 (RFC 1996 §4) */
-            reply[2] = 0x80 | (4 << 3); // QR=1, OPCODE=4
-            reply[3] = 0x00;             // RCODE=NOERROR
+            reply[2] = 0x80 | (4 << 3);
+            reply[3] = 0x00;
         } else {
-            reply[2] = 0x80;                   // QR=1
-            reply[3] = 0x80 | RCODE_NOTIMP;   // RA=1, RCODE=4
+            reply[2] = 0x80;
+            reply[3] = 0x80 | RCODE_NOTIMP;
         }
-        sendto(ctx->dns_sock, reply, sizeof(reply), 0,
-               (const struct sockaddr*)&ctx->client_addr, ctx->client_addr_len);
+        sendto(sock, reply, sizeof(reply), 0, (const struct sockaddr*)caddr, clen);
         free_packet(pkt);
-        free(ctx->buffer);
-        free(ctx);
-        return NULL;
+        return;
     }
 
     // Pre-set parser errors (e.g. FORMERR for invalid QCLASS, RFC 1035)
     if (pkt->rcode != 0) {
         unsigned char err[12] = {0};
-        err[0] = (unsigned char)ctx->buffer[0];
-        err[1] = (unsigned char)ctx->buffer[1];
-        err[2] = 0x80;                          // QR=1
-        err[3] = 0x80 | (pkt->rcode & 0xF);    // RA=1, RCODE
-        sendto(ctx->dns_sock, err, sizeof(err), 0,
-               (const struct sockaddr*)&ctx->client_addr, ctx->client_addr_len);
+        err[0] = (unsigned char)buf[0];
+        err[1] = (unsigned char)buf[1];
+        err[2] = 0x80;
+        err[3] = 0x80 | (pkt->rcode & 0xF);
+        sendto(sock, err, sizeof(err), 0, (const struct sockaddr*)caddr, clen);
         free_packet(pkt);
-        free(ctx->buffer);
-        free(ctx);
-        return NULL;
+        return;
     }
 
     // Unsupported EDNS version: send BADVERS (RFC 6891 §6.1.3)
     if (pkt->edns_present && pkt->edns_version > 0) {
-        struct Packet* bv = build_badvers_response(pkt);
+        struct Packet *bv = build_badvers_response(pkt);
         if (bv) {
-            send_response(ctx->dns_sock, bv,
-                          (const struct sockaddr*)&ctx->client_addr, ctx->client_addr_len);
+            send_response(sock, bv, (const struct sockaddr*)caddr, clen);
             free_packet(bv);
         }
         free_packet(pkt);
-        free(ctx->buffer);
-        free(ctx);
-        return NULL;
+        return;
     }
 
-    /* Count this query. */
     atomic_fetch_add(&g_total_queries, 1);
     {
         uint8_t idx = (pkt->q_type < 256) ? (uint8_t)pkt->q_type : 0;
         atomic_fetch_add(&g_qtype_counters[idx], 1);
     }
 
-    struct Packet* answer = resolve_query(pkt);
+    struct Packet *answer = resolve_query(pkt);
 
     if (!answer) {
         log_entry(client_ip, client_port, pkt->q_type, pkt->full_domain, RCODE_SERVER_FAILURE, NULL);
-        struct Packet* sf = build_servfail_response(pkt);
+        struct Packet *sf = build_servfail_response(pkt);
         if (sf) {
-            send_response(ctx->dns_sock, sf,
-                          (const struct sockaddr*)&ctx->client_addr, ctx->client_addr_len);
+            send_response(sock, sf, (const struct sockaddr*)caddr, clen);
             free_packet(sf);
         }
         free_packet(pkt);
-        free(ctx->buffer);
-        free(ctx);
-        return NULL;
+        return;
     }
 
-    char* resolved_ip = extract_ip_from_response(answer);
+    char *resolved_ip = extract_ip_from_response(answer);
     {
         uint8_t ans_rcode = (answer->recv_len >= HEADER_LEN && answer->request)
             ? (uint8_t)(ntohs(*(uint16_t*)(answer->request + 2)) & 0xF) : 0;
@@ -329,18 +296,81 @@ void* process_udp_query(void* arg) {
     }
     free(resolved_ip);
 
-    /* Post-process: echo EDNS OPT, enforce TC truncation for UDP. */
     finalize_udp_response(answer, pkt);
-
-    if (send_response(ctx->dns_sock, answer,
-                      (const struct sockaddr*)&ctx->client_addr, ctx->client_addr_len) < 0) {
-        fprintf(stderr, "Failed to send UDP response to %s:%u\n", client_ip, client_port);
-    }
+    send_response(sock, answer, (const struct sockaddr*)caddr, clen);
 
     free_packet(answer);
     free_packet(pkt);
-    free(ctx->buffer);
-    free(ctx);
+}
+
+/* --- SO_REUSEPORT UDP worker thread --------------------------------------- */
+
+/*
+ * Each UDP worker thread owns its own socket bound with SO_REUSEPORT.
+ * The kernel distributes incoming datagrams across all sockets on the same
+ * port, so N worker threads give N-fold parallel receive throughput with no
+ * userspace lock on the hot path.  The receive buffer is stack-allocated;
+ * no malloc/free is needed per query.
+ */
+struct UDPWorkerArg {
+    int port;
+    int family;   /* AF_INET or AF_INET6 */
+};
+
+static void* udp_worker_thread(void *arg)
+{
+    struct UDPWorkerArg *wa = arg;
+
+    int sock = socket(wa->family, SOCK_DGRAM, 0);
+    if (sock < 0) { perror("worker: socket"); free(wa); return NULL; }
+
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0)
+        perror("Warning: SO_REUSEPORT unavailable");
+
+    if (wa->family == AF_INET6) {
+        setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+        struct sockaddr_in6 addr = {0};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_addr   = in6addr_any;
+        addr.sin6_port   = htons(wa->port);
+        if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            perror("worker: bind IPv6"); close(sock); free(wa); return NULL;
+        }
+    } else {
+        struct sockaddr_in addr = {0};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port        = htons(wa->port);
+        if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            perror("worker: bind IPv4"); close(sock); free(wa); return NULL;
+        }
+    }
+
+    /* 1-second recv timeout so we check g_running once per second. */
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    char buf[MAXLINE];   /* stack-allocated: no malloc per query */
+
+    while (g_running) {
+        struct sockaddr_storage caddr;
+        socklen_t clen = sizeof(caddr);
+        ssize_t n = recvfrom(sock, buf, sizeof(buf), 0,
+                             (struct sockaddr*)&caddr, &clen);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                continue;   /* timeout — re-check g_running */
+            perror("worker: recvfrom");
+            break;
+        }
+        if (n < HEADER_LEN) continue;   /* too short to be DNS */
+        handle_udp_packet(sock, &caddr, clen, buf, n);
+    }
+
+    close(sock);
+    free(wa);
     return NULL;
 }
 
@@ -498,6 +528,7 @@ int main(int argc, char** argv) {
     }
 
     setup_signals();
+    write_pid_file();
 
     // Load authoritative domains
     printf("Loading authoritative domains...\n");
@@ -516,43 +547,85 @@ int main(int argc, char** argv) {
     else
         printf("DNSSEC online signing disabled (no keys configured).\n\n");
 
-    // Create sockets
-    int udp4_sock = create_udp_socket_v4(PORT);
-    int udp6_sock = create_udp_socket_v6(PORT);  // may be -1
+    // Create TCP sockets
     int tcp4_sock = create_tcp_socket_v4(PORT);  // may be -1
     int tcp6_sock = create_tcp_socket_v6(PORT);  // may be -1
 
-    printf("DNS Server listening on port %d (UDP IPv4", PORT);
-    if (udp6_sock >= 0) printf(", UDP IPv6");
+    printf("DNS Server listening on port %d (UDP IPv4 SO_REUSEPORT", PORT);
+    if (create_udp_socket_v6(PORT) >= 0) printf(", UDP IPv6 SO_REUSEPORT");
     if (tcp4_sock >= 0) printf(", TCP IPv4");
     if (tcp6_sock >= 0) printf(", TCP IPv6");
     printf(")\n");
     printf("Upstream DNS: %s:%d\n", g_config.upstream_dns, g_config.upstream_port);
     printf("Loaded %d authoritative domain(s)\n\n", loaded_count);
 
-    // Create thread pool
-    struct ThreadPoolConfig pool_config = {
-        .num_threads    = g_config.thread_count,
-        .max_queue_size = g_config.queue_size
-    };
-    struct ThreadPool* thread_pool = threadpool_create(pool_config);
-    if (!thread_pool) {
-        fprintf(stderr, "Error: Failed to create thread pool\n");
+    /*
+     * UDP: spawn N SO_REUSEPORT worker threads per address family.
+     * The kernel distributes incoming datagrams across all sockets on the
+     * same port, so every worker runs independently — no shared lock on the
+     * UDP hot path and no per-query malloc for a receive buffer or context.
+     */
+    int n_udp = g_config.thread_count;
+    pthread_t *udp4_threads = calloc(n_udp, sizeof(pthread_t));
+    pthread_t *udp6_threads = calloc(n_udp, sizeof(pthread_t));
+    int n_udp6 = 0;
+
+    if (!udp4_threads || !udp6_threads) {
+        fprintf(stderr, "Error: Failed to allocate UDP worker thread arrays\n");
         exit(EXIT_FAILURE);
     }
 
-    // Build poll() fd set (up to 5: UDP4, UDP6, TCP4, TCP6, stats_pipe)
-    struct pollfd pfds[5];
-    int nfds = 0;
-    int udp4_idx = -1, udp6_idx = -1, tcp4_idx = -1, tcp6_idx = -1, stats_idx = -1;
+    for (int i = 0; i < n_udp; i++) {
+        struct UDPWorkerArg *wa = malloc(sizeof(*wa));
+        if (!wa) { fprintf(stderr, "Error: malloc UDPWorkerArg\n"); exit(EXIT_FAILURE); }
+        wa->port   = PORT;
+        wa->family = AF_INET;
+        if (pthread_create(&udp4_threads[i], NULL, udp_worker_thread, wa) != 0) {
+            perror("Error: pthread_create UDP4 worker");
+            exit(EXIT_FAILURE);
+        }
+    }
 
-    pfds[nfds].fd = udp4_sock; pfds[nfds].events = POLLIN; udp4_idx = nfds++;
-    if (udp6_sock >= 0) { pfds[nfds].fd = udp6_sock; pfds[nfds].events = POLLIN; udp6_idx = nfds++; }
+    /* Probe for IPv6 support before spawning IPv6 workers. */
+    {
+        int probe = socket(AF_INET6, SOCK_DGRAM, 0);
+        if (probe >= 0) { close(probe); n_udp6 = n_udp; }
+    }
+    for (int i = 0; i < n_udp6; i++) {
+        struct UDPWorkerArg *wa = malloc(sizeof(*wa));
+        if (!wa) { fprintf(stderr, "Error: malloc UDPWorkerArg\n"); exit(EXIT_FAILURE); }
+        wa->port   = PORT;
+        wa->family = AF_INET6;
+        if (pthread_create(&udp6_threads[i], NULL, udp_worker_thread, wa) != 0) {
+            perror("Warning: pthread_create UDP6 worker");
+            n_udp6 = i;   /* only join the threads we actually started */
+            break;
+        }
+    }
+
+    /*
+     * TCP: dedicated thread pool sized at min(4, thread_count) so that
+     * slow or idle TCP connections don't starve UDP workers.
+     */
+    int tcp_threads = g_config.thread_count < 4 ? g_config.thread_count : 4;
+    struct ThreadPoolConfig pool_config = {
+        .num_threads    = tcp_threads,
+        .max_queue_size = g_config.queue_size
+    };
+    struct ThreadPool *thread_pool = threadpool_create(pool_config);
+    if (!thread_pool) {
+        fprintf(stderr, "Error: Failed to create TCP thread pool\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Build poll() fd set (up to 4: TCP4, TCP6, stats_pipe, unused)
+    struct pollfd pfds[4];
+    int nfds = 0;
+    int tcp4_idx = -1, tcp6_idx = -1, stats_idx = -1;
+
     if (tcp4_sock >= 0) { pfds[nfds].fd = tcp4_sock; pfds[nfds].events = POLLIN; tcp4_idx = nfds++; }
     if (tcp6_sock >= 0) { pfds[nfds].fd = tcp6_sock; pfds[nfds].events = POLLIN; tcp6_idx = nfds++; }
     pfds[nfds].fd = stats_pipe[0]; pfds[nfds].events = (stats_pipe[0] >= 0) ? POLLIN : 0; stats_idx = nfds++;
-
-    unsigned long query_count = 0;
 
     printf("Waiting for queries...\n\n");
 
@@ -562,6 +635,15 @@ int main(int argc, char** argv) {
             g_reload = 0;
             printf("SIGHUP received — reloading auth domains from %s\n", g_auth_domains_path);
             reload_auth_domains(g_auth_domains_path);
+
+            /* Reload DNSSEC zone keys so key rotation takes effect without restart. */
+            if (g_zone_keys) { free_zone_keys(g_zone_keys); g_zone_keys = NULL; }
+            g_zone_keys = load_zone_keys(SERVER_PATH "/config");
+            printf("DNSSEC signing keys reloaded: %s\n",
+                   g_zone_keys ? "enabled" : "disabled (no keys configured)");
+
+            /* Reopen log file so logrotate can move the old one. */
+            log_reopen();
         }
 
         int nready = poll(pfds, nfds, 1000);
@@ -570,7 +652,7 @@ int main(int argc, char** argv) {
             perror("Error: poll failed");
             break;
         }
-        if (nready == 0) continue;  // timeout — re-check g_shutdown / g_reload
+        if (nready == 0) continue;
 
         // Handle SIGUSR1/SIGUSR2 stats request from self-pipe
         if (stats_pipe[0] >= 0 && (pfds[stats_idx].revents & POLLIN)) {
@@ -579,90 +661,16 @@ int main(int argc, char** argv) {
             print_qtype_stats();
         }
 
-        // --- UDP IPv4 — drain all pending datagrams before returning to poll() ---
-        if (udp4_idx >= 0 && (pfds[udp4_idx].revents & POLLIN)) {
-            while (1) {
-                char* buf = malloc(MAXLINE);
-                if (!buf) { perror("Error: malloc"); break; }
-
-                struct UDPQueryContext* ctx = malloc(sizeof(*ctx));
-                if (!ctx) {
-                    // Can't allocate context — send SERVFAIL if we can peek at TX ID
-                    // We don't have client addr yet; just drop this datagram.
-                    free(buf); break;
-                }
-                memset(ctx, 0, sizeof(*ctx));
-                ctx->client_addr_len = sizeof(ctx->client_addr);
-
-                ssize_t recv_len = recvfrom(udp4_sock, buf, MAXLINE, MSG_DONTWAIT,
-                                            (struct sockaddr*)&ctx->client_addr,
-                                            &ctx->client_addr_len);
-                if (recv_len < 0) {
-                    free(buf); free(ctx);
-                    if (errno != EAGAIN && errno != EWOULDBLOCK)
-                        perror("Error: recvfrom UDP4");
-                    break;  // kernel buffer drained
-                }
-
-                ctx->dns_sock  = udp4_sock;
-                ctx->buffer    = buf;
-                ctx->recv_len  = recv_len;
-                ctx->query_num = ++query_count;
-
-                if (threadpool_add_work(thread_pool, process_udp_query, ctx) < 0) {
-                    send_servfail_udp(udp4_sock,
-                        (const struct sockaddr*)&ctx->client_addr, ctx->client_addr_len,
-                        buf, recv_len);
-                    free(buf); free(ctx);
-                }
-            }
-        }
-
-        // --- UDP IPv6 — drain all pending datagrams before returning to poll() ---
-        if (udp6_idx >= 0 && (pfds[udp6_idx].revents & POLLIN)) {
-            while (1) {
-                char* buf = malloc(MAXLINE);
-                if (!buf) { perror("Error: malloc"); break; }
-
-                struct UDPQueryContext* ctx = malloc(sizeof(*ctx));
-                if (!ctx) { free(buf); break; }
-                memset(ctx, 0, sizeof(*ctx));
-                ctx->client_addr_len = sizeof(ctx->client_addr);
-
-                ssize_t recv_len = recvfrom(udp6_sock, buf, MAXLINE, MSG_DONTWAIT,
-                                            (struct sockaddr*)&ctx->client_addr,
-                                            &ctx->client_addr_len);
-                if (recv_len < 0) {
-                    free(buf); free(ctx);
-                    if (errno != EAGAIN && errno != EWOULDBLOCK)
-                        perror("Error: recvfrom UDP6");
-                    break;  // kernel buffer drained
-                }
-
-                ctx->dns_sock  = udp6_sock;
-                ctx->buffer    = buf;
-                ctx->recv_len  = recv_len;
-                ctx->query_num = ++query_count;
-
-                if (threadpool_add_work(thread_pool, process_udp_query, ctx) < 0) {
-                    send_servfail_udp(udp6_sock,
-                        (const struct sockaddr*)&ctx->client_addr, ctx->client_addr_len,
-                        buf, recv_len);
-                    free(buf); free(ctx);
-                }
-            }
-        }
-
         // --- TCP IPv4 accept ---
         if (tcp4_idx >= 0 && (pfds[tcp4_idx].revents & POLLIN)) {
             struct sockaddr_storage caddr;
             socklen_t clen = sizeof(caddr);
             int cfd = accept(tcp4_sock, (struct sockaddr*)&caddr, &clen);
             if (cfd >= 0) {
-                struct TCPQueryContext* ctx = malloc(sizeof(*ctx));
+                struct TCPQueryContext *ctx = malloc(sizeof(*ctx));
                 if (ctx) {
                     ctx->client_fd = cfd;
-                    struct sockaddr_in* s4 = (struct sockaddr_in*)&caddr;
+                    struct sockaddr_in *s4 = (struct sockaddr_in*)&caddr;
                     inet_ntop(AF_INET, &s4->sin_addr, ctx->client_ip, sizeof(ctx->client_ip));
                     ctx->client_port = ntohs(s4->sin_port);
                     if (threadpool_add_work(thread_pool, process_tcp_query, ctx) < 0) {
@@ -678,10 +686,10 @@ int main(int argc, char** argv) {
             socklen_t clen = sizeof(caddr);
             int cfd = accept(tcp6_sock, (struct sockaddr*)&caddr, &clen);
             if (cfd >= 0) {
-                struct TCPQueryContext* ctx = malloc(sizeof(*ctx));
+                struct TCPQueryContext *ctx = malloc(sizeof(*ctx));
                 if (ctx) {
                     ctx->client_fd = cfd;
-                    struct sockaddr_in6* s6 = (struct sockaddr_in6*)&caddr;
+                    struct sockaddr_in6 *s6 = (struct sockaddr_in6*)&caddr;
                     inet_ntop(AF_INET6, &s6->sin6_addr, ctx->client_ip, sizeof(ctx->client_ip));
                     ctx->client_port = ntohs(s6->sin6_port);
                     if (threadpool_add_work(thread_pool, process_tcp_query, ctx) < 0) {
@@ -694,11 +702,15 @@ int main(int argc, char** argv) {
 
     printf("Shutting down DNS server...\n");
 
+    /* g_running=0 causes each UDP worker to exit after its 1-second timeout. */
+    for (int i = 0; i < n_udp;  i++) pthread_join(udp4_threads[i], NULL);
+    for (int i = 0; i < n_udp6; i++) pthread_join(udp6_threads[i], NULL);
+    free(udp4_threads);
+    free(udp6_threads);
+
     threadpool_wait(thread_pool);
     threadpool_destroy(thread_pool);
 
-    close(udp4_sock);
-    if (udp6_sock >= 0) close(udp6_sock);
     if (tcp4_sock >= 0) close(tcp4_sock);
     if (tcp6_sock >= 0) close(tcp6_sock);
 
@@ -709,6 +721,7 @@ int main(int argc, char** argv) {
     if (g_zone_keys) { free_zone_keys(g_zone_keys); g_zone_keys = NULL; }
 
     log_close();
+    remove_pid_file();
 
     return 0;
 }

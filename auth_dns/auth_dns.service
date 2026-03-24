@@ -1,0 +1,20 @@
+[Unit]
+Description=Authoritative DNS Server
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/home/avilo/dns/auth_dns/bin/auth_dns -p 53 -t 20 -u 127.0.0.1 -q 512
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3s
+KillMode=mixed
+TimeoutStopSec=15s
+LimitNOFILE=65535
+ReadWritePaths=/home/avilo/dns/logs /run
+ReadOnlyPaths=/home/avilo/dns/auth_dns
+
+[Install]
+WantedBy=multi-user.target

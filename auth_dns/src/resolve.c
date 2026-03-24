@@ -88,49 +88,57 @@ struct Packet* resolve_recursive(struct Packet* pkt) {
     char expected_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &upstream_server.sin_addr, expected_ip, sizeof(expected_ip));
 
-    // Receive response — use a separate struct so we can validate source IP
+    // Receive response — retry on stray packets (wrong source IP or TX ID).
+    // The socket timeout covers the total wait; we keep recvfrom-ing until we
+    // get a valid response or the timeout fires.
     struct sockaddr_in recv_addr;
-    socklen_t server_len = sizeof(recv_addr);
-    response->recv_len = recvfrom(sock, response->request, MAXLINE, 0,
-                                   (struct sockaddr*)&recv_addr, &server_len);
+    socklen_t server_len;
+    char recv_ip[INET_ADDRSTRLEN];
+    uint16_t recv_id;
+
+    for (;;) {
+        server_len = sizeof(recv_addr);
+        response->recv_len = recvfrom(sock, response->request, MAXLINE, 0,
+                                      (struct sockaddr*)&recv_addr, &server_len);
+
+        if (response->recv_len < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                fprintf(stderr, "Error: Upstream DNS query timed out\n");
+            } else {
+                perror("Error: Failed to receive upstream response");
+            }
+            close(sock);
+            free_packet(response);
+            return NULL;
+        }
+
+        if (response->recv_len < HEADER_LEN) {
+            /* Too short to be a DNS response — ignore and keep waiting. */
+            continue;
+        }
+
+        /* Validate source IP. */
+        inet_ntop(AF_INET, &recv_addr.sin_addr, recv_ip, sizeof(recv_ip));
+        if (strcmp(recv_ip, expected_ip) != 0) {
+            fprintf(stderr, "Warning: Source IP mismatch from upstream "
+                    "(expected %s, got %s) — ignoring stray packet\n",
+                    expected_ip, recv_ip);
+            continue;
+        }
+
+        /* Validate TX ID. */
+        recv_id = ntohs(*(uint16_t*)response->request);
+        if (random_txid != recv_id) {
+            fprintf(stderr, "Warning: TX ID mismatch from upstream "
+                    "(sent %u, got %u) — ignoring stray packet\n",
+                    random_txid, recv_id);
+            continue;
+        }
+
+        break;  /* valid response */
+    }
 
     close(sock);
-
-    if (response->recv_len < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            fprintf(stderr, "Error: Upstream DNS query timed out\n");
-        } else {
-            perror("Error: Failed to receive upstream response");
-        }
-        free_packet(response);
-        return NULL;
-    }
-
-    if (response->recv_len < HEADER_LEN) {
-        fprintf(stderr, "Error: Invalid DNS response from upstream (%zd bytes)\n",
-                response->recv_len);
-        free_packet(response);
-        return NULL;
-    }
-
-    // Validate source IP matches the server we queried
-    char recv_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &recv_addr.sin_addr, recv_ip, sizeof(recv_ip));
-    if (strcmp(recv_ip, expected_ip) != 0) {
-        fprintf(stderr, "Warning: Source IP mismatch from upstream (expected %s, got %s) — dropping\n",
-                expected_ip, recv_ip);
-        free_packet(response);
-        return NULL;
-    }
-
-    // Validate transaction ID matches what we sent (the randomized ID)
-    uint16_t recv_id = ntohs(*(uint16_t*)response->request);
-    if (random_txid != recv_id) {
-        fprintf(stderr, "Warning: TX ID mismatch from upstream (sent %u, got %u) — dropping\n",
-                random_txid, recv_id);
-        free_packet(response);
-        return NULL;
-    }
 
     // Remap TX ID in response back to the client's original ID
     ((uint8_t*)response->request)[0] = (client_txid >> 8) & 0xFF;

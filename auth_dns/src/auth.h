@@ -13,11 +13,12 @@
 #include <fcntl.h>
 #include "types.h"
 
-/* DNS name compression pointer back to byte 12 (the QNAME in the question
- * section, RFC 1035 §4.1.4).  Valid because our response buffers always start
- * with the 12-byte header immediately followed by the question section, so the
- * QNAME is always at offset 12 = 0xC000 | 0x000C = 0xC00C. */
-#define DNS_NAME_PTR 0xC00C
+/* DNS name compression pointer to the QNAME in the question section
+ * (RFC 1035 §4.1.4).  begin_response() always writes the question section
+ * immediately after the 12-byte header, so the QNAME is always at offset
+ * HEADER_LEN.  Computing the pointer from HEADER_LEN makes the dependency
+ * explicit: if the header layout ever changes, this stays correct. */
+#define DNS_NAME_PTR ((uint16_t)(0xC000u | (unsigned)(HEADER_LEN)))
 
 /* Reader-writer lock protecting the auth_domains array.
  * Callers take rdlock for reads (lookup, check_internal), wrlock for reloads. */
@@ -64,6 +65,11 @@ struct AuthDomain {
     uint16_t srv_weight;
     uint16_t srv_port;
     char     srv_target[256];
+
+    // HTTPS record (RFC 9460) — priority + TargetName, no SvcParams
+    bool     has_https;
+    uint16_t https_priority;
+    char     https_target[256];  // "." means same-as-owner (root label)
 
     // SOA record fields (RFC 1035 §3.3.13, RFC 2308)
     bool     has_soa;

@@ -104,3 +104,15 @@ void log_close(void) {
     }
     pthread_mutex_unlock(&log_mutex);
 }
+
+/*
+ * Reopen the log file.  Call after logrotate has moved/truncated the old file
+ * (triggered by SIGHUP in the main loop).  Thread-safe.
+ */
+void log_reopen(void) {
+    pthread_mutex_lock(&log_mutex);
+    if (log_fd >= 0) { close(log_fd); log_fd = -1; }
+    log_fd = open(LOG_FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (log_fd < 0) perror("Warning: log_reopen: Failed to open log file");
+    pthread_mutex_unlock(&log_mutex);
+}
