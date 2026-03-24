@@ -37,6 +37,7 @@
 #define QTYPE_TXT        16
 #define QTYPE_AAAA       28
 #define QTYPE_SRV        33   // Service Locator (RFC 2782)
+#define QTYPE_HTTPS      65   // HTTPS/SVCB Service Binding (RFC 9460)
 #define QTYPE_ANY        255  // Any record type (RFC 1035 §3.2.3)
 #define QTYPE_DS         43   // Delegation Signer (RFC 4034)
 #define QTYPE_RRSIG      46   // Resource Record Signature (RFC 4034)
@@ -64,6 +65,9 @@
 #endif
 #ifndef LOG_FILE_PATH
 #define LOG_FILE_PATH "../logs/server.log"   /* logs/ sits next to auth_dns/ */
+#endif
+#ifndef PID_FILE_PATH
+#define PID_FILE_PATH "/run/auth_dns.pid"
 #endif
 
 /* Paths relative to SERVER_PATH — do not make these absolute. */

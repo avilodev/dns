@@ -20,7 +20,11 @@ struct ThreadPool {
     struct WorkItem* work_queue_tail;
     int queue_size;
     int max_queue_size;
-    
+
+    // Pre-allocated WorkItem free-list: eliminates malloc/free per enqueue.
+    // Guarded by queue_mutex (same lock as the work queue).
+    struct WorkItem* item_freelist;
+
     // Synchronization
     pthread_mutex_t queue_mutex;
     pthread_cond_t work_available;
@@ -69,15 +73,16 @@ static void* worker_thread(void* arg) {
         
         pthread_mutex_unlock(&pool->queue_mutex);
         
-        // Execute work
+        // Execute work (outside of lock to allow other threads to run)
         if (item) {
             item->func(item->arg);
-            free(item);
-            
-            // Update statistics
+
+            // Return item to freelist instead of freeing; update stats.
             pthread_mutex_lock(&pool->queue_mutex);
             pool->active_workers--;
             pool->completed_work++;
+            item->next = pool->item_freelist;
+            pool->item_freelist = item;
             pthread_cond_signal(&pool->work_done);
             pthread_mutex_unlock(&pool->queue_mutex);
         }
@@ -132,6 +137,17 @@ struct ThreadPool* threadpool_create(struct ThreadPoolConfig config) {
         return NULL;
     }
     
+    // Pre-allocate WorkItems into the freelist.
+    // Cap at max_queue_size (or 512 if unlimited) so we don't over-allocate.
+    int prealloc = (config.max_queue_size > 0 && config.max_queue_size <= 1024)
+                   ? config.max_queue_size : 512;
+    for (int i = 0; i < prealloc; i++) {
+        struct WorkItem* wi = malloc(sizeof(struct WorkItem));
+        if (!wi) break;  // non-fatal: will fall back to malloc on demand
+        wi->next = pool->item_freelist;
+        pool->item_freelist = wi;
+    }
+
     // Create worker threads
     pool->threads = calloc(pool->num_threads, sizeof(pthread_t));
     if (!pool->threads) {
@@ -175,31 +191,41 @@ int threadpool_add_work(struct ThreadPool* pool, work_func_t func, void* arg) {
     if (!pool || !func) {
         return -1;
     }
-    
-    struct WorkItem* item = malloc(sizeof(struct WorkItem));
-    if (!item) {
-        perror("Failed to allocate work item");
-        return -1;
+
+    pthread_mutex_lock(&pool->queue_mutex);
+
+    // Pop a pre-allocated item from the freelist; fall back to malloc if empty.
+    struct WorkItem* item = pool->item_freelist;
+    if (item) {
+        pool->item_freelist = item->next;
+    } else {
+        pthread_mutex_unlock(&pool->queue_mutex);
+        item = malloc(sizeof(struct WorkItem));
+        if (!item) {
+            perror("Failed to allocate work item");
+            return -1;
+        }
+        pthread_mutex_lock(&pool->queue_mutex);
     }
-    
+
     item->func = func;
     item->arg = arg;
     item->next = NULL;
-    
-    pthread_mutex_lock(&pool->queue_mutex);
-    
+
     // Check if shutting down
     if (pool->shutdown) {
+        item->next = pool->item_freelist;
+        pool->item_freelist = item;
         pthread_mutex_unlock(&pool->queue_mutex);
-        free(item);
         return -1;
     }
-    
+
     // Check queue size limit
     if (pool->max_queue_size > 0 && pool->queue_size >= pool->max_queue_size) {
         pool->rejected_work++;
+        item->next = pool->item_freelist;
+        pool->item_freelist = item;
         pthread_mutex_unlock(&pool->queue_mutex);
-        free(item);
         fprintf(stderr, "Work queue full, rejecting work\n");
         return -1;
     }
@@ -254,7 +280,7 @@ void threadpool_destroy(struct ThreadPool* pool) {
     }
     
     /* Free remaining work items.  DO NOT free item->arg — each arg is a
-     * UDPQueryContext/TCPQueryContext whose sub-allocations we can't know.
+     * TCPQueryContext whose sub-allocations we can't know.
      * threadpool_wait() is always called before destroy, draining the queue,
      * so this loop is dead code in practice. */
     struct WorkItem* item = pool->work_queue_head;
@@ -263,7 +289,15 @@ void threadpool_destroy(struct ThreadPool* pool) {
         free(item);
         item = next;
     }
-    
+
+    // Free the pre-allocated WorkItem freelist.
+    item = pool->item_freelist;
+    while (item) {
+        struct WorkItem* next = item->next;
+        free(item);
+        item = next;
+    }
+
     // Cleanup
     free(pool->threads);
     pthread_cond_destroy(&pool->work_done);
