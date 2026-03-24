@@ -414,6 +414,13 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                     return NULL;
                 }
 
+                /* Propagate the client's CD (Checking Disabled) flag so that
+                 * send_resolver_internal skips DNSSEC validation when the
+                 * original client opted out (RFC 4035 §3.1.6).  The outgoing
+                 * wire query correctly has CD=0 (set_packet_fields zeroes it);
+                 * we only need this for the internal validation gate. */
+                formatted->cd = query->cd;
+
                 /* Recursively resolve CNAME target.  Pass the same dnssec_chain
                  * so keys validated during this delegation walk are also
                  * available when verifying RRSIGs in the CNAME target zone. */

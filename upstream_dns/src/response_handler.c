@@ -448,53 +448,23 @@ char* extract_zone_apex(struct Packet* response)
         pos += 10 + rdlength;
     }
 
-    // The owner name of the first record in the authority section is the zone apex
-    if (pos < buffer_len) {
-        return parse_dns_name_from_wire(buffer, buffer_len, pos);
+    /* Scan authority section for the first NS record and return its owner.
+     * We must filter by type because DNSSEC-signed referrals include NSEC and
+     * RRSIG records in the authority section alongside the NS records; if those
+     * appear first, returning their owner would yield the wrong zone apex and
+     * corrupt the NS cache key. */
+    for (int i = 0; i < response->nscount && pos < buffer_len; i++) {
+        int owner_pos = pos;
+        skip_dns_name(buffer, buffer_len, &pos);
+        if (pos + 10 > buffer_len) break;
+        uint16_t type     = ntohs(*(uint16_t*)(buffer + pos));
+        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        if (type == QTYPE_NS) {
+            return parse_dns_name_from_wire(buffer, buffer_len, owner_pos);
+        }
+        pos += 10 + rdlength;
     }
     return NULL;
-}
-
-/*
- * Test if a nameserver responds (quick probe)
- */
-bool test_nameserver_reachable(const char* ns_ip, struct Packet* query)
-{
-    if (!ns_ip || !query) return false;
-    
-    int test_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (test_sock < 0) return false;
-    
-    // Very short timeout for testing
-    struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
-    setsockopt(test_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    
-    struct sockaddr_in test_addr = {0};
-    test_addr.sin_family = AF_INET;
-    test_addr.sin_port = htons(DNS_PORT);
-    
-    if (inet_pton(AF_INET, ns_ip, &test_addr.sin_addr) <= 0) {
-        close(test_sock);
-        return false;
-    }
-    
-    ssize_t sent = sendto(test_sock, query->request, query->recv_len, 0,
-                         (struct sockaddr*)&test_addr, sizeof(test_addr));
-    
-    bool reachable = false;
-    if (sent > 0) {
-        char test_buf[512];
-        struct sockaddr_in recv_addr;
-        socklen_t recv_len = sizeof(recv_addr);
-        
-        ssize_t received = recvfrom(test_sock, test_buf, sizeof(test_buf), 0,
-                                   (struct sockaddr*)&recv_addr, &recv_len);
-        
-        reachable = (received > 0);
-    }
-    
-    close(test_sock);
-    return reachable;
 }
 
 extern Hints* g_hints[13];
