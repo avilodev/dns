@@ -9,7 +9,8 @@ CC = gcc
 #   LOG_FILE_PATH  — where query logs are written.
 # ----------------------------------------------------------------------------
 SERVER_PATH   := $(abspath .)
-LOG_FILE_PATH := $(abspath ..)/logs/server.log
+LOG_DIR       := $(abspath ..)/logs
+LOG_FILE_PATH := $(LOG_DIR)/server.log
 
 CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP \
          -DSERVER_PATH='"$(SERVER_PATH)"' \
@@ -69,9 +70,14 @@ LOGROTATE_DIR = /etc/logrotate.d
 
 install: $(TARGET)
 	install -d $(INSTALL_BIN)
+	install -d $(LOG_DIR)
 	install -m 755 $(TARGET) $(INSTALL_BIN)/auth_dns
-	install -m 644 auth_dns.service $(SYSTEMD_DIR)/auth_dns.service
-	install -m 644 misc/logrotate-auth $(LOGROTATE_DIR)/auth_dns
+	sed -e 's|@INSTALL_BIN@|$(INSTALL_BIN)|g' \
+	    -e 's|@LOG_DIR@|$(LOG_DIR)|g' \
+	    -e 's|@SERVER_PATH@|$(SERVER_PATH)|g' \
+	    auth_dns.service > $(SYSTEMD_DIR)/auth_dns.service
+	sed 's|@LOG_FILE_PATH@|$(LOG_FILE_PATH)|g' misc/logrotate-auth \
+	    > $(LOGROTATE_DIR)/auth_dns
 	systemctl daemon-reload
 	@echo "Installed auth_dns. Enable with: systemctl enable --now auth_dns"
 

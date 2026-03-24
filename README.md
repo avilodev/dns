@@ -30,17 +30,18 @@ Both servers are multithreaded, support UDP and TCP, and speak IPv4 and IPv6.
 
 ## Building
 
-You need `gcc`, `make`, and OpenSSL development headers (`libssl-dev`).
+You need `gcc`, `make`, OpenSSL development headers (`libssl-dev`), and `libatomic`.
 
 ```bash
-# Build the authoritative server
-cd auth_dns && make rebuild
-
-# Build the upstream resolver
-cd upstream_dns && make rebuild
+make            # build both servers
+make rebuild    # clean + build both servers
+sudo make install   # install binaries, systemd units, logrotate, and cron script
+sudo make uninstall # remove all installed files
 ```
 
-Binaries end up at `auth_dns/bin/dns` and `upstream_dns/bin/dns`.
+Binaries end up at `auth_dns/bin/auth_dns` and `upstream_dns/bin/upstream_dns`.
+
+`make install` also creates the `logs/` directory and substitutes all install-time paths (binary location, log path, server directory) into the systemd service files and logrotate configs — no hardcoded paths in the source tree.
 
 ---
 
@@ -50,10 +51,10 @@ Start the upstream resolver first, then the authoritative server.
 
 ```bash
 # Upstream resolver (port 5335, 20 threads)
-./upstream_dns/bin/dns -p 5335 -t 20 -q 100
+./upstream_dns/bin/upstream_dns -p 5335 -t 20 -q 100
 
 # Authoritative server (port 53, forwarding to upstream on localhost:5335)
-sudo ./auth_dns/bin/dns -p 53 -t 20 -u 127.0.0.1:5335 -q 100
+sudo ./auth_dns/bin/auth_dns -p 53 -t 20 -u 127.0.0.1:5335 -q 100
 ```
 
 Port 53 requires root (or `CAP_NET_BIND_SERVICE`).
@@ -150,7 +151,7 @@ Wildcards are supported for A and AAAA using `*.zone` syntax.
 Reload zone data without restarting:
 
 ```bash
-kill -HUP $(pidof dns)   # auth_dns only
+kill -HUP $(pidof auth_dns)   # auth_dns only
 ```
 
 ---
@@ -195,15 +196,17 @@ Both servers handle the same signals:
 | `SIGUSR1` or `SIGUSR2` | Print per-QTYPE query statistics to stdout |
 
 ```bash
-kill -USR1 $(pidof dns)   # dump stats
-kill -HUP  $(pidof dns)   # reload config
+kill -USR1 $(pidof auth_dns)    # dump stats (auth_dns)
+kill -USR1 $(pidof upstream_dns) # dump stats (upstream_dns)
+kill -HUP  $(pidof auth_dns)    # reload zone file
+kill -HUP  $(pidof upstream_dns) # flush NS cache / reload hints
 ```
 
 ---
 
 ## Logs
 
-Both servers write to `/home/avilo/dns/logs/`:
+Both servers write to the `logs/` directory (at the root of the repository):
 
 - `auth_dns` logs go to `auth.log`
 - `upstream_dns` logs go to `upstream.log`
@@ -222,7 +225,7 @@ Log format:
 ```
 dns/
 ├── auth_dns/
-│   ├── bin/dns                    # compiled binary
+│   ├── bin/auth_dns               # compiled binary
 │   ├── src/                       # source code
 │   ├── misc/
 │   │   └── auth_domains.txt       # zone records
@@ -231,7 +234,7 @@ dns/
 │       └── *.pem                  # zone signing keys (optional)
 │
 ├── upstream_dns/
-│   ├── bin/dns                    # compiled binary
+│   ├── bin/upstream_dns           # compiled binary
 │   ├── src/                       # source code
 │   ├── misc/
 │   │   └── root_hints.txt         # root server IPs (falls back to built-in)

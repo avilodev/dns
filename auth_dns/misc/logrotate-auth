@@ -1,4 +1,4 @@
-/home/avilo/dns/logs/server.log {
+@LOG_FILE_PATH@ {
     daily
     rotate 30
     compress
