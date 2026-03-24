@@ -6,15 +6,15 @@ Wants=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/home/avilo/dns/upstream_dns/bin/upstream_dns -p 5335 -t 20 -q 512
+ExecStart=@INSTALL_BIN@/upstream_dns -p 5335 -t 20 -q 512
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3s
 KillMode=mixed
 TimeoutStopSec=15s
 LimitNOFILE=65535
-ReadWritePaths=/home/avilo/dns/logs /run
-ReadOnlyPaths=/home/avilo/dns/upstream_dns
+ReadWritePaths=@LOG_DIR@ /run
+ReadOnlyPaths=@SERVER_PATH@
 
 [Install]
 WantedBy=multi-user.target
