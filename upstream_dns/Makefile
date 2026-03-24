@@ -9,7 +9,8 @@ CC = gcc
 #   LOG_FILE_PATH  — where query logs are written.
 # ----------------------------------------------------------------------------
 SERVER_PATH   := $(abspath .)
-LOG_FILE_PATH := $(abspath ..)/logs/upstream.log
+LOG_DIR       := $(abspath ..)/logs
+LOG_FILE_PATH := $(LOG_DIR)/upstream.log
 
 CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP \
          -DSERVER_PATH='"$(SERVER_PATH)"' \
@@ -72,9 +73,14 @@ LOGROTATE_DIR = /etc/logrotate.d
 
 install: $(TARGET) install-cron
 	install -d $(INSTALL_BIN)
+	install -d $(LOG_DIR)
 	install -m 755 $(TARGET) $(INSTALL_BIN)/upstream_dns
-	install -m 644 upstream_dns.service $(SYSTEMD_DIR)/upstream_dns.service
-	install -m 644 misc/logrotate-upstream $(LOGROTATE_DIR)/upstream_dns
+	sed -e 's|@INSTALL_BIN@|$(INSTALL_BIN)|g' \
+	    -e 's|@LOG_DIR@|$(LOG_DIR)|g' \
+	    -e 's|@SERVER_PATH@|$(SERVER_PATH)|g' \
+	    upstream_dns.service > $(SYSTEMD_DIR)/upstream_dns.service
+	sed 's|@LOG_FILE_PATH@|$(LOG_FILE_PATH)|g' misc/logrotate-upstream \
+	    > $(LOGROTATE_DIR)/upstream_dns
 	systemctl daemon-reload
 	@echo "Installed upstream_dns. Enable with: systemctl enable --now upstream_dns"
 
