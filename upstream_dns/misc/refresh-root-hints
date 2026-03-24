@@ -36,7 +36,7 @@ if [ -f "$PIDFILE" ]; then
     kill -HUP "$(cat "$PIDFILE")" 2>/dev/null && \
         echo "refresh-root-hints: sent SIGHUP to upstream_dns (pid file)" || true
 else
-    pkill -HUP -x dns 2>/dev/null && \
+    pkill -HUP -x upstream_dns 2>/dev/null && \
         echo "refresh-root-hints: sent SIGHUP to upstream_dns (pgrep)" || \
         echo "refresh-root-hints: could not signal upstream_dns (not running?)"
 fi

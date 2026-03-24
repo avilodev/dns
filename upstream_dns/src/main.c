@@ -13,6 +13,7 @@
 #include <netinet/tcp.h>
 #include <stdatomic.h>
 #include <inttypes.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <time.h>
 
@@ -21,6 +22,18 @@ Hints* g_hints[13];
 NSCache* g_ns_cache = NULL;
 AnswerCache* g_answer_cache = NULL;
 TrustAnchor* g_trust_anchors = NULL;
+
+/* Write PID to PID_FILE_PATH; best-effort, non-fatal. */
+static void write_pid_file(void) {
+    FILE *f = fopen(PID_FILE_PATH, "w");
+    if (!f) { perror("Warning: Cannot write PID file " PID_FILE_PATH); return; }
+    fprintf(f, "%d\n", (int)getpid());
+    fclose(f);
+}
+static void remove_pid_file(void) 
+{ 
+    unlink(PID_FILE_PATH); 
+}
 
 /* Protects g_ns_cache pointer across SIGHUP swaps and concurrent readers.
  * Workers and the cleanup thread hold rdlock while using the pointer.
@@ -127,12 +140,21 @@ static void log_close_upstream(void) {
     pthread_mutex_unlock(&g_log_mutex);
 }
 
-// Structure to hold UDP query processing context (IPv4 or IPv6)
+static void log_reopen_upstream(void) {
+    pthread_mutex_lock(&g_log_mutex);
+    if (g_log_fd >= 0) { close(g_log_fd); g_log_fd = -1; }
+    g_log_fd = open(LOG_FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (g_log_fd < 0) perror("Warning: log_reopen: Failed to open upstream log file");
+    pthread_mutex_unlock(&g_log_mutex);
+}
+
+// Structure to hold UDP query processing context (IPv4 or IPv6).
+// buffer is embedded directly (no separate malloc/free per query).
 struct QueryContext {
     int dns_sock;
     struct sockaddr_storage client_addr;
     socklen_t client_addr_len;
-    char* buffer;
+    char buffer[MAXLINE];
     ssize_t recv_len;
     unsigned long query_num;
 };
@@ -242,6 +264,41 @@ static void send_servfail(int sock, const struct sockaddr* client_addr, socklen_
     sendto(sock, resp, sizeof(resp), 0, client_addr, addr_len);
 }
 
+/*
+ * Lightweight inline parser: extract the QNAME (dotted string) and QTYPE
+ * from a raw DNS query packet without allocating any memory.
+ * Returns 1 on success, 0 if the packet is malformed or not a standard query.
+ */
+static int quick_parse_query(const char* buf, ssize_t len,
+                              char* domain_out, int domain_max,
+                              uint16_t* qtype_out)
+{
+    if (len < 17) return 0;                          // header(12) + min QNAME(1) + null(1) + QTYPE(2) + QCLASS(2)
+    if (buf[2] & 0x80) return 0;                     // QR=1 means response, not a query
+    if ((uint8_t)buf[4] != 0 || (uint8_t)buf[5] != 1) return 0;  // QDCOUNT must be 1
+
+    int pos = 12;
+    int out_pos = 0;
+    while (pos < len) {
+        uint8_t ll = (uint8_t)buf[pos++];
+        if (ll == 0) break;
+        if ((ll & 0xC0) == 0xC0) return 0;           // compression in question section = malformed
+        if (ll > 63 || pos + ll > len) return 0;
+        if (out_pos > 0) {
+            if (out_pos + 1 >= domain_max) return 0;
+            domain_out[out_pos++] = '.';
+        }
+        if (out_pos + (int)ll >= domain_max) return 0;
+        for (int i = 0; i < (int)ll; i++)
+            domain_out[out_pos++] = (char)tolower((unsigned char)buf[pos++]);
+    }
+    domain_out[out_pos] = '\0';
+
+    if (pos + 4 > len) return 0;
+    *qtype_out = (uint16_t)(((uint8_t)buf[pos] << 8) | (uint8_t)buf[pos + 1]);
+    return 1;
+}
+
 void* process_query(void* arg) {
     struct QueryContext* ctx = (struct QueryContext*)arg;
 
@@ -268,7 +325,6 @@ void* process_query(void* arg) {
         fprintf(stderr, "Failed to parse request from %s\n", client_ip_buf);
         send_servfail(ctx->dns_sock, caddr, ctx->client_addr_len,
                       (unsigned char*)ctx->buffer, ctx->recv_len);
-        free(ctx->buffer);
         free(ctx);
         return NULL;
     }
@@ -282,7 +338,6 @@ void* process_query(void* arg) {
         notimp[3] = 0x80 | RCODE_NOTIMP;   // RA=1, RCODE=4
         sendto(ctx->dns_sock, notimp, sizeof(notimp), 0, caddr, ctx->client_addr_len);
         free_packet(pkt);
-        free(ctx->buffer);
         free(ctx);
         return NULL;
     }
@@ -295,7 +350,7 @@ void* process_query(void* arg) {
         err[2] = 0x80;                          // QR=1
         err[3] = 0x80 | (pkt->rcode & 0xF);    // RA=1, RCODE
         sendto(ctx->dns_sock, err, sizeof(err), 0, caddr, ctx->client_addr_len);
-        free_packet(pkt); free(ctx->buffer); free(ctx);
+        free_packet(pkt); free(ctx);
         return NULL;
     }
 
@@ -317,7 +372,7 @@ void* process_query(void* arg) {
         bv[19] = 0x00; bv[20] = 0x00;  // Flags = 0
         bv[21] = 0x00; bv[22] = 0x00;  // RDLEN = 0
         sendto(ctx->dns_sock, bv, sizeof(bv), 0, caddr, ctx->client_addr_len);
-        free_packet(pkt); free(ctx->buffer); free(ctx);
+        free_packet(pkt); free(ctx);
         return NULL;
     }
 
@@ -326,7 +381,6 @@ void* process_query(void* arg) {
         send_servfail(ctx->dns_sock, caddr, ctx->client_addr_len,
                       (unsigned char*)ctx->buffer, ctx->recv_len);
         free_packet(pkt);
-        free(ctx->buffer);
         free(ctx);
         return NULL;
     }
@@ -344,7 +398,6 @@ void* process_query(void* arg) {
         send_servfail(ctx->dns_sock, caddr, ctx->client_addr_len,
                       (unsigned char*)ctx->buffer, ctx->recv_len);
         free_packet(pkt);
-        free(ctx->buffer);
         free(ctx);
         return NULL;
     }
@@ -358,7 +411,6 @@ void* process_query(void* arg) {
                       (unsigned char*)ctx->buffer, ctx->recv_len);
         free_packet(pkt);
         free_packet(answer);
-        free(ctx->buffer);
         free(ctx);
         return NULL;
     }
@@ -448,7 +500,6 @@ void* process_query(void* arg) {
     free_packet(ret);
     free_packet(answer);
     free_packet(pkt);
-    free(ctx->buffer);
     free(ctx);
     return NULL;
 }
@@ -644,6 +695,7 @@ int main(int argc, char** argv)
 
     // Setup signal handlers
     setup_signals();
+    write_pid_file();
 
     // Initialize caches BEFORE creating threads
     printf("\n=== Initializing DNS Caches ===\n");
@@ -756,6 +808,9 @@ int main(int argc, char** argv)
             else
                 fprintf(stderr, "Warning: Failed to create new NS cache; keeping old one\n");
             if (old_ns) ns_cache_destroy(old_ns);
+
+            /* Reopen log file so logrotate can move the old one. */
+            log_reopen_upstream();
         }
 
         // 1-second timeout so we re-check g_shutdown promptly after a signal
@@ -780,17 +835,17 @@ int main(int argc, char** argv)
         // --- UDP IPv4 — drain all pending datagrams before returning to poll() ---
         if (pfds[udp4_idx].revents & POLLIN) {
             while (1) {
-                char* buffer = malloc(MAXLINE);
-                if (!buffer) { perror("Error: malloc"); break; }
-
+                // Receive into a stack buffer first.
+                // Cache hits are served here with zero heap allocation.
+                // Only cache misses pay for malloc(QueryContext).
+                char recv_buf[MAXLINE];
                 struct sockaddr_in client_addr;
                 socklen_t client_len = sizeof(client_addr);
                 memset(&client_addr, 0, sizeof(client_addr));
 
-                ssize_t recv_len = recvfrom(udp4_sock, buffer, MAXLINE, MSG_DONTWAIT,
+                ssize_t recv_len = recvfrom(udp4_sock, recv_buf, MAXLINE, MSG_DONTWAIT,
                                             (struct sockaddr*)&client_addr, &client_len);
                 if (recv_len < 0) {
-                    free(buffer);
                     if (errno != EAGAIN && errno != EWOULDBLOCK)
                         perror("Error: recvfrom UDP4");
                     break;  // kernel buffer drained
@@ -798,26 +853,49 @@ int main(int argc, char** argv)
 
                 query_count++;
 
+                // Cache hit: respond entirely from the poll loop — no thread wakeup.
+                if (g_answer_cache) {
+                    char domain_fast[256];
+                    uint16_t qtype_fast;
+                    if (quick_parse_query(recv_buf, recv_len,
+                                          domain_fast, sizeof(domain_fast), &qtype_fast)) {
+                        struct Packet* cached = answer_cache_get(g_answer_cache,
+                                                                  domain_fast, qtype_fast);
+                        if (cached) {
+                            if (cached->request && cached->recv_len >= 2) {
+                                ((unsigned char*)cached->request)[0] = (unsigned char)recv_buf[0];
+                                ((unsigned char*)cached->request)[1] = (unsigned char)recv_buf[1];
+                            }
+                            sendto(udp4_sock, cached->request, cached->recv_len, 0,
+                                   (const struct sockaddr*)&client_addr, client_len);
+                            free_packet(cached);
+                            continue;  // zero malloc/free for cache hits
+                        }
+                    }
+                }
+
+                // Cache miss: allocate ctx, copy the already-received bytes into it.
+                // DNS queries are small (<200 bytes typically), so the memcpy is cheap.
                 struct QueryContext* ctx = malloc(sizeof(struct QueryContext));
                 if (!ctx) {
                     send_servfail(udp4_sock, (const struct sockaddr*)&client_addr,
-                                  client_len, (unsigned char*)buffer, recv_len);
-                    free(buffer); break;
+                                  client_len, (unsigned char*)recv_buf, recv_len);
+                    break;
                 }
 
+                memcpy(ctx->buffer, recv_buf, recv_len);
                 ctx->dns_sock = udp4_sock;
                 memset(&ctx->client_addr, 0, sizeof(ctx->client_addr));
                 memcpy(&ctx->client_addr, &client_addr, client_len);
                 ctx->client_addr_len = client_len;
-                ctx->buffer      = buffer;
                 ctx->recv_len    = recv_len;
                 ctx->query_num   = query_count;
 
                 if (threadpool_add_work(thread_pool, process_query, ctx) < 0) {
                     fprintf(stderr, "Error: Failed to queue work (pool might be full)\n");
                     send_servfail(udp4_sock, (const struct sockaddr*)&client_addr,
-                                  client_len, (unsigned char*)buffer, recv_len);
-                    free(buffer); free(ctx);
+                                  client_len, (unsigned char*)recv_buf, recv_len);
+                    free(ctx);
                 }
             }
         }
@@ -825,17 +903,14 @@ int main(int argc, char** argv)
         // --- UDP IPv6 — drain all pending datagrams before returning to poll() ---
         if (udp6_idx >= 0 && (pfds[udp6_idx].revents & POLLIN)) {
             while (1) {
-                char* buffer = malloc(MAXLINE);
-                if (!buffer) { perror("Error: malloc"); break; }
-
+                char recv_buf[MAXLINE];
                 struct sockaddr_in6 client_addr6;
                 socklen_t client_len = sizeof(client_addr6);
                 memset(&client_addr6, 0, sizeof(client_addr6));
 
-                ssize_t recv_len = recvfrom(udp6_sock, buffer, MAXLINE, MSG_DONTWAIT,
+                ssize_t recv_len = recvfrom(udp6_sock, recv_buf, MAXLINE, MSG_DONTWAIT,
                                             (struct sockaddr*)&client_addr6, &client_len);
                 if (recv_len < 0) {
-                    free(buffer);
                     if (errno != EAGAIN && errno != EWOULDBLOCK)
                         perror("Error: recvfrom UDP6");
                     break;  // kernel buffer drained
@@ -843,26 +918,46 @@ int main(int argc, char** argv)
 
                 query_count++;
 
+                if (g_answer_cache) {
+                    char domain_fast[256];
+                    uint16_t qtype_fast;
+                    if (quick_parse_query(recv_buf, recv_len,
+                                          domain_fast, sizeof(domain_fast), &qtype_fast)) {
+                        struct Packet* cached = answer_cache_get(g_answer_cache,
+                                                                  domain_fast, qtype_fast);
+                        if (cached) {
+                            if (cached->request && cached->recv_len >= 2) {
+                                ((unsigned char*)cached->request)[0] = (unsigned char)recv_buf[0];
+                                ((unsigned char*)cached->request)[1] = (unsigned char)recv_buf[1];
+                            }
+                            sendto(udp6_sock, cached->request, cached->recv_len, 0,
+                                   (const struct sockaddr*)&client_addr6, client_len);
+                            free_packet(cached);
+                            continue;
+                        }
+                    }
+                }
+
                 struct QueryContext* ctx = malloc(sizeof(struct QueryContext));
                 if (!ctx) {
                     send_servfail(udp6_sock, (const struct sockaddr*)&client_addr6,
-                                  client_len, (unsigned char*)buffer, recv_len);
-                    free(buffer); break;
+                                  client_len, (unsigned char*)recv_buf, recv_len);
+                    break;
                 }
 
+                memcpy(ctx->buffer, recv_buf, recv_len);
                 ctx->dns_sock = udp6_sock;
                 memset(&ctx->client_addr, 0, sizeof(ctx->client_addr));
                 memcpy(&ctx->client_addr, &client_addr6, client_len);
                 ctx->client_addr_len = client_len;
-                ctx->buffer      = buffer;
                 ctx->recv_len    = recv_len;
                 ctx->query_num   = query_count;
 
                 if (threadpool_add_work(thread_pool, process_query, ctx) < 0) {
                     fprintf(stderr, "Error: Failed to queue work (pool might be full)\n");
                     send_servfail(udp6_sock, (const struct sockaddr*)&client_addr6,
-                                  client_len, (unsigned char*)buffer, recv_len);
-                    free(buffer); free(ctx);
+                                  client_len, (unsigned char*)recv_buf, recv_len);
+                    free(ctx);
                 }
             }
         }
@@ -936,6 +1031,7 @@ int main(int argc, char** argv)
     if (tcp6_sock >= 0) close(tcp6_sock);
 
     log_close_upstream();
+    remove_pid_file();
 
     return 0;
 }

@@ -67,6 +67,9 @@
 #ifndef LOG_FILE_PATH
 #define LOG_FILE_PATH "../logs/upstream.log"   /* logs/ sits next to upstream_dns/ */
 #endif
+#ifndef PID_FILE_PATH
+#define PID_FILE_PATH "/run/upstream_dns.pid"
+#endif
 
 /* Paths relative to SERVER_PATH — do not make these absolute. */
 #define HINTS_FILE       "/misc/root_hints.txt"

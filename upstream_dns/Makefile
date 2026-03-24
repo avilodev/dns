@@ -13,7 +13,8 @@ LOG_FILE_PATH := $(abspath ..)/logs/upstream.log
 
 CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP \
          -DSERVER_PATH='"$(SERVER_PATH)"' \
-         -DLOG_FILE_PATH='"$(LOG_FILE_PATH)"'
+         -DLOG_FILE_PATH='"$(LOG_FILE_PATH)"' \
+         -DPID_FILE_PATH='"$(PID_FILE_PATH)"'
 LDFLAGS = -pthread -lssl -lcrypto -latomic
 
 # Directories
@@ -32,7 +33,8 @@ SOURCES = main.c config.c thread_pool.c utils.c      \
 SRC_FILES = $(addprefix $(SRC_DIR)/, $(SOURCES))
 OBJECTS = $(addprefix $(OBJ_DIR)/, $(SOURCES:.c=.o))
 
-TARGET = $(BIN_DIR)/dns
+TARGET = $(BIN_DIR)/upstream_dns
+PID_FILE_PATH = /run/upstream_dns.pid
 
 # Default target
 all: directories $(TARGET)
@@ -63,10 +65,27 @@ rebuild: clean all
 run: $(TARGET)
 	sudo ./$(TARGET)
 
-# Install cron script to /etc/cron.daily/ (requires root)
-install: install-cron
+# Install binary, systemd service, logrotate config, and cron script
+INSTALL_BIN   = /usr/local/sbin
+SYSTEMD_DIR   = /etc/systemd/system
+LOGROTATE_DIR = /etc/logrotate.d
+
+install: $(TARGET) install-cron
+	install -d $(INSTALL_BIN)
+	install -m 755 $(TARGET) $(INSTALL_BIN)/upstream_dns
+	install -m 644 upstream_dns.service $(SYSTEMD_DIR)/upstream_dns.service
+	install -m 644 misc/logrotate-upstream $(LOGROTATE_DIR)/upstream_dns
+	systemctl daemon-reload
+	@echo "Installed upstream_dns. Enable with: systemctl enable --now upstream_dns"
 
 uninstall: uninstall-cron
+	systemctl stop upstream_dns 2>/dev/null || true
+	systemctl disable upstream_dns 2>/dev/null || true
+	rm -f $(INSTALL_BIN)/upstream_dns
+	rm -f $(SYSTEMD_DIR)/upstream_dns.service
+	rm -f $(LOGROTATE_DIR)/upstream_dns
+	systemctl daemon-reload
+	@echo "Removed upstream_dns"
 
 # Install the root-hints refresh cron script to /etc/cron.daily/,
 # substituting @HINTS_DEST@ with the current absolute path to root_hints.txt.
@@ -93,4 +112,4 @@ debug:
 # Auto-generated header dependency files (from -MMD -MP)
 -include $(OBJECTS:.o=.d)
 
-.PHONY: all clean rebuild run debug directories install uninstall install-cron uninstall-cron
+.PHONY: all clean rebuild run debug directories install uninstall install-cron uninstall-cron install-service uninstall-service

@@ -97,6 +97,8 @@ int create_server_socket(int port) {
         close(dns_sock);
         exit(EXIT_FAILURE);
     }
+    if (setsockopt(dns_sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0)
+        perror("Warning: SO_REUSEPORT unavailable");
 
     // Configure server address
     memset(&dns_addr, 0, sizeof(dns_addr));
@@ -128,6 +130,7 @@ int create_server_socket_v6(int port) {
     }
     int opt = 1;
     setsockopt(sock, SOL_SOCKET,   SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(sock, SOL_SOCKET,   SO_REUSEPORT, &opt, sizeof(opt));
     setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY,  &opt, sizeof(opt));
     struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
