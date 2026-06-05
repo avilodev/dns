@@ -58,9 +58,16 @@ void answer_cache_destroy(AnswerCache* cache);
 int answer_cache_put(AnswerCache* cache, const char* domain, uint16_t qtype, 
                      const char* response_data, ssize_t response_len, uint32_t ttl);
 struct Packet* answer_cache_get(AnswerCache* cache, const char* domain, uint16_t qtype);
+/* Fast path: returns a malloc'd copy of the raw, TTL-patched response bytes
+ * (caller frees with free()), or NULL on miss.  *out_len receives the length.
+ * Avoids the full struct Packet build/teardown that answer_cache_get() does. */
+char* answer_cache_get_raw(AnswerCache* cache, const char* domain, uint16_t qtype,
+                           ssize_t* out_len);
 void answer_cache_cleanup_expired(AnswerCache* cache);
 
 // Utility functions
+bool wire_is_signed(const unsigned char* buf, int len);
+bool response_is_signed(struct Packet* response);
 uint32_t extract_min_ttl_from_response(struct Packet* response);
 uint32_t extract_referral_ns_ttl(struct Packet* response);
 void print_cache_stats(NSCache* ns_cache, AnswerCache* answer_cache);

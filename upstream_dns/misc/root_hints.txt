@@ -9,8 +9,8 @@
 ;           on server           FTP.INTERNIC.NET
 ;       -OR-                    RS.INTERNIC.NET
 ;
-;       last update:     March 05, 2026
-;       related version of root zone:     2026030501
+;       last update:     May 21, 2026
+;       related version of root zone:     2026052101
 ; 
 ; FORMERLY NS.INTERNIC.NET 
 ;

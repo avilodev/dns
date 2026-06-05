@@ -222,6 +222,16 @@ struct Packet* format_resolver(struct Packet* pkt)
 
     set_packet_fields(copy_pkt);
 
+    /* copy_packet() always allocates a full MAX_PACKET_SIZE buffer, so let
+     * construct_dns_packet() use all of it.  Otherwise recv_len still reflects
+     * the (smaller) source query length — and for a client query the upstream
+     * parser already trimmed that to exactly header+question, leaving no room.
+     * construct_dns_packet() would then drop the trailing EDNS OPT, which
+     * carries the DO bit, so upstream nameservers return no RRSIGs and DNSSEC
+     * validation can never run.  construct_dns_packet() rebuilds the packet
+     * from struct fields, so the source length is irrelevant here. */
+    copy_pkt->recv_len = MAX_PACKET_SIZE;
+
     int ret = construct_dns_packet(copy_pkt);
     if (ret < 0) {
         fprintf(stderr, "Error: Failed to construct DNS packet\n");

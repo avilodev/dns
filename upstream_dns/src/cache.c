@@ -307,15 +307,27 @@ int answer_cache_put(AnswerCache* cache, const char* domain, uint16_t qtype,
     return 0;
 }
 
-struct Packet* answer_cache_get(AnswerCache* cache, const char* domain, uint16_t qtype) {
+/*
+ * Core cache lookup.  Returns a freshly malloc'd copy of the raw, TTL-patched
+ * response bytes for (domain, qtype), or NULL on miss/expiry/OOM.  On success
+ * *out_len is set to the byte length and the caller owns the buffer (free it).
+ *
+ * The hot path (cache hits served straight from the poll loop) calls this
+ * directly: it copies the bytes once, patches TTLs, and sends them.  This
+ * avoids building and immediately freeing a full struct Packet — a second
+ * buffer copy plus full_domain/component strdup()s — on every cache hit.
+ */
+char* answer_cache_get_raw(AnswerCache* cache, const char* domain, uint16_t qtype,
+                           ssize_t* out_len) {
+    if (out_len) *out_len = 0;
     if (!cache || !domain) return NULL;
-    
+
     unsigned long hash = hash_domain_type(domain, qtype);
     size_t index = hash % cache->size;
     time_t now = time(NULL);
-    
+
     pthread_mutex_lock(&cache->lock);
-    
+
     AnswerCacheEntry* entry = cache->buckets[index];
     while (entry) {
         if (strcmp(entry->domain, domain) == 0 && entry->qtype == qtype) {
@@ -330,8 +342,7 @@ struct Packet* answer_cache_get(AnswerCache* cache, const char* domain, uint16_t
                 }
                 memcpy(data_copy, entry->response_data, data_len);
                 /* Compute remaining TTL: how many seconds until expiry. */
-                uint32_t remaining = (entry->expiry > now)
-                    ? (uint32_t)(entry->expiry - now) : 0;
+                uint32_t remaining = (uint32_t)(entry->expiry - now);
                 pthread_mutex_unlock(&cache->lock);
 
                 /* RFC 1034 §4.1.3: decrement all RR TTLs by elapsed time
@@ -339,9 +350,8 @@ struct Packet* answer_cache_get(AnswerCache* cache, const char* domain, uint16_t
                 patch_response_ttls((unsigned char*)data_copy, (int)data_len,
                                     remaining);
 
-                struct Packet* pkt = parse_response(data_copy, data_len);
-                free(data_copy);
-                return pkt;
+                if (out_len) *out_len = data_len;
+                return data_copy;
             } else {
                 pthread_mutex_unlock(&cache->lock);
                 return NULL;
@@ -352,6 +362,20 @@ struct Packet* answer_cache_get(AnswerCache* cache, const char* domain, uint16_t
 
     pthread_mutex_unlock(&cache->lock);
     return NULL;
+}
+
+/*
+ * Convenience wrapper: look up a cached answer and parse it into a struct
+ * Packet.  Used by the resolver worker path, which needs the parsed fields.
+ */
+struct Packet* answer_cache_get(AnswerCache* cache, const char* domain, uint16_t qtype) {
+    ssize_t data_len = 0;
+    char* data_copy = answer_cache_get_raw(cache, domain, qtype, &data_len);
+    if (!data_copy) return NULL;
+
+    struct Packet* pkt = parse_response(data_copy, data_len);
+    free(data_copy);
+    return pkt;
 }
 
 void answer_cache_cleanup_expired(AnswerCache* cache) {
@@ -379,6 +403,45 @@ void answer_cache_cleanup_expired(AnswerCache* cache) {
     }
     
     pthread_mutex_unlock(&cache->lock);
+}
+
+/*
+ * Return true if the response carries at least one RRSIG — i.e. the answer is
+ * DNSSEC-signed.  Used to tell "genuinely unsigned" (safe to cache even when a
+ * validating query couldn't set AD) apart from "signed but unvalidated" (an
+ * incomplete/transient validation that must NOT be cached, or it would serve a
+ * stale non-AD answer until the TTL expires).
+ */
+bool wire_is_signed(const unsigned char* buf, int len) {
+    if (!buf || len < HEADER_LEN) return false;
+
+    uint16_t qdcount = ntohs(*(const uint16_t*)(buf + 4));
+    uint16_t ancount = ntohs(*(const uint16_t*)(buf + 6));
+    uint16_t nscount = ntohs(*(const uint16_t*)(buf + 8));
+    uint16_t arcount = ntohs(*(const uint16_t*)(buf + 10));
+    int pos = HEADER_LEN;
+
+    for (int i = 0; i < qdcount && pos < len; i++) {
+        skip_dns_name((unsigned char*)buf, len, &pos);
+        pos += 4; /* QTYPE + QCLASS */
+    }
+
+    int total_rrs = (int)ancount + nscount + arcount;
+    for (int i = 0; i < total_rrs && pos < len; i++) {
+        skip_dns_name((unsigned char*)buf, len, &pos);
+        if (pos + 10 > len) break;
+        uint16_t type  = ntohs(*(const uint16_t*)(buf + pos));
+        uint16_t rdlen = ntohs(*(const uint16_t*)(buf + pos + 8));
+        if (type == QTYPE_RRSIG) return true;
+        pos += 10 + rdlen;
+    }
+    return false;
+}
+
+bool response_is_signed(struct Packet* response) {
+    if (!response || !response->request) return false;
+    return wire_is_signed((const unsigned char*)response->request,
+                          (int)response->recv_len);
 }
 
 uint32_t extract_min_ttl_from_response(struct Packet* response) {

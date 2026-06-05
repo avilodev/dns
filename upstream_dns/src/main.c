@@ -128,8 +128,15 @@ static void log_query(const char* client_ip, uint16_t port,
                        ts, client_ip ? client_ip : "-", port,
                        qt, domain ? domain : "-", rcode_name_up(rcode));
 
-    if (len > 0 && write(g_log_fd, line, len) < 0)
-        perror("Warning: Upstream log write failed");
+    /* snprintf returns the number of bytes it WOULD have written, even when
+     * it truncated.  Without clamping, write() reads past the end of line[]
+     * and writes uninitialized stack memory to the log (and the trailing '\n'
+     * gets lost, causing log entries to run together). */
+    if (len > 0) {
+        if (len >= (int)sizeof(line)) len = (int)sizeof(line) - 1;
+        if (write(g_log_fd, line, len) < 0)
+            perror("Warning: Upstream log write failed");
+    }
 
     pthread_mutex_unlock(&g_log_mutex);
 }
@@ -271,8 +278,9 @@ static void send_servfail(int sock, const struct sockaddr* client_addr, socklen_
  */
 static int quick_parse_query(const char* buf, ssize_t len,
                               char* domain_out, int domain_max,
-                              uint16_t* qtype_out)
+                              uint16_t* qtype_out, bool* do_out)
 {
+    if (do_out) *do_out = false;
     if (len < 17) return 0;                          // header(12) + min QNAME(1) + null(1) + QTYPE(2) + QCLASS(2)
     if (buf[2] & 0x80) return 0;                     // QR=1 means response, not a query
     if ((uint8_t)buf[4] != 0 || (uint8_t)buf[5] != 1) return 0;  // QDCOUNT must be 1
@@ -296,6 +304,34 @@ static int quick_parse_query(const char* buf, ssize_t len,
 
     if (pos + 4 > len) return 0;
     *qtype_out = (uint16_t)(((uint8_t)buf[pos] << 8) | (uint8_t)buf[pos + 1]);
+
+    /* Scan the additional section for the EDNS OPT record to learn whether the
+     * client set the DO (DNSSEC OK) bit — the fast path needs this to avoid
+     * serving a signed-but-unvalidated cached answer to a validating client. */
+    if (do_out) {
+        int p = pos + 4;  /* past QTYPE(2) + QCLASS(2) */
+        int an = ((uint8_t)buf[6]  << 8) | (uint8_t)buf[7];
+        int ns = ((uint8_t)buf[8]  << 8) | (uint8_t)buf[9];
+        int ar = ((uint8_t)buf[10] << 8) | (uint8_t)buf[11];
+        int total = an + ns + ar;
+        for (int i = 0; i < total && p < len; i++) {
+            while (p < len) {                        /* skip owner name */
+                uint8_t l = (uint8_t)buf[p];
+                if (l == 0)              { p += 1; break; }
+                if ((l & 0xC0) == 0xC0)  { p += 2; break; }
+                p += 1 + l;
+            }
+            if (p + 10 > len) break;
+            uint16_t rtype = ((uint8_t)buf[p] << 8) | (uint8_t)buf[p + 1];
+            uint32_t rttl  = ((uint32_t)(uint8_t)buf[p + 4] << 24) |
+                             ((uint32_t)(uint8_t)buf[p + 5] << 16) |
+                             ((uint32_t)(uint8_t)buf[p + 6] <<  8) |
+                              (uint32_t)(uint8_t)buf[p + 7];
+            uint16_t rdlen = ((uint8_t)buf[p + 8] << 8) | (uint8_t)buf[p + 9];
+            if (rtype == 41) { *do_out = (rttl & 0x00008000u) != 0; break; }  /* OPT */
+            p += 10 + rdlen;
+        }
+    }
     return 1;
 }
 
@@ -401,6 +437,13 @@ void* process_query(void* arg) {
         free(ctx);
         return NULL;
     }
+
+    /* Carry the client's DNSSEC intent (DO/CD) onto the resolver query so
+     * validation runs only when the client asked for it (RFC 4035 §3.2.2).
+     * format_resolver()/set_packet_fields() zero these on the outgoing wire
+     * query, so we copy them from the parsed client request here. */
+    answer->do_bit = pkt->do_bit;
+    answer->cd     = pkt->cd;
 
     struct Packet* ret = send_resolver(answer);
     if (!ret) {
@@ -609,6 +652,11 @@ void* process_tcp_query(void* arg) {
             free_packet(pkt); free(buffer); continue;
         }
 
+        /* Carry the client's DNSSEC intent (DO/CD) onto the resolver query
+         * (see process_query() for rationale). */
+        answer->do_bit = pkt->do_bit;
+        answer->cd     = pkt->cd;
+
         struct Packet* ret = send_resolver(answer);
         if (!ret) {
             log_query(ctx->client_ip, ctx->client_port, pkt->q_type,
@@ -742,10 +790,12 @@ int main(int argc, char** argv)
     }
 
     // Create all listeners
-    int udp4_sock = create_server_socket(PORT);
-    int udp6_sock = create_server_socket_v6(PORT);  // may be -1
-    int tcp4_sock = create_tcp_socket_v4(PORT);     // may be -1
-    int tcp6_sock = create_tcp_socket_v6(PORT);     // may be -1
+    // Bind the port the user actually requested via -p (defaults to PORT).
+    int listen_port = g_config.port;
+    int udp4_sock = create_server_socket(listen_port);
+    int udp6_sock = create_server_socket_v6(listen_port);  // may be -1
+    int tcp4_sock = create_tcp_socket_v4(listen_port);     // may be -1
+    int tcp6_sock = create_tcp_socket_v6(listen_port);     // may be -1
 
     // Create thread pool — use g_config.queue_size for the work queue
     struct ThreadPoolConfig pool_config = {
@@ -857,19 +907,35 @@ int main(int argc, char** argv)
                 if (g_answer_cache) {
                     char domain_fast[256];
                     uint16_t qtype_fast;
+                    bool do_fast = false;
                     if (quick_parse_query(recv_buf, recv_len,
-                                          domain_fast, sizeof(domain_fast), &qtype_fast)) {
-                        struct Packet* cached = answer_cache_get(g_answer_cache,
-                                                                  domain_fast, qtype_fast);
-                        if (cached) {
-                            if (cached->request && cached->recv_len >= 2) {
-                                ((unsigned char*)cached->request)[0] = (unsigned char)recv_buf[0];
-                                ((unsigned char*)cached->request)[1] = (unsigned char)recv_buf[1];
+                                          domain_fast, sizeof(domain_fast),
+                                          &qtype_fast, &do_fast)) {
+                        ssize_t cached_len = 0;
+                        char* cached_raw = answer_cache_get_raw(g_answer_cache,
+                                                                domain_fast, qtype_fast,
+                                                                &cached_len);
+                        if (cached_raw) {
+                            // A validating client (DO=1) must not be served a
+                            // signed-but-unvalidated cached answer from the fast
+                            // path — route it to the worker to (re)validate.
+                            // Validated (AD) and unsigned answers serve directly.
+                            bool ad = cached_len > 3 &&
+                                      (((unsigned char)cached_raw[3] >> 5) & 1);
+                            if (do_fast && !ad &&
+                                wire_is_signed((const unsigned char*)cached_raw,
+                                               (int)cached_len)) {
+                                free(cached_raw);  // fall through to worker
+                            } else {
+                                if (cached_len >= 2) {
+                                    ((unsigned char*)cached_raw)[0] = (unsigned char)recv_buf[0];
+                                    ((unsigned char*)cached_raw)[1] = (unsigned char)recv_buf[1];
+                                }
+                                sendto(udp4_sock, cached_raw, cached_len, 0,
+                                       (const struct sockaddr*)&client_addr, client_len);
+                                free(cached_raw);
+                                continue;  // zero parse/Packet alloc for cache hits
                             }
-                            sendto(udp4_sock, cached->request, cached->recv_len, 0,
-                                   (const struct sockaddr*)&client_addr, client_len);
-                            free_packet(cached);
-                            continue;  // zero malloc/free for cache hits
                         }
                     }
                 }
@@ -921,19 +987,31 @@ int main(int argc, char** argv)
                 if (g_answer_cache) {
                     char domain_fast[256];
                     uint16_t qtype_fast;
+                    bool do_fast = false;
                     if (quick_parse_query(recv_buf, recv_len,
-                                          domain_fast, sizeof(domain_fast), &qtype_fast)) {
-                        struct Packet* cached = answer_cache_get(g_answer_cache,
-                                                                  domain_fast, qtype_fast);
-                        if (cached) {
-                            if (cached->request && cached->recv_len >= 2) {
-                                ((unsigned char*)cached->request)[0] = (unsigned char)recv_buf[0];
-                                ((unsigned char*)cached->request)[1] = (unsigned char)recv_buf[1];
+                                          domain_fast, sizeof(domain_fast),
+                                          &qtype_fast, &do_fast)) {
+                        ssize_t cached_len = 0;
+                        char* cached_raw = answer_cache_get_raw(g_answer_cache,
+                                                                domain_fast, qtype_fast,
+                                                                &cached_len);
+                        if (cached_raw) {
+                            bool ad = cached_len > 3 &&
+                                      (((unsigned char)cached_raw[3] >> 5) & 1);
+                            if (do_fast && !ad &&
+                                wire_is_signed((const unsigned char*)cached_raw,
+                                               (int)cached_len)) {
+                                free(cached_raw);  // fall through to worker
+                            } else {
+                                if (cached_len >= 2) {
+                                    ((unsigned char*)cached_raw)[0] = (unsigned char)recv_buf[0];
+                                    ((unsigned char*)cached_raw)[1] = (unsigned char)recv_buf[1];
+                                }
+                                sendto(udp6_sock, cached_raw, cached_len, 0,
+                                       (const struct sockaddr*)&client_addr6, client_len);
+                                free(cached_raw);
+                                continue;
                             }
-                            sendto(udp6_sock, cached->request, cached->recv_len, 0,
-                                   (const struct sockaddr*)&client_addr6, client_len);
-                            free_packet(cached);
-                            continue;
                         }
                     }
                 }

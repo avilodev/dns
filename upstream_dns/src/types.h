@@ -48,6 +48,7 @@
 #define RCODE_SERVER_FAILURE 2
 #define RCODE_NAME_ERROR     3
 #define RCODE_NOTIMP         4
+#define RCODE_REFUSED        5
 #define RCODE_NOTAUTH        9   // Not Authoritative (RFC 2136)
 #define RCODE_BADVERS        16  // Bad OPT Version (RFC 6891)
 
