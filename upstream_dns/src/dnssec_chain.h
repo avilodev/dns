@@ -91,6 +91,9 @@ typedef struct PendingDS {
 typedef struct {
     ValidatedKey *keys;        /* Validated DNSKEYs accumulated this resolution */
     PendingDS    *pending_ds;  /* DS records awaiting a matching child DNSKEY   */
+    bool          bogus;       /* A secure delegation broke (DS without matching
+                                * DNSKEY) — the whole resolution is bogus and the
+                                * caller must return SERVFAIL (RFC 4035 §5.5).  */
 } DnssecChainCtx;
 
 /* --------------------------------------------------------------------------
@@ -197,5 +200,29 @@ void dnssec_chain_process_referral(DnssecChainCtx *ctx,
 void dnssec_chain_try_validate_dnskeys(DnssecChainCtx *ctx,
                                        const struct Packet *dnskey_response,
                                        const char *zone);
+
+/*
+ * Add every DNSKEY in a response's RR sections to the chain as a ValidatedKey
+ * for `zone`.  Used for the root bootstrap: the caller MUST have already
+ * verified the response's DNSKEY RRSIG against the trust anchor (via
+ * dnssec_validate_root_dnskey) before calling this — this function performs no
+ * verification of its own.
+ *
+ * Returns the number of keys added.
+ */
+int dnssec_chain_add_response_keys(DnssecChainCtx *ctx,
+                                   const struct Packet *response,
+                                   const char *zone);
+
+/*
+ * Decide whether `zone` is "bogus" at the current chain state: the parent
+ * supplied a DS with a SUPPORTED digest type (so the zone is provably meant to
+ * be signed), yet no DNSKEY validated against it (no key for the zone, and an
+ * unmatched DS remains).  This distinguishes a broken signed zone (-> SERVFAIL)
+ * from a genuinely unsigned/insecure delegation (no DS -> pass through).
+ *
+ * Returns 1 if bogus, 0 otherwise.
+ */
+int dnssec_chain_zone_bogus(const DnssecChainCtx *ctx, const char *zone);
 
 #endif /* DNSSEC_CHAIN_H */

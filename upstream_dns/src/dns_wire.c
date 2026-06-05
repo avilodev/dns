@@ -90,7 +90,13 @@ char* parse_dns_name_from_wire(unsigned char* buffer, int buffer_len, int pos)
     }
     
     name[name_len] = '\0';
-    return name_len > 0 ? strdup(name) : NULL;
+    /* A zero-length name is the DNS root ".", a valid name — NOT an error.
+     * Returning NULL here previously broke parse_rrsig_rdata() for every
+     * root-signed RRSIG (signer name = "."), so the root DNSKEY signature
+     * could never be parsed and the DNSSEC chain-of-trust never bootstrapped.
+     * The root does not appear as a CNAME/NS/SOA name in the other callers,
+     * so returning "." is correct everywhere it is used. */
+    return strdup(name_len > 0 ? name : ".");
 }
 
 /*

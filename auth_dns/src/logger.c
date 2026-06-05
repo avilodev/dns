@@ -84,8 +84,14 @@ int log_entry(const char* client_ip, uint16_t port, uint16_t qtype,
                        rcode_name(rcode));
     }
 
-    if (len > 0 && write(log_fd, log_line, len) < 0) {
-        perror("Warning: Log write failed");
+    /* snprintf returns the number of bytes it WOULD have written, even when
+     * it truncated.  Without clamping, write() reads past the end of log_line
+     * and writes uninitialized stack memory to the log (and the trailing '\n'
+     * gets lost, causing log entries to run together). */
+    if (len > 0) {
+        if (len >= (int)sizeof(log_line)) len = (int)sizeof(log_line) - 1;
+        if (write(log_fd, log_line, len) < 0)
+            perror("Warning: Log write failed");
     }
 
     pthread_mutex_unlock(&log_mutex);

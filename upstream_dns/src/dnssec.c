@@ -85,6 +85,15 @@ static int encode_name_lc(const char *name, uint8_t *dst, int dst_size)
 {
     int pos = 0;
     const char *p = name;
+    /* Root "." (or empty) is a valid name that encodes to a single zero byte.
+     * Without this, the generic loop below sees a leading '.' as a zero-length
+     * label and returns -1 — which made build_signed_data() fail for every
+     * root-signed RRSIG (signer name "."), blocking DNSSEC chain bootstrap. */
+    if (!p || p[0] == '\0' || (p[0] == '.' && p[1] == '\0')) {
+        if (dst_size < 1) return -1;
+        dst[0] = 0;
+        return 1;
+    }
     while (*p) {
         const char *dot = p;
         while (*dot && *dot != '.') dot++;
@@ -415,6 +424,8 @@ static EVP_PKEY *import_dnskey_pubkey(const DnskeyRdata *dk)
 
     switch (dk->algorithm) {
 
+    case 5:    /* RSASHA1            (RFC 3110) */
+    case 7:    /* RSASHA1-NSEC3-SHA1 (RFC 5155) — same RSA key format */
     case 8:    /* RSASHA256 */
     case 10:   /* RSASHA512 */
     {
@@ -617,6 +628,8 @@ int dnssec_verify_rrsig(const RrsigRdata *rrsig,
     /* Select digest (NULL = implicit, used for Ed25519) */
     const EVP_MD *md = NULL;
     switch (rrsig->algorithm) {
+    case 5:  md = EVP_sha1();   break;   /* RSASHA1            */
+    case 7:  md = EVP_sha1();   break;   /* RSASHA1-NSEC3-SHA1 */
     case 8:  md = EVP_sha256(); break;
     case 10: md = EVP_sha512(); break;
     case 13: md = EVP_sha256(); break;
@@ -1097,4 +1110,156 @@ int dnssec_validate_response(struct Packet *response,
                              const TrustAnchor *anchors)
 {
     return dnssec_validate_with_chain(response, anchors, NULL);
+}
+
+/*
+ * Bootstrap validator for the root DNSKEY RRset.
+ *
+ * Verifies the RRSIG covering the root DNSKEY RRset using ONLY a trust-anchor
+ * key (the root KSK loaded at startup) as the verifier — deliberately NOT
+ * find_dnskey(), which would also accept a key contained in the response and
+ * thus self-validate a forged RRset.  This anchors the root ZSK to the static
+ * trust anchor so the caller can safely add the whole RRset to the chain.
+ *
+ * Returns 1 if a trust-anchor key verifies the DNSKEY RRSIG, else 0.
+ */
+int dnssec_validate_root_dnskey(struct Packet *response,
+                                const TrustAnchor *anchors)
+{
+    if (!response || !response->request ||
+        response->recv_len < HEADER_LEN || !anchors)
+        return 0;
+
+    const uint8_t *buf     = (const uint8_t *)response->request;
+    int            buf_len = (int)response->recv_len;
+    int total_rrs = response->ancount + response->nscount + response->arcount;
+
+    int pos = HEADER_LEN;
+    for (int q = 0; q < response->qdcount && pos < buf_len; q++) {
+        int e = name_end_pos(buf, buf_len, pos);
+        if (e < 0) return 0;
+        pos = e + 4;
+    }
+
+    for (int a = 0; a < total_rrs && pos < buf_len; a++) {
+        int name_pos = pos;
+        int name_end = name_end_pos(buf, buf_len, pos);
+        if (name_end < 0 || name_end + 10 > buf_len) break;
+
+        uint16_t type = ((uint16_t)buf[name_end]     << 8) | buf[name_end + 1];
+        uint16_t rdl  = ((uint16_t)buf[name_end + 8] << 8) | buf[name_end + 9];
+        int rdata_off = name_end + 10;
+        if (rdata_off + rdl > buf_len) break;
+
+        if (type == QTYPE_RRSIG) {
+            RrsigRdata rrsig;
+            if (parse_rrsig_rdata(buf, buf_len, rdata_off, rdl, &rrsig) == 0) {
+                if (rrsig.type_covered == QTYPE_DNSKEY) {
+                    /* Verifier MUST be a trust anchor (not a response key). */
+                    for (const TrustAnchor *ta = anchors; ta; ta = ta->next) {
+                        if (ta->key_tag != rrsig.key_tag ||
+                            ta->algorithm != rrsig.algorithm)
+                            continue;
+
+                        /* Borrowed pubkey — do NOT free_dnskey_rdata(&dk). */
+                        DnskeyRdata dk;
+                        dk.flags      = ta->flags;
+                        dk.protocol   = ta->protocol;
+                        dk.algorithm  = ta->algorithm;
+                        dk.pubkey     = ta->pubkey;
+                        dk.pubkey_len = ta->pubkey_len;
+
+                        uint8_t *signed_data = NULL;
+                        int      signed_len  = 0;
+                        if (build_signed_data(response, &rrsig, name_pos,
+                                              &signed_data, &signed_len) >= 0) {
+                            int r = dnssec_verify_rrsig(&rrsig, &dk, signed_data,
+                                                        (size_t)signed_len);
+                            free(signed_data);
+                            if (r == 1) {
+                                free_rrsig_rdata(&rrsig);
+                                return 1;
+                            }
+                        }
+                    }
+                }
+                free_rrsig_rdata(&rrsig);
+            }
+        }
+
+        pos = rdata_off + rdl;
+    }
+
+    return 0;
+}
+
+/*
+ * Verify a zone's DNSKEY RRset self-signature using a key already validated in
+ * the chain (typically the zone KSK, just promoted via its DS digest), and
+ * report success so the caller can then trust the whole RRset — including the
+ * ZSK(s).  The verifier is taken ONLY from the chain (never from the response),
+ * so a forged DNSKEY/RRSIG cannot self-validate.
+ *
+ * Returns 1 if the DNSKEY RRset RRSIG verifies against a chain key for `zone`.
+ */
+int dnssec_validate_dnskey_with_chain(struct Packet *response, const char *zone,
+                                      const DnssecChainCtx *chain)
+{
+    if (!response || !response->request ||
+        response->recv_len < HEADER_LEN || !zone || !chain)
+        return 0;
+
+    const uint8_t *buf     = (const uint8_t *)response->request;
+    int            buf_len = (int)response->recv_len;
+    int total_rrs = response->ancount + response->nscount + response->arcount;
+
+    int pos = HEADER_LEN;
+    for (int q = 0; q < response->qdcount && pos < buf_len; q++) {
+        int e = name_end_pos(buf, buf_len, pos);
+        if (e < 0) return 0;
+        pos = e + 4;
+    }
+
+    for (int a = 0; a < total_rrs && pos < buf_len; a++) {
+        int name_pos = pos;
+        int name_end = name_end_pos(buf, buf_len, pos);
+        if (name_end < 0 || name_end + 10 > buf_len) break;
+
+        uint16_t type = ((uint16_t)buf[name_end]     << 8) | buf[name_end + 1];
+        uint16_t rdl  = ((uint16_t)buf[name_end + 8] << 8) | buf[name_end + 9];
+        int rdata_off = name_end + 10;
+        if (rdata_off + rdl > buf_len) break;
+
+        if (type == QTYPE_RRSIG) {
+            RrsigRdata rrsig;
+            if (parse_rrsig_rdata(buf, buf_len, rdata_off, rdl, &rrsig) == 0) {
+                if (rrsig.type_covered == QTYPE_DNSKEY) {
+                    DnskeyRdata dk;
+                    if (dnssec_chain_find_key(chain, zone, rrsig.key_tag,
+                                              rrsig.algorithm, &dk)) {
+                        uint8_t *signed_data = NULL;
+                        int      signed_len  = 0;
+                        if (build_signed_data(response, &rrsig, name_pos,
+                                              &signed_data, &signed_len) >= 0) {
+                            int r = dnssec_verify_rrsig(&rrsig, &dk, signed_data,
+                                                        (size_t)signed_len);
+                            free(signed_data);
+                            free_dnskey_rdata(&dk);
+                            if (r == 1) {
+                                free_rrsig_rdata(&rrsig);
+                                return 1;
+                            }
+                        } else {
+                            free_dnskey_rdata(&dk);
+                        }
+                    }
+                }
+                free_rrsig_rdata(&rrsig);
+            }
+        }
+
+        pos = rdata_off + rdl;
+    }
+
+    return 0;
 }

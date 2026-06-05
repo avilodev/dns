@@ -112,7 +112,33 @@ void dnssec_chain_init(DnssecChainCtx *ctx)
     if (ctx) {
         ctx->keys       = NULL;
         ctx->pending_ds = NULL;
+        ctx->bogus      = false;
     }
+}
+
+/*
+ * A zone is bogus when the parent provided a DS with a supported digest type
+ * (the zone is provably meant to be signed) but no DNSKEY matched it.  If a
+ * validated key already exists for the zone, it is secure (not bogus).  If only
+ * unsupported-digest DS records remain, the delegation is treated as insecure
+ * (not bogus) and the answer passes through.
+ */
+int dnssec_chain_zone_bogus(const DnssecChainCtx *ctx, const char *zone)
+{
+    if (!ctx || !zone) return 0;
+
+    for (const ValidatedKey *vk = ctx->keys; vk; vk = vk->next)
+        if (strcasecmp(vk->zone, zone) == 0)
+            return 0;   /* a key was validated for this zone — secure */
+
+    for (const PendingDS *pd = ctx->pending_ds; pd; pd = pd->next) {
+        if (strcasecmp(pd->zone, zone) != 0) continue;
+        /* Supported digest types (match dnssec_chain_verify_ds): 1, 2, 4. */
+        if (pd->ds.digest_type == 1 || pd->ds.digest_type == 2 ||
+            pd->ds.digest_type == 4)
+            return 1;   /* signed-but-unvalidatable -> bogus */
+    }
+    return 0;
 }
 
 void dnssec_chain_free(DnssecChainCtx *ctx)
@@ -492,4 +518,50 @@ void dnssec_chain_try_validate_dnskeys(DnssecChainCtx *ctx,
      * because the DS digest provides the integrity guarantee.
      */
     dnssec_chain_process_referral(ctx, dnskey_response, NULL, 0);
+}
+
+int dnssec_chain_add_response_keys(DnssecChainCtx *ctx,
+                                   const struct Packet *response,
+                                   const char *zone)
+{
+    if (!ctx || !response || !response->request || !zone ||
+        response->recv_len < HEADER_LEN) return 0;
+
+    const uint8_t *buf     = (const uint8_t *)response->request;
+    int            buf_len = (int)response->recv_len;
+    int total_rrs = response->ancount + response->nscount + response->arcount;
+
+    /* Skip the question section. */
+    int pos = HEADER_LEN;
+    for (int q = 0; q < response->qdcount && pos < buf_len; q++) {
+        int e = dc_name_end(buf, buf_len, pos);
+        if (e < 0) return 0;
+        pos = e + 4;
+    }
+
+    int added = 0;
+    for (int a = 0; a < total_rrs && pos < buf_len; a++) {
+        int name_end = dc_name_end(buf, buf_len, pos);
+        if (name_end < 0 || name_end + 10 > buf_len) break;
+
+        uint16_t type      = ((uint16_t)buf[name_end]     << 8) | buf[name_end + 1];
+        uint16_t rdl       = ((uint16_t)buf[name_end + 8] << 8) | buf[name_end + 9];
+        int      rdata_off = name_end + 10;
+        if (rdata_off + rdl > buf_len) break;
+
+        if (type == QTYPE_DNSKEY) {
+            DnskeyRdata dk;
+            if (parse_dnskey_rdata(buf + rdata_off, rdl, &dk) == 0) {
+                uint16_t kt = compute_key_tag(dk.flags, dk.protocol, dk.algorithm,
+                                              dk.pubkey, dk.pubkey_len);
+                if (dnssec_chain_add_key(ctx, zone, &dk, kt) == 0)
+                    added++;
+                free_dnskey_rdata(&dk);
+            }
+        }
+
+        pos = rdata_off + rdl;
+    }
+
+    return added;
 }

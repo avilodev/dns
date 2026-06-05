@@ -55,4 +55,28 @@ int dnssec_validate_with_chain(struct Packet* response,
                                const TrustAnchor* anchors,
                                const DnssecChainCtx* chain);
 
+/*
+ * Securely validate a root-zone ('.') DNSKEY RRset for chain bootstrap.
+ *
+ * Unlike dnssec_validate_with_chain(), the RRSIG(DNSKEY) is verified using
+ * ONLY a configured trust-anchor key — never a key taken from the response
+ * itself.  This is mandatory for bootstrap: trusting a self-signed DNSKEY
+ * RRset would let an on-path attacker inject a forged root ZSK.
+ *
+ * Returns 1 if the DNSKEY RRset is signed by a trust-anchor KSK, else 0.
+ */
+int dnssec_validate_root_dnskey(struct Packet* response,
+                                const TrustAnchor* anchors);
+
+/*
+ * Verify a zone's DNSKEY RRset self-signature using a key already in the chain
+ * (e.g. the zone KSK just validated via its DS).  On success the caller may add
+ * the whole RRset — including ZSKs — to the chain.  The verifier comes only
+ * from the chain, never from the response, so forged keys cannot self-validate.
+ *
+ * Returns 1 if the DNSKEY RRset RRSIG verifies against a chain key for `zone`.
+ */
+int dnssec_validate_dnskey_with_chain(struct Packet* response, const char* zone,
+                                      const DnssecChainCtx* chain);
+
 #endif /* DNSSEC_H */
