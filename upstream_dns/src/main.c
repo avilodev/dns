@@ -74,7 +74,8 @@ static void print_qtype_stats(void) {
 
 /* --------------------------------------------------------------------------
  * Simple query logger — persistent fd, localtime_r, mutex-protected.
- * Format: [timestamp] client_ip:port QTYPE domain RCODE [-> info]
+ * Format (CSV): timestamp,client_ip,port,qtype,domain,rcode,info
+ * The info column is empty when there is no answer detail.
  * -------------------------------------------------------------------------- */
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_log_fd = -1;
@@ -117,16 +118,12 @@ static void log_query(const char* client_ip, uint16_t port,
     char qt_buf[12];
     if (!qt) { snprintf(qt_buf, sizeof(qt_buf), "TYPE%u", qtype_val); qt = qt_buf; }
 
+    /* CSV: timestamp,client_ip,port,qtype,domain,rcode,info  (info empty if none) */
     char line[512];
-    int len;
-    if (info)
-        len = snprintf(line, sizeof(line), "[%s] %s:%u %s %s %s -> %s\n",
+    int len = snprintf(line, sizeof(line), "%s,%s,%u,%s,%s,%s,%s\n",
                        ts, client_ip ? client_ip : "-", port,
-                       qt, domain ? domain : "-", rcode_name_up(rcode), info);
-    else
-        len = snprintf(line, sizeof(line), "[%s] %s:%u %s %s %s\n",
-                       ts, client_ip ? client_ip : "-", port,
-                       qt, domain ? domain : "-", rcode_name_up(rcode));
+                       qt, domain ? domain : "-", rcode_name_up(rcode),
+                       info ? info : "");
 
     /* snprintf returns the number of bytes it WOULD have written, even when
      * it truncated.  Without clamping, write() reads past the end of line[]

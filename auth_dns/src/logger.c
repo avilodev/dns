@@ -44,7 +44,8 @@ static const char* rcode_name(uint8_t rcode) {
 /*
  * Log a DNS query result (thread-safe).
  * Keeps the log fd open for the server's lifetime to avoid per-query open/close overhead.
- * Format: [timestamp] client_ip:port QTYPE domain RCODE [-> info]
+ * Format (CSV): timestamp,client_ip,port,qtype,domain,rcode,info
+ * The info column is empty when there is no answer detail.
  */
 int log_entry(const char* client_ip, uint16_t port, uint16_t qtype,
               const char* domain, uint8_t rcode, const char* info) {
@@ -70,19 +71,12 @@ int log_entry(const char* client_ip, uint16_t port, uint16_t qtype,
     char qt_buf[12];
     if (!qt) { snprintf(qt_buf, sizeof(qt_buf), "TYPE%u", qtype); qt = qt_buf; }
 
+    /* CSV: timestamp,client_ip,port,qtype,domain,rcode,info  (info empty if none) */
     char log_line[512];
-    int len;
-    if (info) {
-        len = snprintf(log_line, sizeof(log_line), "[%s] %s:%u %s %s %s -> %s\n",
+    int len = snprintf(log_line, sizeof(log_line), "%s,%s,%u,%s,%s,%s,%s\n",
                        timestamp, client_ip ? client_ip : "-", port,
                        qt, domain ? domain : "-",
-                       rcode_name(rcode), info);
-    } else {
-        len = snprintf(log_line, sizeof(log_line), "[%s] %s:%u %s %s %s\n",
-                       timestamp, client_ip ? client_ip : "-", port,
-                       qt, domain ? domain : "-",
-                       rcode_name(rcode));
-    }
+                       rcode_name(rcode), info ? info : "");
 
     /* snprintf returns the number of bytes it WOULD have written, even when
      * it truncated.  Without clamping, write() reads past the end of log_line
