@@ -367,6 +367,48 @@ struct Packet* build_badvers_response(struct Packet* request) {
     return response;
 }
 
+/* Skip a wire-format name starting at pos; returns the offset just past it,
+ * or -1 if the buffer is malformed.  Handles compression pointers. */
+static int skip_wire_name(const unsigned char* buf, int len, int pos)
+{
+    while (pos >= 0 && pos < len) {
+        uint8_t l = buf[pos];
+        if (l == 0)               return pos + 1;
+        if ((l & 0xC0) == 0xC0)   return pos + 2;   /* compression pointer */
+        pos += 1 + l;
+    }
+    return -1;
+}
+
+/* Returns 1 if the DNS message already contains an OPT (type 41) RR.
+ * Used to avoid emitting a second OPT on forwarded upstream answers, which
+ * would make the message malformed (RFC 6891 §6.1.1 — at most one OPT RR). */
+static int message_has_opt(const unsigned char* buf, int len)
+{
+    if (!buf || len < HEADER_LEN) return 0;
+    uint16_t qd = ntohs(*(const uint16_t*)(buf + 4));
+    uint16_t an = ntohs(*(const uint16_t*)(buf + 6));
+    uint16_t ns = ntohs(*(const uint16_t*)(buf + 8));
+    uint16_t ar = ntohs(*(const uint16_t*)(buf + 10));
+
+    int pos = HEADER_LEN;
+    for (int i = 0; i < qd; i++) {
+        pos = skip_wire_name(buf, len, pos);
+        if (pos < 0 || pos + 4 > len) return 0;
+        pos += 4;                                   /* QTYPE + QCLASS */
+    }
+    long rr = (long)an + ns + ar;
+    for (long i = 0; i < rr; i++) {
+        pos = skip_wire_name(buf, len, pos);
+        if (pos < 0 || pos + 10 > len) return 0;
+        uint16_t type  = ntohs(*(const uint16_t*)(buf + pos));
+        uint16_t rdlen = ntohs(*(const uint16_t*)(buf + pos + 8));
+        if (type == 41) return 1;                   /* OPT */
+        pos += 10 + rdlen;
+    }
+    return 0;
+}
+
 /* ==========================================================================
  * finalize_udp_response — post-processing for all UDP responses.
  *
@@ -384,8 +426,13 @@ void finalize_udp_response(struct Packet *response, const struct Packet *request
 {
     if (!response || !response->request || !request) return;
 
-    /* --- 1. Append EDNS0 OPT RR if client sent EDNS --- */
-    if (request->edns_present) {
+    /* --- 1. Append EDNS0 OPT RR if client sent EDNS ---
+     * Skip when the response already carries an OPT (e.g. a forwarded upstream
+     * answer that passed one through): a second OPT makes the message
+     * malformed (RFC 6891 §6.1.1 — a message may contain at most one OPT RR). */
+    if (request->edns_present &&
+        !message_has_opt((const unsigned char*)response->request,
+                         (int)response->recv_len)) {
         int pos = (int)response->recv_len;
         if (pos + 11 <= MAXLINE) {
             response->request[pos++] = 0x00;                          /* root name  */

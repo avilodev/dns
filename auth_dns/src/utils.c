@@ -158,7 +158,9 @@ char* extract_ip_from_response(struct Packet* response) {
                     ptr[0], ptr[1], ptr[2], ptr[3]);
             
             if (ip_count > 0) {
-                strncat(result, ", ", sizeof(result) - strlen(result) - 1);
+                /* Space-separate multiple IPs so the CSV log's info column
+                 * stays a single comma-free field. */
+                strncat(result, " ", sizeof(result) - strlen(result) - 1);
             }
             strncat(result, ip_str, sizeof(result) - strlen(result) - 1);
             ip_count++;
@@ -177,7 +179,9 @@ char* extract_ip_from_response(struct Packet* response) {
                     ntohs(*(uint16_t*)(ptr + 14)));
             
             if (ip_count > 0) {
-                strncat(result, ", ", sizeof(result) - strlen(result) - 1);
+                /* Space-separate multiple IPs so the CSV log's info column
+                 * stays a single comma-free field. */
+                strncat(result, " ", sizeof(result) - strlen(result) - 1);
             }
             strncat(result, ip_str, sizeof(result) - strlen(result) - 1);
             ip_count++;

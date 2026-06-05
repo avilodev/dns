@@ -53,8 +53,8 @@ Start the upstream resolver first, then the authoritative server.
 # Upstream resolver (port 5335, 20 threads)
 ./upstream_dns/bin/upstream_dns -p 5335 -t 20 -q 100
 
-# Authoritative server (port 53, forwarding to upstream on localhost:5335)
-sudo ./auth_dns/bin/auth_dns -p 53 -t 20 -u 127.0.0.1:5335 -q 100
+# Authoritative server (always listens on port 53; forwards to upstream at 127.0.0.1:5335)
+sudo ./auth_dns/bin/auth_dns -u 127.0.0.1 -p 5335 -t 20 -q 100
 ```
 
 Port 53 requires root (or `CAP_NET_BIND_SERVICE`).
@@ -65,10 +65,15 @@ Port 53 requires root (or `CAP_NET_BIND_SERVICE`).
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-p PORT` | Port to listen on | 53 |
+| `-u HOST` | Upstream resolver IPv4 address (bare IP — no port) | 1.1.1.1 |
+| `-p PORT` | Upstream resolver **port** | 53 |
 | `-t N` | Number of worker threads | 20 |
-| `-u HOST:PORT` | Upstream resolver address | required |
 | `-q N` | Thread pool queue depth | 100 |
+
+> **Note:** the authoritative server always listens on **port 53** (a compile-time
+> constant); there is no flag to change its listen port. `-p` sets the *upstream*
+> port and `-u` takes a bare IPv4 address — pass them separately
+> (`-u 127.0.0.1 -p 5335`), not as `host:port`.
 
 ### What it serves
 
@@ -211,12 +216,16 @@ Both servers write to the `logs/` directory (at the root of the repository):
 - `auth_dns` logs go to `auth.log`
 - `upstream_dns` logs go to `upstream.log`
 
-Log format:
+Log format — CSV, one row per query:
+`timestamp,client_ip,port,qtype,domain,rcode,info`
 
 ```
-[2026-03-07 14:23:01] 192.168.1.10:54321 A www.google.com NOERROR -> 142.250.80.36
-[2026-03-07 14:23:02] 192.168.1.10:54322 A ads.google.com NXDOMAIN
+2026-03-07 14:23:01,192.168.1.10,54321,A,www.google.com,NOERROR,142.250.80.36
+2026-03-07 14:23:02,192.168.1.10,54322,A,ads.google.com,NXDOMAIN,
 ```
+
+The `info` column is empty when there is no answer detail; multiple answer IPs
+are space-separated within that single column so the CSV stays well-formed.
 
 ---
 

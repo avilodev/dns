@@ -192,11 +192,33 @@ static void send_servfail_udp(int sock, const struct sockaddr* addr, socklen_t a
     sendto(sock, resp, sizeof(resp), 0, addr, addr_len);
 }
 
+/*
+ * Normalize the header flags of a forwarded (recursively-resolved) answer.
+ * resolve_recursive() returns the raw authoritative-server response, whose
+ * flags describe THAT server, not us.  For a recursive/forwarding answer we
+ * MUST fix three bits (RFC 1035 §4.1.1):
+ *   - clear AA — we are not authoritative for forwarded names
+ *   - set   RA — this server provides recursion
+ *   - echo  RD — mirror the client's query
+ * QR, opcode, TC, AD, CD and RCODE are left exactly as the upstream set them.
+ */
+static void normalize_forwarded_flags(struct Packet* ans, const struct Packet* req) {
+    if (!ans || !ans->request || ans->recv_len < 4 || !req) return;
+    uint16_t flags = ntohs(*(uint16_t*)(ans->request + 2));
+    flags &= ~(1u << 10);              /* AA = 0 */
+    flags |=  (1u << 7);               /* RA = 1 */
+    if (req->rd) flags |=  (1u << 8);  /* RD echo */
+    else         flags &= ~(1u << 8);
+    *(uint16_t*)(ans->request + 2) = htons(flags);
+}
+
 /* Core resolution: authoritative first, then recursive upstream. */
 static struct Packet* resolve_query(struct Packet* pkt) {
     struct Packet* answer = check_internal(pkt);
     if (answer) return answer;
-    return resolve_recursive(pkt);
+    answer = resolve_recursive(pkt);
+    if (answer) normalize_forwarded_flags(answer, pkt);
+    return answer;
 }
 
 /* --- UDP packet handler — called inline by each SO_REUSEPORT worker ------- */

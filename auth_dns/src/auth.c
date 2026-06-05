@@ -94,6 +94,27 @@ static const struct AuthDomain *find_wildcard(const char *owner)
     return NULL;
 }
 
+/*
+ * is_empty_non_terminal — true if `owner` is a strict ancestor of some loaded
+ * record (e.g. "_tcp.avilo.com" when "_imaps._tcp.avilo.com" exists).  Such a
+ * name owns no records itself but DOES exist in the tree, so a query for it is
+ * NODATA (NOERROR), not NXDOMAIN (RFC 1034 §4.3.2, empty non-terminal).
+ */
+static bool is_empty_non_terminal(const char *owner)
+{
+    if (!owner || !*owner) return false;
+    size_t olen = strlen(owner);
+    for (int i = 0; i < auth_domain_count; i++) {
+        const char *d = auth_domains[i].domain;
+        size_t dlen = strlen(d);
+        if (dlen > olen + 1 &&
+            d[dlen - olen - 1] == '.' &&
+            strcmp(d + dlen - olen, owner) == 0)
+            return true;
+    }
+    return false;
+}
+
 /* Find the ZSK whose zone is a suffix of owner. */
 static const ZoneKey *find_zsk_for_owner(const char *owner)
 {
@@ -1181,12 +1202,37 @@ struct Packet *check_internal(struct Packet *req)
             has_entry = true;
     }
     const struct AuthDomain *soa = find_zone_soa(owner);
-    bool owned = has_entry || (soa != NULL);
 
-    if (!owned) {
-        /* Try wildcard expansion (e.g. *.avilo.com matches www.avilo.com). */
+    /* No exact record for this name.  It is one of: a wildcard match, an empty
+     * non-terminal (NODATA), a genuinely non-existent name inside a zone we own
+     * (NXDOMAIN, RFC 1034/2308), or a name we are not authoritative for at all
+     * (forward upstream). */
+    if (!has_entry) {
         const struct AuthDomain *wc = find_wildcard(owner);
         if (!wc) {
+            if (soa) {
+                /* Inside a zone we own but with no exact record: NODATA only
+                 * for an empty non-terminal, otherwise NXDOMAIN. */
+                bool ent = is_empty_non_terminal(owner);
+                struct Packet *r = ent ? build_nodata_response(req, soa)
+                                       : build_nxdomain_response(req, soa);
+                if (r && req->do_bit && soa) {
+                    int pos = (int)r->recv_len;
+                    char nsec_owner[256], nsec_next[256];
+                    if (nsec_find_covering(soa->domain, owner, !ent,
+                                           nsec_owner, nsec_next)) {
+                        unsigned char type_bm[64];
+                        int bm_len = build_nsec_type_bitmap(nsec_owner,
+                                                            type_bm, sizeof(type_bm));
+                        if (bm_len > 0)
+                            append_nsec_authority(r->request, &pos, nsec_owner,
+                                                  nsec_next, type_bm, bm_len, req);
+                        r->recv_len = pos;
+                    }
+                }
+                pthread_rwlock_unlock(&g_auth_domains_lock);
+                return r;
+            }
             pthread_rwlock_unlock(&g_auth_domains_lock);
             return NULL;   /* not authoritative — forward to upstream */
         }
