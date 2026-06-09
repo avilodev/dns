@@ -1,0 +1,95 @@
+#!/bin/bash
+#
+# dns-startup — boot launcher for the two DNS servers.
+#
+# This is the ONE file you edit to choose what runs at startup. Scroll to the
+# bottom and comment out a line to disable that server:
+#
+#     start_upstream   -> the recursive/iterative resolver
+#     start_auth       -> the authoritative server (the front door on port 53)
+#
+# Leave both uncommented for the full setup.
+#
+# It runs at boot via /etc/cron.d/dns-startup, which `make install` writes to
+# point back at THIS file (`@reboot root <repo>/cron_scripts/dns-startup`).
+# Because the cron entry points here, editing this file takes effect on the
+# next boot with no reinstall.
+#
+# The script is self-locating (it derives the repo path from its own location),
+# so it runs unchanged on any machine, from any checkout path.
+
+# cron's @reboot environment is minimal; give ourselves a sane PATH so setsid,
+# date, etc. resolve.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+# --- Locate the repo (no hardcoded paths) ----------------------------------
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# ===========================================================================
+# Tunables — adjust to taste.
+# ===========================================================================
+THREADS=20            # worker threads per server
+QUEUE=512             # max queued requests
+UPSTREAM_IP=127.0.0.1 # where auth_dns forwards non-local queries
+UPSTREAM_PORT=5335    # upstream_dns listen port == auth_dns forward port
+DROP_USER=""          # if set (e.g. "dnsd"), both servers drop root via -U
+
+# --- Binaries ---------------------------------------------------------------
+# Default: run the binaries built in-place in the repo (self-contained — just
+# `make`). To run the system-installed copies instead (after a full
+# `make install`), point these at /usr/local/sbin/{upstream,auth}_dns.
+UPSTREAM_BIN="$REPO/upstream_dns/bin/upstream_dns"
+AUTH_BIN="$REPO/auth_dns/bin/auth_dns"
+
+# --- Logging ----------------------------------------------------------------
+# Each server writes its own query log; this captures the launcher's own
+# diagnostics plus the servers' startup stderr (privilege-drop notices, bind
+# warnings, etc.).
+LOG_DIR="$REPO/logs"
+RUNLOG="$LOG_DIR/dns-startup.log"
+mkdir -p "$LOG_DIR"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') dns-startup: $*" >> "$RUNLOG"; }
+
+# Optional in-process privilege drop (root -> DROP_USER).
+DROP_ARGS=()
+[ -n "$DROP_USER" ] && DROP_ARGS=(-U "$DROP_USER")
+
+# launch <label> <binary> [args...]
+# Starts a foreground server detached from cron's process group (setsid + &)
+# so it keeps running after this launcher exits.
+launch() {
+    local label="$1"; shift
+    local bin="$1"; shift
+    if [ ! -x "$bin" ]; then
+        log "ERROR: $label binary missing or not executable: $bin (did you run 'make'?)"
+        return 1
+    fi
+    log "starting $label: $bin $*"
+    setsid "$bin" "$@" >> "$RUNLOG" 2>&1 < /dev/null &
+}
+
+start_upstream() {
+    launch "upstream_dns (recursive resolver)" "$UPSTREAM_BIN" \
+        -p "$UPSTREAM_PORT" -t "$THREADS" -q "$QUEUE" "${DROP_ARGS[@]}"
+    # Give the resolver a moment to bind before the front door forwards to it.
+    sleep 2
+}
+
+start_auth() {
+    launch "auth_dns (authoritative front door)" "$AUTH_BIN" \
+        -u "$UPSTREAM_IP" -p "$UPSTREAM_PORT" -t "$THREADS" -q "$QUEUE" "${DROP_ARGS[@]}"
+}
+
+log "boot launcher running (repo=$REPO)"
+
+# ===========================================================================
+# Comment out a line below to disable that server.
+#   - both uncommented : recursive resolver + authoritative front door (default)
+#   - only start_auth  : authoritative server only
+#   - only start_upstream : recursive resolver only
+# ===========================================================================
+start_upstream
+start_auth

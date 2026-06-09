@@ -1,0 +1,49 @@
+#!/bin/bash
+
+# DNS Log Archiver - Daily log rotation script for the auth server's server.log.
+# Installed to /etc/cron.daily/ by `make install`, which substitutes the
+# placeholders below with values derived from the install location — so no
+# absolute path or username is baked into the repo.
+
+set -e
+
+LOG_FILE="@LOG_DIR@/server.log"
+BASE_DIR="@LOG_DIR@"
+YEAR=$(date +%Y)
+MONTH=$(date +%m)
+DAY=$(date +%d)
+DEST_DIR="$BASE_DIR/$YEAR/$MONTH/$DAY"
+
+# Create destination directory if it doesn't exist.
+# Own the date dirs as the run user (not root) so the archive can be pruned
+# without sudo, while staying 0755 (not world-writable). The parents are
+# included because an earlier run may have created them root-owned.
+mkdir -p "$DEST_DIR"
+chown @RUN_USER@:@RUN_GROUP@ "$BASE_DIR/$YEAR" "$BASE_DIR/$YEAR/$MONTH" "$DEST_DIR"
+chmod 755 "$BASE_DIR/$YEAR" "$BASE_DIR/$YEAR/$MONTH" "$DEST_DIR"
+
+# Use flock to lock the file, copy it, then truncate it
+# Lock timeout of 60 seconds
+(
+    flock -x -w 60 200 || exit 1
+    
+    # Copy the log file with timestamp
+    if [ -f "$LOG_FILE" ]; then
+        cp "$LOG_FILE" "$DEST_DIR/server.log"
+        chown @RUN_USER@:@RUN_GROUP@ "$DEST_DIR/server.log"
+        chmod 0644 "$DEST_DIR/server.log"
+        
+        # Truncate the original log file (optional - remove if you don't want this)
+        : > "$LOG_FILE"
+        
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - Log archived to $DEST_DIR/server.log"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - Warning: Log file not found at $LOG_FILE"
+        exit 1
+    fi
+) 200>"$LOG_FILE.lock"
+
+# Clean up lock file
+rm -f "$LOG_FILE.lock"
+
+exit 0
