@@ -30,9 +30,11 @@ A recursive, iterative DNS resolver written in C. Listens on port 5335 by defaul
 cd upstream_dns
 make           # build
 make rebuild   # clean + build
-make install   # install binary, systemd service, logrotate, and root-hints cron script
-make uninstall # remove all installed files
 ```
+
+To install and run both servers at boot, use the **top-level** `sudo make install`
+(see the repo root README) — it installs the cron jobs, including the `@reboot`
+launcher that starts this resolver.
 
 Requires: `gcc`, `libssl-dev` (OpenSSL ≥ 1.1 or 3.x), `libatomic`.
 
@@ -48,12 +50,9 @@ sudo ./bin/upstream_dns [options]
 | `-t THREADS` | `4` | Worker thread count |
 | `-q QUEUE` | `256` | Thread pool queue depth |
 
-For system use, enable the included systemd service:
-
-```sh
-sudo make install
-sudo systemctl enable --now upstream_dns
-```
+For system use, run `sudo make install` from the repo root and reboot — the
+`@reboot` cron launcher (`cron_scripts/dns-startup`) starts this resolver
+automatically. Edit that launcher to choose which servers run.
 
 ## Configuration
 
@@ -69,9 +68,9 @@ DNSKEY record for the DNS root zone (KSK-2017, key tag 20326). Used as the start
 . 172800 IN DNSKEY 257 3 8 <base64-public-key>
 ```
 
-### Log rotation (`misc/logrotate-upstream`)
+### Log size cap (in-process)
 
-Installed to `/etc/logrotate.d/upstream_dns`. Rotates `upstream.log` daily, keeps 30 days, sends SIGHUP to the process after rotation so the fd is reopened.
+`upstream.log` is capped in-process: once it exceeds `LOG_MAX_BYTES` the server truncates it in place (`ftruncate` to 0) — there is no rotation, no `upstream.log.1`, and no logrotate config to install.
 
 ## Signal handling
 

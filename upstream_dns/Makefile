@@ -86,47 +86,6 @@ asan: clean all
 run: $(TARGET)
 	sudo ./$(TARGET)
 
-# Install binary, systemd service, and cron script.
-# Log size is capped in-process (the server truncates upstream.log in place once
-# it passes LOG_MAX_BYTES), so there is no logrotate config to install.
-INSTALL_BIN   = /usr/local/sbin
-SYSTEMD_DIR   = /etc/systemd/system
-
-install: $(TARGET) install-cron
-	install -d $(INSTALL_BIN)
-	install -d $(LOG_DIR)
-	install -m 755 $(TARGET) $(INSTALL_BIN)/upstream_dns
-	sed -e 's|@INSTALL_BIN@|$(INSTALL_BIN)|g' \
-	    -e 's|@LOG_DIR@|$(LOG_DIR)|g' \
-	    -e 's|@SERVER_PATH@|$(SERVER_PATH)|g' \
-	    upstream_dns.service > $(SYSTEMD_DIR)/upstream_dns.service
-	systemctl daemon-reload
-	@echo "Installed upstream_dns. Enable with: systemctl enable --now upstream_dns"
-
-uninstall: uninstall-cron
-	systemctl stop upstream_dns 2>/dev/null || true
-	systemctl disable upstream_dns 2>/dev/null || true
-	rm -f $(INSTALL_BIN)/upstream_dns
-	rm -f $(SYSTEMD_DIR)/upstream_dns.service
-	systemctl daemon-reload
-	@echo "Removed upstream_dns"
-
-# Install the root-hints refresh cron script to /etc/cron.daily/,
-# substituting @HINTS_DEST@ with the current absolute path to root_hints.txt.
-CRON_DAILY   = /etc/cron.daily
-CRON_SCRIPT  = $(CRON_DAILY)/refresh-root-hints
-HINTS_DEST   = $(abspath .)/misc/root_hints.txt
-
-install-cron:
-	sed 's|@HINTS_DEST@|$(HINTS_DEST)|g' misc/refresh-root-hints \
-	    > $(CRON_SCRIPT)
-	chmod 755 $(CRON_SCRIPT)
-	@echo "Installed: $(CRON_SCRIPT) (DEST=$(HINTS_DEST))"
-
-uninstall-cron:
-	rm -f $(CRON_SCRIPT)
-	@echo "Removed: $(CRON_SCRIPT)"
-
 # Debugging info
 debug:
 	@echo "Sources: $(SRC_FILES)"
@@ -136,4 +95,4 @@ debug:
 # Auto-generated header dependency files (from -MMD -MP)
 -include $(OBJECTS:.o=.d)
 
-.PHONY: all clean rebuild asan run debug directories install uninstall install-cron uninstall-cron install-service uninstall-service
+.PHONY: all clean rebuild asan run debug directories

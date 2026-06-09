@@ -83,33 +83,6 @@ asan: clean all
 run: $(TARGET)
 	sudo ./$(TARGET)
 
-# Install binary, systemd service, and logrotate config
-INSTALL_BIN  = /usr/local/sbin
-SYSTEMD_DIR  = /etc/systemd/system
-LOGROTATE_DIR = /etc/logrotate.d
-
-install: $(TARGET)
-	install -d $(INSTALL_BIN)
-	install -d $(LOG_DIR)
-	install -m 755 $(TARGET) $(INSTALL_BIN)/auth_dns
-	sed -e 's|@INSTALL_BIN@|$(INSTALL_BIN)|g' \
-	    -e 's|@LOG_DIR@|$(LOG_DIR)|g' \
-	    -e 's|@SERVER_PATH@|$(SERVER_PATH)|g' \
-	    auth_dns.service > $(SYSTEMD_DIR)/auth_dns.service
-	sed 's|@LOG_FILE_PATH@|$(LOG_FILE_PATH)|g' misc/logrotate-auth \
-	    > $(LOGROTATE_DIR)/auth_dns
-	systemctl daemon-reload
-	@echo "Installed auth_dns. Enable with: systemctl enable --now auth_dns"
-
-uninstall:
-	systemctl stop auth_dns 2>/dev/null || true
-	systemctl disable auth_dns 2>/dev/null || true
-	rm -f $(INSTALL_BIN)/auth_dns
-	rm -f $(SYSTEMD_DIR)/auth_dns.service
-	rm -f $(LOGROTATE_DIR)/auth_dns
-	systemctl daemon-reload
-	@echo "Removed auth_dns"
-
 # Debugging info
 debug:
 	@echo "Sources: $(SRC_FILES)"
@@ -119,4 +92,4 @@ debug:
 # Auto-generated header dependency files (from -MMD -MP)
 -include $(OBJECTS:.o=.d)
 
-.PHONY: all clean rebuild asan run debug directories install uninstall install-service uninstall-service
+.PHONY: all clean rebuild asan run debug directories
