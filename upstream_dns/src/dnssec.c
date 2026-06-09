@@ -642,19 +642,27 @@ int dnssec_verify_rrsig(const RrsigRdata *rrsig,
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
     int result = -1;
     if (ctx) {
-        if (EVP_DigestVerifyInit(ctx, NULL, md, NULL, pkey) == 1 &&
-            EVP_DigestVerifyUpdate(ctx, rrset_data, rrset_len) == 1) {
-            int rv = EVP_DigestVerifyFinal(ctx, sig, (size_t)sig_len);
-            if (rv == 1) {
-                result = 1;
-            } else {
-                result = 0;
-                unsigned long e = ERR_get_error();
-                char ebuf[256];
-                ERR_error_string_n(e, ebuf, sizeof(ebuf));
-                fprintf(stderr, "DNSSEC: signature verify failed (alg=%u): %s\n",
-                        rrsig->algorithm, ebuf);
-            }
+        /* Ed25519 (RFC 8080) only supports one-shot verification — the
+         * streaming EVP_DigestVerifyUpdate/Final API errors out for
+         * edwards-curve keys, so use EVP_DigestVerify() for alg 15. */
+        int rv = -1;
+        if (rrsig->algorithm == 15) {
+            if (EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1)
+                rv = EVP_DigestVerify(ctx, sig, (size_t)sig_len,
+                                      rrset_data, rrset_len);
+        } else if (EVP_DigestVerifyInit(ctx, NULL, md, NULL, pkey) == 1 &&
+                   EVP_DigestVerifyUpdate(ctx, rrset_data, rrset_len) == 1) {
+            rv = EVP_DigestVerifyFinal(ctx, sig, (size_t)sig_len);
+        }
+        if (rv == 1) {
+            result = 1;
+        } else if (rv == 0) {
+            result = 0;
+            unsigned long e = ERR_get_error();
+            char ebuf[256];
+            ERR_error_string_n(e, ebuf, sizeof(ebuf));
+            fprintf(stderr, "DNSSEC: signature verify failed (alg=%u): %s\n",
+                    rrsig->algorithm, ebuf);
         }
         EVP_MD_CTX_free(ctx);
     }
@@ -909,7 +917,7 @@ static int verify_nsec_denial(const uint8_t *buf, int buf_len,
                         return 1;   /* type absent — NODATA proven */
                     /* Type IS present in the NSEC; NODATA claim is contradicted. */
                     fprintf(stderr,
-                            "DNSSEC: ✗ NSEC type bitmap contradicts NODATA\n");
+                            "DNSSEC: NSEC type bitmap contradicts NODATA\n");
                     return 0;
                 }
             }
@@ -932,6 +940,170 @@ static int verify_nsec_denial(const uint8_t *buf, int buf_len,
     }
 
     return found_any ? -1 : -1;   /* either no NSEC found or NSEC didn't cover */
+}
+
+/* ==========================================================================
+ * Section 6b: answer-coverage helpers (RFC 4035 §5.3.2 — the AD bit may only
+ * be set when the RRset that answers the question is itself covered by a
+ * verified RRSIG, not merely when *some* RRSIG in the packet verified).
+ * ========================================================================== */
+
+/* One validated (owner, type) pair recorded during the RRSIG loop. */
+typedef struct {
+    uint8_t  owner[256];
+    int      owner_len;       /* uncompressed, lowercased wire length */
+    uint16_t type;            /* the RRSIG's type_covered */
+} ValidatedRR;
+
+/*
+ * Return 1 if signer (wire, lc) is a label-boundary suffix of owner (wire, lc)
+ * — i.e. the signing zone is in-bailiwick for the RR owner.  Both names are
+ * uncompressed and terminate in a root label.  Walking owner one label at a
+ * time guarantees comparisons only ever land on label boundaries.
+ */
+static int wire_name_is_suffix(const uint8_t *owner, int owner_len,
+                               const uint8_t *signer, int signer_len)
+{
+    if (signer_len <= 0 || owner_len <= 0 || signer_len > owner_len)
+        return 0;
+    int off = 0;
+    while (off <= owner_len - signer_len) {
+        if (owner_len - off == signer_len &&
+            memcmp(owner + off, signer, (size_t)signer_len) == 0)
+            return 1;
+        if (owner[off] == 0) break;             /* reached root label */
+        if ((owner[off] & 0xC0)) return 0;      /* compression not expected */
+        off += 1 + owner[off];
+    }
+    return 0;
+}
+
+/* True if the validated set contains an entry for this exact (owner, type). */
+static int rr_set_contains(const ValidatedRR *set, int n,
+                           const uint8_t *owner, int owner_len, uint16_t type)
+{
+    for (int i = 0; i < n; i++)
+        if (set[i].type == type && set[i].owner_len == owner_len &&
+            memcmp(set[i].owner, owner, (size_t)owner_len) == 0)
+            return 1;
+    return 0;
+}
+
+/* Byte offset of the answer section (immediately after the question section). */
+static int dns_skip_questions(const uint8_t *buf, int buf_len, int qdcount)
+{
+    int pos = HEADER_LEN;
+    for (int q = 0; q < qdcount && pos < buf_len; q++) {
+        int e = name_end_pos(buf, buf_len, pos);
+        if (e < 0) return -1;
+        pos = e + 4;                            /* past QTYPE + QCLASS */
+    }
+    return pos;
+}
+
+/* Advance past `count` resource records starting at pos.  Returns -1 on error. */
+static int dns_skip_rrs(const uint8_t *buf, int buf_len, int pos, int count)
+{
+    for (int i = 0; i < count && pos >= 0 && pos < buf_len; i++) {
+        int e = name_end_pos(buf, buf_len, pos);
+        if (e < 0 || e + 10 > buf_len) return -1;
+        uint16_t rdl = ((uint16_t)buf[e + 8] << 8) | buf[e + 9];
+        pos = e + 10 + rdl;
+    }
+    return pos;
+}
+
+/* True if any of `count` RRs starting at pos has the given TYPE. */
+static int section_has_type(const uint8_t *buf, int buf_len, int pos,
+                            int count, uint16_t want_type)
+{
+    for (int i = 0; i < count && pos >= 0 && pos < buf_len; i++) {
+        int e = name_end_pos(buf, buf_len, pos);
+        if (e < 0 || e + 10 > buf_len) return 0;
+        uint16_t type = ((uint16_t)buf[e]     << 8) | buf[e + 1];
+        uint16_t rdl  = ((uint16_t)buf[e + 8] << 8) | buf[e + 9];
+        if (type == want_type) return 1;
+        pos = e + 10 + rdl;
+    }
+    return 0;
+}
+
+/* QTYPE of the first question, or 0 on error. */
+static uint16_t question_qtype(const uint8_t *buf, int buf_len)
+{
+    int qend = name_end_pos(buf, buf_len, HEADER_LEN);
+    if (qend >= 0 && qend + 1 < buf_len)
+        return ((uint16_t)buf[qend] << 8) | buf[qend + 1];
+    return 0;
+}
+
+/*
+ * Find a CNAME RR in the answer section whose owner equals `owner` (wire, lc)
+ * and expand its target into out[] (wire, lc).  Returns target length or -1.
+ */
+static int find_cname_target(const uint8_t *buf, int buf_len, int ancount,
+                             int answer_pos,
+                             const uint8_t *owner, int owner_len,
+                             uint8_t *out, int out_size)
+{
+    int pos = answer_pos;
+    for (int a = 0; a < ancount && pos < buf_len; a++) {
+        int name_pos = pos;
+        int name_end = name_end_pos(buf, buf_len, pos);
+        if (name_end < 0 || name_end + 10 > buf_len) return -1;
+        uint16_t type = ((uint16_t)buf[name_end]     << 8) | buf[name_end + 1];
+        uint16_t rdl  = ((uint16_t)buf[name_end + 8] << 8) | buf[name_end + 9];
+        int rdata_off = name_end + 10;
+        if (rdata_off + rdl > buf_len) return -1;
+        if (type == QTYPE_CNAME) {
+            uint8_t this_owner[256];
+            int tol = expand_name_lc(buf, buf_len, name_pos,
+                                     this_owner, sizeof(this_owner));
+            if (tol == owner_len &&
+                memcmp(this_owner, owner, (size_t)owner_len) == 0)
+                return expand_name_lc(buf, buf_len, rdata_off, out, out_size);
+        }
+        pos = rdata_off + rdl;
+    }
+    return -1;
+}
+
+/*
+ * Confirm the RRset that answers the question is in the validated set.
+ * Follows an in-packet CNAME chain: QNAME -> ... -> terminal (QTYPE), where
+ * every CNAME hop must itself be a validated (owner, CNAME) pair.
+ * Returns 1 if the answer is covered by a verified RRSIG, 0 otherwise.
+ */
+static int answer_is_validated(const uint8_t *buf, int buf_len,
+                               int qdcount, int ancount, uint16_t qtype,
+                               const ValidatedRR *set, int set_n)
+{
+    uint8_t name[256];
+    int name_len = expand_name_lc(buf, buf_len, HEADER_LEN, name, sizeof(name));
+    if (name_len < 0) return 0;
+
+    int answer_pos = dns_skip_questions(buf, buf_len, qdcount);
+    if (answer_pos < 0) return 0;
+
+    /* Bounded by ancount (each hop consumes one CNAME RR) plus a hard cap. */
+    enum { DNSSEC_MAX_CNAME_HOPS = 16 };
+    int max_hops = (ancount < DNSSEC_MAX_CNAME_HOPS) ? ancount
+                                                     : DNSSEC_MAX_CNAME_HOPS;
+    for (int hop = 0; hop <= max_hops; hop++) {
+        if (rr_set_contains(set, set_n, name, name_len, qtype))
+            return 1;
+        if (qtype == QTYPE_CNAME)
+            return 0;   /* exact match would already have been found above */
+        if (!rr_set_contains(set, set_n, name, name_len, QTYPE_CNAME))
+            return 0;   /* no validated CNAME to follow from here */
+        uint8_t target[256];
+        int tlen = find_cname_target(buf, buf_len, ancount, answer_pos,
+                                     name, name_len, target, sizeof(target));
+        if (tlen < 0) return 0;
+        memcpy(name, target, (size_t)tlen);
+        name_len = tlen;
+    }
+    return 0;
 }
 
 /* ==========================================================================
@@ -971,6 +1143,11 @@ int dnssec_validate_with_chain(struct Packet *response,
     int has_rrsig = 0;
     int validated = 0;
     int failed    = 0;
+
+    /* (owner,type) pairs covered by a verified, in-bailiwick RRSIG.  Used after
+     * the loop to confirm the *answering* RRset is signed before AD is set. */
+    ValidatedRR vset[64];
+    int         vset_n = 0;
 
     for (int a = 0; a < total_rrs && pos < buf_len; a++) {
         int name_pos = pos;
@@ -1015,6 +1192,17 @@ int dnssec_validate_with_chain(struct Packet *response,
             }
 
             uint16_t type_covered = rrsig.type_covered;   /* save before free */
+
+            /* Capture covered owner + signer (wire, lc) before freeing rrsig,
+             * for the in-bailiwick check and validated-set bookkeeping. */
+            uint8_t cov_owner[256];
+            int     cov_owner_len = expand_name_lc(buf, buf_len, name_pos,
+                                                   cov_owner, sizeof(cov_owner));
+            uint8_t signer_wire[256];
+            int     signer_wire_len = encode_name_lc(rrsig.signer_name,
+                                                     signer_wire,
+                                                     sizeof(signer_wire));
+
             int result = dnssec_verify_rrsig(&rrsig, &dk,
                                              signed_data, (size_t)signed_len);
             free(signed_data);
@@ -1022,9 +1210,28 @@ int dnssec_validate_with_chain(struct Packet *response,
             free_dnskey_rdata(&dk);
 
             if (result == 1) {
-                validated++;
+                /* RFC 4035 §5.3.1: the signer must be in-bailiwick for the
+                 * owner (signer is a label-suffix of the RR owner).  A
+                 * cross-zone signature is a forgery attempt — do not count it
+                 * as validating the RRset (the answer-coverage gate then
+                 * withholds AD). */
+                if (cov_owner_len < 0 || signer_wire_len < 0 ||
+                    !wire_name_is_suffix(cov_owner, cov_owner_len,
+                                         signer_wire, signer_wire_len)) {
+                    fprintf(stderr, "DNSSEC: RRSIG signer not in-bailiwick "
+                                    "(type_covered=%u)\n", type_covered);
+                } else {
+                    validated++;
+                    if (vset_n < (int)(sizeof(vset) / sizeof(vset[0]))) {
+                        memcpy(vset[vset_n].owner, cov_owner,
+                               (size_t)cov_owner_len);
+                        vset[vset_n].owner_len = cov_owner_len;
+                        vset[vset_n].type      = type_covered;
+                        vset_n++;
+                    }
+                }
             } else if (result == 0) {
-                fprintf(stderr, "DNSSEC: ✗ RRSIG INVALID (type_covered=%u)\n",
+                fprintf(stderr, "DNSSEC: RRSIG INVALID (type_covered=%u)\n",
                         type_covered);
                 failed++;
             }
@@ -1034,72 +1241,84 @@ int dnssec_validate_with_chain(struct Packet *response,
         pos = rdata_off + rdl;
     }
 
-    if (!has_rrsig) return -1;    /* unsigned or DO bit not honoured by upstream */
-    if (failed > 0) return 0;     /* at least one explicit failure              */
+    if (!has_rrsig)     return -1;  /* unsigned or DO bit not honoured upstream  */
+    if (failed > 0)     return 0;   /* at least one explicit failure             */
+    if (validated == 0) return -1;  /* had RRSIGs but no matching DNSKEY found   */
+
+    uint16_t rcode   = (((uint16_t)buf[2] << 8) | buf[3]) & 0x000Fu;
+    int      ancount = (int)response->ancount;
+
+    /* Authority section start (after questions + answers). */
+    int answer_pos = dns_skip_questions(buf, buf_len, response->qdcount);
+    int auth_pos   = (answer_pos < 0)
+                   ? -1 : dns_skip_rrs(buf, buf_len, answer_pos, ancount);
 
     /*
-     * For NXDOMAIN/NODATA responses with validated RRSIGs: additionally verify
-     * that the NSEC record in the authority section actually proves the denial
-     * for our specific query (RFC 4034 §4 / RFC 5155 §8).
-     *
-     * Only attempted when ancount == 0 (simple denial with no CNAME chain)
-     * and nscount > 0 (there is something in the authority section).
+     * Distinguish a true denial-of-existence from a delegation referral.  Both
+     * carry ancount == 0, but a denial is served by the zone's authoritative
+     * server and carries a SOA in the authority section, whereas a referral
+     * comes from the parent and carries NS (no SOA).  Only denials are gated by
+     * the NSEC proof; referrals fall through to the chain-step return below so
+     * verified DS records are still stored (see resolve.c referral handling).
      */
-    if (validated > 0 && response->nscount > 0) {
-        uint16_t rflags  = ((uint16_t)buf[2] << 8) | buf[3];
-        uint16_t rcode   = rflags & 0x000Fu;
-        uint16_t ancount = ntohs(*(const uint16_t *)(buf + 6));
+    int auth_has_soa = (auth_pos >= 0) &&
+        section_has_type(buf, buf_len, auth_pos, (int)response->nscount,
+                         QTYPE_SOA);
+    int is_nxdomain = (rcode == 3);
+    int is_nodata   = (rcode == 0 && ancount == 0 && auth_has_soa);
 
-        int is_nxdomain = (rcode == 3);
-        int is_nodata   = (rcode == 0 && ancount == 0);
+    if (is_nxdomain || is_nodata) {
+        /*
+         * Denial of existence: AD is justified only if the NSEC/NSEC3 records
+         * actually prove the denial for THIS (QNAME, QTYPE) — a validated but
+         * irrelevant signature (e.g. RRSIG(SOA)) is not enough (RFC 4035 §5.4).
+         */
+        if (response->nscount == 0 || auth_pos < 0 || auth_pos >= buf_len)
+            return -1;
 
-        if (is_nxdomain || is_nodata) {
-            /* Extract QNAME (uncompressed, lowercased). */
-            uint8_t qname_wire[256];
-            int qname_len = expand_name_lc(buf, buf_len, HEADER_LEN,
-                                           qname_wire, sizeof(qname_wire));
+        uint8_t qname_wire[256];
+        int qname_len = expand_name_lc(buf, buf_len, HEADER_LEN,
+                                       qname_wire, sizeof(qname_wire));
+        uint16_t qtype = question_qtype(buf, buf_len);
+        if (qname_len <= 0)
+            return -1;
 
-            /* Locate authority section: skip questions then (for NODATA) 0 answers. */
-            int auth_pos = HEADER_LEN;
-            for (int q = 0; q < response->qdcount && auth_pos < buf_len; q++) {
-                int e = name_end_pos(buf, buf_len, auth_pos);
-                if (e < 0) { auth_pos = buf_len; break; }
-                auth_pos = e + 4;   /* past QTYPE + QCLASS */
-            }
-            for (int a = 0; a < (int)ancount && auth_pos < buf_len; a++) {
-                int e = name_end_pos(buf, buf_len, auth_pos);
-                if (e < 0) { auth_pos = buf_len; break; }
-                uint16_t rdl = ((uint16_t)buf[e + 8] << 8) | buf[e + 9];
-                auth_pos = e + 10 + rdl;
-            }
-
-            /* Extract QTYPE from question section. */
-            uint16_t qtype = 0;
-            if (HEADER_LEN < buf_len) {
-                int qend = name_end_pos(buf, buf_len, HEADER_LEN);
-                if (qend >= 0 && qend + 1 < buf_len)
-                    qtype = ((uint16_t)buf[qend] << 8) | buf[qend + 1];
-            }
-
-            if (qname_len > 0 && auth_pos < buf_len) {
-                int nsec_result = verify_nsec_denial(buf, buf_len,
-                                                     qname_wire, qname_len,
-                                                     qtype, is_nxdomain,
-                                                     auth_pos, response->nscount);
-                if (nsec_result == 0) {
-                    fprintf(stderr, "DNSSEC: ✗ NSEC denial-of-existence proof"
-                                    " is invalid\n");
-                    return 0;   /* treat as validation failure */
-                }
-                /* nsec_result == 1: proof verified.
-                 * nsec_result == -1: no NSEC or unverifiable (NSEC3 / complex);
-                 *   the RRSIG was already validated so we still return 1. */
-            }
+        int nsec_result = verify_nsec_denial(buf, buf_len, qname_wire, qname_len,
+                                             qtype, is_nxdomain, auth_pos,
+                                             response->nscount);
+        if (nsec_result == 1) return 1;    /* denial proven                     */
+        if (nsec_result == 0) {            /* denial contradicted               */
+            fprintf(stderr, "DNSSEC: NSEC denial-of-existence proof"
+                            " is invalid\n");
+            return 0;
         }
+        return -1;   /* could not prove denial (NSEC3/complex) — withhold AD    */
     }
 
-    if (validated > 0) return 1;  /* all attempted verifications passed         */
-    return -1;                    /* had RRSIGs but no matching DNSKEY found    */
+    if (ancount > 0) {
+        /*
+         * Positive answer: require the RRset answering the question (or the
+         * terminal RRset of an in-packet CNAME chain) to be covered by a
+         * verified, in-bailiwick RRSIG.  This is the core 4.2 fix — without it,
+         * a forged/unsigned answer alongside one genuine RRSIG would set AD.
+         */
+        uint16_t qtype = question_qtype(buf, buf_len);
+        if (qtype != 0 &&
+            answer_is_validated(buf, buf_len, response->qdcount, ancount,
+                                qtype, vset, vset_n))
+            return 1;
+        fprintf(stderr, "DNSSEC: answer RRset (qtype=%u) not covered by a"
+                        " validated RRSIG — withholding AD\n", qtype);
+        return -1;
+    }
+
+    /*
+     * Referral or other signed non-answer (ancount == 0, no SOA): at least one
+     * in-bailiwick RRSIG verified.  Report success so the chain-of-trust step
+     * (DS storage) proceeds; this path never reaches the client AD bit because
+     * the final-answer caller always has ancount > 0.
+     */
+    return 1;
 }
 
 /*

@@ -13,11 +13,13 @@ upstream_dns/obj/
 
 # Query logs (daily-rotating, can be large)
 logs/
+cron_scripts/
 
 # Testing scripts and results
 testing/
 
-# DNSSEC zone signing keys (private — never commit)
+# DNSSEC zone signing key
+s (private — never commit)
 auth_dns/config/*.pem
 auth_dns/config/*.key
 

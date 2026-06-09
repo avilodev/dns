@@ -29,6 +29,22 @@ struct Packet* build_badvers_response(struct Packet* request);
 char* extract_ip_from_response(struct Packet* response);
 
 /*
+ * Echo the question section (QNAME + QTYPE + QCLASS) into a response, advancing
+ * *pos.  Copies the original question bytes verbatim from request->request so
+ * the client's QNAME case is preserved (RFC 1035 §4.1.2; matters for 0x20
+ * mixed-case anti-spoofing — known_issues 4.8).  Falls back to re-encoding from
+ * the lowercased full_domain for internally-built requests with no wire copy.
+ */
+void echo_question(char* buf, int* pos, const struct Packet* request);
+
+/*
+ * Append an EDNS0 OPT RR to a response if the client sent EDNS (RFC 6891
+ * §6.1.1), mirroring the DO bit.  No-op if no EDNS, an OPT is already present,
+ * or it won't fit.  Used by both the UDP and TCP send paths.
+ */
+void append_edns_opt(struct Packet* response, const struct Packet* request);
+
+/*
  * Post-process a UDP response before sending:
  *   1. Append an EDNS0 OPT RR if the client sent one (RFC 6891 §6.1.1).
  *   2. Set TC=1 and truncate to the question section if the response exceeds

@@ -62,6 +62,99 @@ static unsigned long hash_domain_type(const char* domain, uint16_t qtype) {
     return hash;
 }
 
+/* =========================================================================
+ * Intrusive LRU helpers (most-recently-used at head).  All callers MUST hold
+ * the owning cache's lock.  These keep the answer/NS caches bounded so a flood
+ * of unique names cannot grow memory without limit (eviction past max_entries).
+ * ========================================================================= */
+
+static void ns_lru_unlink(NSCache* c, NSCacheEntry* e) {
+    if (e->lru_prev) e->lru_prev->lru_next = e->lru_next;
+    else             c->lru_head           = e->lru_next;
+    if (e->lru_next) e->lru_next->lru_prev = e->lru_prev;
+    else             c->lru_tail           = e->lru_prev;
+    e->lru_prev = e->lru_next = NULL;
+}
+
+static void ns_lru_push_front(NSCache* c, NSCacheEntry* e) {
+    e->lru_prev = NULL;
+    e->lru_next = c->lru_head;
+    if (c->lru_head) c->lru_head->lru_prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+static void ns_lru_touch(NSCache* c, NSCacheEntry* e) {
+    if (c->lru_head == e) return;
+    ns_lru_unlink(c, e);
+    ns_lru_push_front(c, e);
+}
+
+/* Remove an entry from its hash-collision chain (by identity). */
+static void ns_bucket_unlink(NSCache* c, NSCacheEntry* target) {
+    size_t idx = hash_string(target->domain) % c->size;
+    NSCacheEntry** pp = &c->buckets[idx];
+    while (*pp) {
+        if (*pp == target) { *pp = target->next; return; }
+        pp = &(*pp)->next;
+    }
+}
+
+/* Evict the least-recently-used NS entry.  Caller holds the lock. */
+static void ns_cache_evict_lru(NSCache* c) {
+    NSCacheEntry* victim = c->lru_tail;
+    if (!victim) return;
+    ns_lru_unlink(c, victim);
+    ns_bucket_unlink(c, victim);
+    free(victim->domain);
+    free(victim->ns_ip);
+    free(victim);
+    if (c->count > 0) c->count--;
+}
+
+static void answer_lru_unlink(AnswerCache* c, AnswerCacheEntry* e) {
+    if (e->lru_prev) e->lru_prev->lru_next = e->lru_next;
+    else             c->lru_head           = e->lru_next;
+    if (e->lru_next) e->lru_next->lru_prev = e->lru_prev;
+    else             c->lru_tail           = e->lru_prev;
+    e->lru_prev = e->lru_next = NULL;
+}
+
+static void answer_lru_push_front(AnswerCache* c, AnswerCacheEntry* e) {
+    e->lru_prev = NULL;
+    e->lru_next = c->lru_head;
+    if (c->lru_head) c->lru_head->lru_prev = e;
+    c->lru_head = e;
+    if (!c->lru_tail) c->lru_tail = e;
+}
+
+static void answer_lru_touch(AnswerCache* c, AnswerCacheEntry* e) {
+    if (c->lru_head == e) return;
+    answer_lru_unlink(c, e);
+    answer_lru_push_front(c, e);
+}
+
+static void answer_bucket_unlink(AnswerCache* c, AnswerCacheEntry* target) {
+    size_t idx = hash_domain_type(target->domain, target->qtype) % c->size;
+    AnswerCacheEntry** pp = &c->buckets[idx];
+    while (*pp) {
+        if (*pp == target) { *pp = target->next; return; }
+        pp = &(*pp)->next;
+    }
+}
+
+/* Evict the least-recently-used answer entry.  Caller holds the lock. */
+static void answer_cache_evict_lru(AnswerCache* c) {
+    AnswerCacheEntry* victim = c->lru_tail;
+    if (!victim) return;
+    answer_lru_unlink(c, victim);
+    answer_bucket_unlink(c, victim);
+    free(victim->domain);
+    free(victim->response_data);
+    free(victim);
+    if (c->count > 0) c->count--;
+}
+
 NSCache* ns_cache_create(size_t size) {
     NSCache* cache = malloc(sizeof(NSCache));
     if (!cache) return NULL;
@@ -73,6 +166,10 @@ NSCache* ns_cache_create(size_t size) {
     }
      
     cache->size = size;
+    cache->count = 0;
+    cache->max_entries = NS_CACHE_MAX_ENTRIES;
+    cache->lru_head = NULL;
+    cache->lru_tail = NULL;
     pthread_mutex_init(&cache->lock, NULL);
     return cache;
 }
@@ -123,12 +220,13 @@ int ns_cache_put(NSCache* cache, const char* domain, const char* ns_ip, uint32_t
             free(entry->ns_ip);
             entry->ns_ip = new_ip;
             entry->expiry = time(NULL) + ttl;
+            ns_lru_touch(cache, entry);
             pthread_mutex_unlock(&cache->lock);
             return 0;
         }
         entry = entry->next;
     }
-    
+
     // Create new entry
     NSCacheEntry* new_entry = malloc(sizeof(NSCacheEntry));
     if (!new_entry) {
@@ -148,6 +246,10 @@ int ns_cache_put(NSCache* cache, const char* domain, const char* ns_ip, uint32_t
     new_entry->expiry = time(NULL) + ttl;
     new_entry->next = cache->buckets[index];
     cache->buckets[index] = new_entry;
+    ns_lru_push_front(cache, new_entry);
+    cache->count++;
+    if (cache->max_entries && cache->count > cache->max_entries)
+        ns_cache_evict_lru(cache);
 
     pthread_mutex_unlock(&cache->lock);
     return 0;
@@ -166,6 +268,7 @@ char* ns_cache_get(NSCache* cache, const char* domain) {
     while (entry) {
         if (strcmp(entry->domain, domain) == 0) {
             if (entry->expiry > now) {
+                ns_lru_touch(cache, entry);
                 char* result = strdup(entry->ns_ip);
                 pthread_mutex_unlock(&cache->lock);
                 return result;
@@ -195,6 +298,8 @@ void ns_cache_cleanup_expired(NSCache* cache) {
             NSCacheEntry* entry = *entry_ptr;
             if (entry->expiry <= now) {
                 *entry_ptr = entry->next;
+                ns_lru_unlink(cache, entry);
+                if (cache->count > 0) cache->count--;
                 free(entry->domain);
                 free(entry->ns_ip);
                 free(entry);
@@ -219,6 +324,10 @@ AnswerCache* answer_cache_create(size_t size) {
     }
     
     cache->size = size;
+    cache->count = 0;
+    cache->max_entries = ANSWER_CACHE_MAX_ENTRIES;
+    cache->lru_head = NULL;
+    cache->lru_tail = NULL;
     pthread_mutex_init(&cache->lock, NULL);
     return cache;
 }
@@ -273,12 +382,13 @@ int answer_cache_put(AnswerCache* cache, const char* domain, uint16_t qtype,
             entry->response_len = response_len;
             entry->stored_at = time(NULL);
             entry->expiry = entry->stored_at + ttl;
+            answer_lru_touch(cache, entry);
             pthread_mutex_unlock(&cache->lock);
             return 0;
         }
         entry = entry->next;
     }
-    
+
     // Create new entry
     AnswerCacheEntry* new_entry = malloc(sizeof(AnswerCacheEntry));
     if (!new_entry) {
@@ -302,7 +412,11 @@ int answer_cache_put(AnswerCache* cache, const char* domain, uint16_t qtype,
     new_entry->expiry = new_entry->stored_at + ttl;
     new_entry->next = cache->buckets[index];
     cache->buckets[index] = new_entry;
-    
+    answer_lru_push_front(cache, new_entry);
+    cache->count++;
+    if (cache->max_entries && cache->count > cache->max_entries)
+        answer_cache_evict_lru(cache);
+
     pthread_mutex_unlock(&cache->lock);
     return 0;
 }
@@ -332,6 +446,7 @@ char* answer_cache_get_raw(AnswerCache* cache, const char* domain, uint16_t qtyp
     while (entry) {
         if (strcmp(entry->domain, domain) == 0 && entry->qtype == qtype) {
             if (entry->expiry > now) {
+                answer_lru_touch(cache, entry);
                 // Copy raw response data under the lock, then patch outside
                 // the critical section to avoid holding mutex during allocation.
                 ssize_t data_len = entry->response_len;
@@ -392,6 +507,8 @@ void answer_cache_cleanup_expired(AnswerCache* cache) {
             AnswerCacheEntry* entry = *entry_ptr;
             if (entry->expiry <= now) {
                 *entry_ptr = entry->next;
+                answer_lru_unlink(cache, entry);
+                if (cache->count > 0) cache->count--;
                 free(entry->domain);
                 free(entry->response_data);
                 free(entry);
@@ -596,10 +713,7 @@ void print_cache_stats(NSCache* ns_cache, AnswerCache* answer_cache) {
     }
     pthread_mutex_unlock(&answer_cache->lock);
     
-    printf("\n╔════════════════════════════════════════════╗\n");
-    printf("║            CACHE STATISTICS                ║\n");
-    printf("╠════════════════════════════════════════════╣\n");
-    printf("║ NS Cache:     %6d entries             ║\n", ns_count);
-    printf("║ Answer Cache: %6d entries             ║\n", answer_count);
-    printf("╚════════════════════════════════════════════╝\n\n");
+    printf("Cache statistics:\n");
+    printf("  NS cache:     %d entries\n", ns_count);
+    printf("  Answer cache: %d entries\n", answer_count);
 }

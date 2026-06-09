@@ -17,12 +17,26 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#define VERSION "v2.1"
-
 #define MAXLINE 4096
 #define HEADER_LEN 12
 #define SOCKET_TIMEOUT 5
 #define DNS_PORT 53
+
+/* Recursion time budget (see udp_client.c / resolve.c).
+ *
+ * A cache-miss recursion is an iterative walk (root -> TLD -> authoritative,
+ * plus CNAME and DNSSEC sub-fetches), each hop its own network round-trip.
+ * Without a total cap, MAX_ITERATIONS hops * SOCKET_TIMEOUT each can stall for
+ * far longer than the forwarding auth server is willing to wait, so auth times
+ * out on a query the resolver is still working on.
+ *
+ * RECURSION_BUDGET_SEC bounds the wall-clock for one whole resolution; once it
+ * is spent the resolver bails with SERVFAIL.  PER_HOP_TIMEOUT_SEC caps the wait
+ * on any single nameserver so one dead server cannot eat the whole budget.
+ * Keep RECURSION_BUDGET_SEC strictly below the auth server's forward timeout so
+ * the resolver always returns a real answer inside auth's window. */
+#define RECURSION_BUDGET_SEC 4
+#define PER_HOP_TIMEOUT_SEC  2
 
 // DNS Query Types
 #define QTYPE_A          1
@@ -121,9 +135,13 @@ struct Packet {
 };
 
 typedef struct ServerConfig {
-    int thread_count;
-    int queue_size;
-    int port;
+    int   thread_count;
+    int   queue_size;
+    int   port;
+    char* bind_addr;       /* listen address (-b); NULL = INADDR_ANY/in6addr_any */
+    char* acl_csv;         /* allow-list CIDRs (-a); NULL = built-in defaults     */
+    int   rate_limit_qps;  /* per-source queries/sec (-r); 0 = disabled           */
+    char* drop_user;       /* drop to this user[:group] after bind (-U); NULL=off */
 } Config;
 
 typedef struct ServerRecord {

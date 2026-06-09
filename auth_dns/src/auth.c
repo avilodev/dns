@@ -182,15 +182,11 @@ static uint16_t aa_flags(const struct Packet *req)
                       (1u << 7));             /* RA = available   */
 }
 
-/* Write QNAME (via write_dns_labels) + QTYPE + QCLASS. Advances *pos. */
+/* Write the echoed question (QNAME + QTYPE + QCLASS), preserving the client's
+ * original QNAME case for 0x20 anti-spoofing (4.8). Advances *pos. */
 static void write_question(char *buf, int *pos, const struct Packet *req)
 {
-    if (req->full_domain)
-        write_dns_labels(req->full_domain, buf, pos);
-    else
-        buf[(*pos)++] = 0;
-    *(uint16_t*)(buf + *pos) = htons(req->q_type);   *pos += 2;
-    *(uint16_t*)(buf + *pos) = htons(req->q_class);  *pos += 2;
+    echo_question(buf, pos, req);
 }
 
 /*
@@ -216,8 +212,32 @@ static struct Packet *begin_response(const struct Packet *req,
  * ========================================================================= */
 
 /*
+ * Lowercase the ASCII letters of an uncompressed wire-format domain name,
+ * label by label (RFC 4034 §6.2 canonical form).  Stops at the root label.
+ * Used to canonicalise the owner name and the embedded RDATA names of the
+ * pre-RFC-4034 types that require it (NS, MX, SRV, CNAME, SOA, …).
+ */
+static void wire_name_lc(unsigned char *p, int max)
+{
+    int i = 0;
+    while (i < max) {
+        uint8_t l = p[i];
+        if (l == 0) break;          /* root label — done            */
+        if (l & 0xC0) break;        /* compression not expected here */
+        i++;
+        for (int k = 0; k < l && i < max; k++, i++)
+            if (p[i] >= 'A' && p[i] <= 'Z') p[i] = (unsigned char)(p[i] + 32);
+    }
+}
+
+/*
  * Append one canonical-form RR to out[*out_pos]:
- *   owner_wire (no compression) || type || class || ttl || rdlen || rdata
+ *   owner_wire (no compression, downcased) || type || class || ttl || rdlen || rdata
+ *
+ * The owner name is downcased per RFC 4034 §6.2(1).  RDATA is taken as given;
+ * callers are responsible for putting any embedded RDATA names into canonical
+ * (downcased) form before calling, per the type's §6.2 rules (RFC 6840 §5.1
+ * exempts newer types such as HTTPS/SVCB).
  */
 static void canon_rr_append(unsigned char *out, size_t *out_pos, size_t out_cap,
                              const char *owner_name, uint16_t type, uint32_t ttl,
@@ -225,7 +245,8 @@ static void canon_rr_append(unsigned char *out, size_t *out_pos, size_t out_cap,
 {
     char own_wire[280];
     int  own_len = 0;
-    write_dns_labels(owner_name, own_wire, &own_len);
+    write_dns_labels(owner_name, own_wire, &own_len, sizeof(own_wire));
+    wire_name_lc((unsigned char *)own_wire, own_len);   /* §6.2(1) */
 
     size_t need = (size_t)own_len + 2 + 2 + 4 + 2 + rdlen;
     if (*out_pos + need > out_cap) return;
@@ -270,7 +291,7 @@ static int append_rrsig(char *buf, int *pos,
     /* Signer name (zone apex) in wire format */
     char signer_wire[280];
     int  signer_wire_len = 0;
-    write_dns_labels(zsk->zone, signer_wire, &signer_wire_len);
+    write_dns_labels(zsk->zone, signer_wire, &signer_wire_len, sizeof(signer_wire));
 
     /* Build RRSIG RDATA header (everything before the signature field):
      *   type_covered(2) + alg(1) + labels(1) + orig_ttl(4)
@@ -310,7 +331,7 @@ static int append_rrsig(char *buf, int *pos,
 
     /* Owner name: use compression ptr for answer section, or full labels for authority. */
     if (explicit_rr_owner) {
-        write_dns_labels(explicit_rr_owner, buf, pos);
+        write_dns_labels(explicit_rr_owner, buf, pos, MAXLINE);
     } else {
         *(uint16_t*)(buf + *pos) = htons(DNS_NAME_PTR);             *pos += 2;
     }
@@ -322,6 +343,81 @@ static int append_rrsig(char *buf, int *pos,
     memcpy(buf + *pos, sig, sig_len);                              *pos += (int)sig_len;
     free(sig);
     return 1;
+}
+
+/* =========================================================================
+ * RRset assembly with canonical ordering (RFC 4034 §6.3)
+ * ========================================================================= */
+
+/*
+ * One resource record's canonical RDATA, used to order and sign an RRset.
+ * Sized for the largest RDATA we emit (DNSKEY public keys, SOA, multi-string
+ * TXT).  Embedded names must already be in §6.2 canonical form (downcased)
+ * where the type requires it; this struct is type-agnostic.
+ */
+typedef struct { unsigned char data[1024]; uint16_t len; } RrBlob;
+
+/*
+ * RFC 4034 §6.3 canonical RR ordering: compare the RDATA of two RRs (same
+ * owner/class/type) as a left-justified unsigned octet sequence; if one is a
+ * prefix of the other, the shorter sorts first ("absence of an octet sorts
+ * before a zero octet").
+ */
+static int rrblob_cmp(const void *a, const void *b)
+{
+    const RrBlob *x = (const RrBlob *)a;
+    const RrBlob *y = (const RrBlob *)b;
+    size_t m = (x->len < y->len) ? x->len : y->len;
+    int c = memcmp(x->data, y->data, m);
+    if (c) return c;
+    if (x->len != y->len) return (x->len < y->len) ? -1 : 1;
+    return 0;
+}
+
+/*
+ * Emit one RRset into the answer section and, when DO is set and a signing key
+ * is available, append its RRSIG.
+ *
+ * The RRs are first sorted into RFC 4034 §6.3 canonical order, and that exact
+ * order is used both for the answer section and for the signed image — so the
+ * signature matches the RRset a validator reconstructs (the fix for the
+ * "BOGUS multi-RR RRset" bug).  Each blob's RDATA must already be in §6.2
+ * canonical form.  Returns the number of answer RRs written (excluding RRSIG)
+ * and updates the ANCOUNT header field.
+ */
+static int emit_signed_rrset(struct Packet *r, int *pos, const char *owner,
+                             uint16_t type, uint32_t ttl,
+                             RrBlob *blobs, int n,
+                             bool do_bit, const ZoneKey *key)
+{
+    if (n > 1)
+        qsort(blobs, (size_t)n, sizeof(RrBlob), rrblob_cmp);   /* §6.3 */
+
+    int written = 0;
+    for (int i = 0; i < n; i++) {
+        if (*pos + 2 + 2 + 2 + 4 + 2 + (int)blobs[i].len > MAXLINE) break;
+        *(uint16_t*)(r->request + *pos) = htons(DNS_NAME_PTR);   *pos += 2;
+        *(uint16_t*)(r->request + *pos) = htons(type);           *pos += 2;
+        *(uint16_t*)(r->request + *pos) = htons(1 /* IN */);     *pos += 2;
+        *(uint32_t*)(r->request + *pos) = htonl(ttl);            *pos += 4;
+        *(uint16_t*)(r->request + *pos) = htons(blobs[i].len);   *pos += 2;
+        memcpy(r->request + *pos, blobs[i].data, blobs[i].len);  *pos += blobs[i].len;
+        written++;
+    }
+    *(uint16_t*)(r->request + 6) = htons((uint16_t)written);
+
+    if (do_bit && written > 0 && key) {
+        unsigned char canon[16384];
+        size_t canon_pos = 0;
+        for (int i = 0; i < written; i++)
+            canon_rr_append(canon, &canon_pos, sizeof(canon),
+                            owner, type, ttl, blobs[i].data, blobs[i].len);
+        if (canon_pos > 0 &&
+            append_rrsig(r->request, pos, owner, type, ttl,
+                         canon, canon_pos, key, false, NULL))
+            *(uint16_t*)(r->request + 6) = htons((uint16_t)(written + 1));
+    }
+    return written;
 }
 
 /* =========================================================================
@@ -414,9 +510,9 @@ static int build_nsec_type_bitmap(const char *owner,
         if (d->has_srv)    nsec_set_type(bm, &max_type, QTYPE_SRV);
         if (d->has_https)  nsec_set_type(bm, &max_type, QTYPE_HTTPS);
         if (d->has_ipv6)   nsec_set_type(bm, &max_type, QTYPE_AAAA);
-        /* A record: ip set, no typed flags, not blocked */
+        /* A record: ip set, no typed flags */
         if (!d->has_mx && !d->has_ipv6 && !d->has_cname && !d->has_ns &&
-            !d->has_txt && !d->has_srv && !d->has_soa && !d->is_blocked &&
+            !d->has_txt && !d->has_srv && !d->has_soa &&
             d->ip[0] != '\0' && strcmp(d->ip, "0.0.0.0") != 0)
             nsec_set_type(bm, &max_type, QTYPE_A);
     }
@@ -456,7 +552,6 @@ static int nsec_find_covering(const char *zone, const char *qname,
     int  name_count = 0;
 
     for (int i = 0; i < auth_domain_count && name_count < 256; i++) {
-        if (auth_domains[i].is_blocked) continue;  /* blocked names not in NSEC chain */
         const char *n = auth_domains[i].domain;
         if (!is_in_zone(n, zone)) continue;
 
@@ -524,7 +619,7 @@ static void append_nsec_authority(char *buf, int *pos,
     /* NSEC RDATA: next-domain-name (wire, uncompressed) + type bitmap */
     unsigned char rdata[600];
     int rdata_len = 0;
-    write_dns_labels(next_name, (char*)rdata, &rdata_len);
+    write_dns_labels(next_name, (char*)rdata, &rdata_len, sizeof(rdata));
     if (rdata_len + type_bm_len > (int)sizeof(rdata)) return;
     memcpy(rdata + rdata_len, type_bm, type_bm_len);
     rdata_len += type_bm_len;
@@ -534,7 +629,7 @@ static void append_nsec_authority(char *buf, int *pos,
     if (*pos + need > MAXLINE) return;
 
     /* Write NSEC RR: owner (full wire labels) + type + class + ttl + rdlen + rdata */
-    write_dns_labels(owner_name, buf, pos);
+    write_dns_labels(owner_name, buf, pos, MAXLINE);
     *(uint16_t*)(buf + *pos) = htons(QTYPE_NSEC);            *pos += 2;
     *(uint16_t*)(buf + *pos) = htons(1 /* IN */);             *pos += 2;
     *(uint32_t*)(buf + *pos) = htonl(ttl);                   *pos += 4;
@@ -580,7 +675,6 @@ static struct Packet *build_a_response(struct Packet *req, const char *owner)
         if (d->has_mx || d->has_ipv6 || d->has_cname ||
             d->has_ns || d->has_txt || d->has_srv || d->has_soa)
             continue;
-        if (d->is_blocked) continue;
         if (strcmp(d->domain, owner) != 0) continue;
         if (d->ip[0] == '\0' || strcmp(d->ip, "0.0.0.0") == 0) continue;
 
@@ -591,34 +685,19 @@ static struct Packet *build_a_response(struct Packet *req, const char *owner)
     }
     if (rr_count == 0) return NULL;
 
+    /* A RDATA has no embedded names — canonical form is the 4 raw bytes. */
+    RrBlob blobs[16];
+    for (int i = 0; i < rr_count; i++) {
+        memcpy(blobs[i].data, rdatas[i], 4);
+        blobs[i].len = 4;
+    }
+
     int pos;
     struct Packet *r = begin_response(req, &pos, (uint16_t)rr_count);
     if (!r) return NULL;
 
-    for (int i = 0; i < rr_count; i++) {
-        if (pos + 2+2+2+4+2+4 > MAXLINE) { rr_count = i; break; }
-        *(uint16_t*)(r->request + pos) = htons(DNS_NAME_PTR);   pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(QTYPE_A);  pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(1);        pos += 2;
-        *(uint32_t*)(r->request + pos) = htonl(ttl);      pos += 4;
-        *(uint16_t*)(r->request + pos) = htons(4);        pos += 2;
-        memcpy(r->request + pos, rdatas[i], 4);           pos += 4;
-    }
-    *(uint16_t*)(r->request + 6) = htons((uint16_t)rr_count);
-
-    if (req->do_bit) {
-        const ZoneKey *zsk = find_zsk_for_owner(owner);
-        if (zsk) {
-            unsigned char canon[2048];
-            size_t canon_pos = 0;
-            for (int i = 0; i < rr_count; i++)
-                canon_rr_append(canon, &canon_pos, sizeof(canon),
-                                owner, QTYPE_A, ttl, rdatas[i], 4);
-            if (append_rrsig(r->request, &pos, owner, QTYPE_A, ttl,
-                              canon, canon_pos, zsk, false, NULL))
-                *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
-        }
-    }
+    emit_signed_rrset(r, &pos, owner, QTYPE_A, ttl, blobs, rr_count,
+                      req->do_bit, req->do_bit ? find_zsk_for_owner(owner) : NULL);
 
     r->recv_len = pos;
     return r;
@@ -641,34 +720,19 @@ static struct Packet *build_aaaa_response(struct Packet *req, const char *owner)
     }
     if (rr_count == 0) return NULL;
 
+    /* AAAA RDATA has no embedded names — canonical form is the 16 raw bytes. */
+    RrBlob blobs[16];
+    for (int i = 0; i < rr_count; i++) {
+        memcpy(blobs[i].data, rdatas[i], 16);
+        blobs[i].len = 16;
+    }
+
     int pos;
     struct Packet *r = begin_response(req, &pos, (uint16_t)rr_count);
     if (!r) return NULL;
 
-    for (int i = 0; i < rr_count; i++) {
-        if (pos + 2+2+2+4+2+16 > MAXLINE) { rr_count = i; break; }
-        *(uint16_t*)(r->request + pos) = htons(DNS_NAME_PTR);     pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(QTYPE_AAAA); pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(1);          pos += 2;
-        *(uint32_t*)(r->request + pos) = htonl(ttl);        pos += 4;
-        *(uint16_t*)(r->request + pos) = htons(16);         pos += 2;
-        memcpy(r->request + pos, rdatas[i], 16);            pos += 16;
-    }
-    *(uint16_t*)(r->request + 6) = htons((uint16_t)rr_count);
-
-    if (req->do_bit) {
-        const ZoneKey *zsk = find_zsk_for_owner(owner);
-        if (zsk) {
-            unsigned char canon[4096];
-            size_t canon_pos = 0;
-            for (int i = 0; i < rr_count; i++)
-                canon_rr_append(canon, &canon_pos, sizeof(canon),
-                                owner, QTYPE_AAAA, ttl, rdatas[i], 16);
-            if (append_rrsig(r->request, &pos, owner, QTYPE_AAAA, ttl,
-                              canon, canon_pos, zsk, false, NULL))
-                *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
-        }
-    }
+    emit_signed_rrset(r, &pos, owner, QTYPE_AAAA, ttl, blobs, rr_count,
+                      req->do_bit, req->do_bit ? find_zsk_for_owner(owner) : NULL);
 
     r->recv_len = pos;
     return r;
@@ -693,39 +757,23 @@ static struct Packet *build_mx_response(struct Packet *req, const char *owner)
     }
     if (rr_count == 0) return NULL;
 
+    /* MX RDATA: priority(2) + exchange.  The exchange name is downcased for
+     * canonical form (MX is in the RFC 4034 §6.2 list). */
+    RrBlob blobs[16];
+    for (int i = 0; i < rr_count; i++) {
+        int len = 0;
+        *(uint16_t*)(blobs[i].data + len) = htons(mxes[i].prio); len += 2;
+        write_dns_labels(mxes[i].host, (char*)blobs[i].data, &len, sizeof(blobs[i].data));
+        wire_name_lc(blobs[i].data + 2, len - 2);
+        blobs[i].len = (uint16_t)len;
+    }
+
     int pos;
     struct Packet *r = begin_response(req, &pos, (uint16_t)rr_count);
     if (!r) return NULL;
 
-    unsigned char canon[4096];
-    size_t canon_pos = 0;
-
-    for (int i = 0; i < rr_count; i++) {
-        /* MX RDATA: priority(2) + hostname in wire label format */
-        unsigned char rdata[300];
-        int rdata_len = 0;
-        *(uint16_t*)(rdata + rdata_len) = htons(mxes[i].prio); rdata_len += 2;
-        write_dns_labels(mxes[i].host, (char*)rdata, &rdata_len);
-
-        if (pos + 2+2+2+4+2+rdata_len > MAXLINE) { rr_count = i; break; }
-        *(uint16_t*)(r->request + pos) = htons(DNS_NAME_PTR);             pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(QTYPE_MX);           pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(1);                  pos += 2;
-        *(uint32_t*)(r->request + pos) = htonl(ttl);                pos += 4;
-        *(uint16_t*)(r->request + pos) = htons((uint16_t)rdata_len); pos += 2;
-        memcpy(r->request + pos, rdata, rdata_len);                  pos += rdata_len;
-
-        canon_rr_append(canon, &canon_pos, sizeof(canon),
-                        owner, QTYPE_MX, ttl, rdata, rdata_len);
-    }
-    *(uint16_t*)(r->request + 6) = htons((uint16_t)rr_count);
-
-    if (req->do_bit && canon_pos > 0) {
-        const ZoneKey *zsk = find_zsk_for_owner(owner);
-        if (zsk && append_rrsig(r->request, &pos, owner, QTYPE_MX, ttl,
-                                 canon, canon_pos, zsk, false, NULL))
-            *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
-    }
+    emit_signed_rrset(r, &pos, owner, QTYPE_MX, ttl, blobs, rr_count,
+                      req->do_bit, req->do_bit ? find_zsk_for_owner(owner) : NULL);
 
     r->recv_len = pos;
     return r;
@@ -748,37 +796,22 @@ static struct Packet *build_ns_response(struct Packet *req, const char *owner)
     }
     if (rr_count == 0) return NULL;
 
+    /* NS RDATA is a single name, downcased for canonical form (NS is in the
+     * RFC 4034 §6.2 list). */
+    RrBlob blobs[16];
+    for (int i = 0; i < rr_count; i++) {
+        int len = 0;
+        write_dns_labels(ns_names[i], (char*)blobs[i].data, &len, sizeof(blobs[i].data));
+        wire_name_lc(blobs[i].data, len);
+        blobs[i].len = (uint16_t)len;
+    }
+
     int pos;
     struct Packet *r = begin_response(req, &pos, (uint16_t)rr_count);
     if (!r) return NULL;
 
-    unsigned char canon[4096];
-    size_t canon_pos = 0;
-
-    for (int i = 0; i < rr_count; i++) {
-        unsigned char rdata[300];
-        int rdata_len = 0;
-        write_dns_labels(ns_names[i], (char*)rdata, &rdata_len);
-
-        if (pos + 2+2+2+4+2+rdata_len > MAXLINE) { rr_count = i; break; }
-        *(uint16_t*)(r->request + pos) = htons(DNS_NAME_PTR);             pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(QTYPE_NS);           pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(1);                  pos += 2;
-        *(uint32_t*)(r->request + pos) = htonl(ttl);                pos += 4;
-        *(uint16_t*)(r->request + pos) = htons((uint16_t)rdata_len); pos += 2;
-        memcpy(r->request + pos, rdata, rdata_len);                  pos += rdata_len;
-
-        canon_rr_append(canon, &canon_pos, sizeof(canon),
-                        owner, QTYPE_NS, ttl, rdata, rdata_len);
-    }
-    *(uint16_t*)(r->request + 6) = htons((uint16_t)rr_count);
-
-    if (req->do_bit && canon_pos > 0) {
-        const ZoneKey *zsk = find_zsk_for_owner(owner);
-        if (zsk && append_rrsig(r->request, &pos, owner, QTYPE_NS, ttl,
-                                 canon, canon_pos, zsk, false, NULL))
-            *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
-    }
+    emit_signed_rrset(r, &pos, owner, QTYPE_NS, ttl, blobs, rr_count,
+                      req->do_bit, req->do_bit ? find_zsk_for_owner(owner) : NULL);
 
     r->recv_len = pos;
     return r;
@@ -801,53 +834,34 @@ static struct Packet *build_txt_response(struct Packet *req, const char *owner)
     }
     if (rr_count == 0) return NULL;
 
+    /* TXT RDATA: one or more ≤255-byte character-strings (RFC 1035 §3.3.14);
+     * no embedded names, so canonical RDATA == wire RDATA. */
+    RrBlob blobs[16];
+    for (int i = 0; i < rr_count; i++) {
+        size_t tlen = strlen(txt_vals[i]);
+        int len = 0;
+        if (tlen == 0) {
+            blobs[i].data[len++] = 0;   /* one zero-length character-string */
+        } else {
+            size_t off = 0;
+            while (off < tlen && len < (int)sizeof(blobs[i].data) - 256) {
+                size_t chunk = tlen - off;
+                if (chunk > 255) chunk = 255;
+                blobs[i].data[len++] = (unsigned char)chunk;
+                memcpy(blobs[i].data + len, txt_vals[i] + off, chunk);
+                len += (int)chunk;
+                off += chunk;
+            }
+        }
+        blobs[i].len = (uint16_t)len;
+    }
+
     int pos;
     struct Packet *r = begin_response(req, &pos, (uint16_t)rr_count);
     if (!r) return NULL;
 
-    unsigned char canon[8192];
-    size_t canon_pos = 0;
-
-    for (int i = 0; i < rr_count; i++) {
-        size_t tlen = strlen(txt_vals[i]);
-        /* TXT RDATA: sequence of ≤255-byte character-strings (RFC 1035 §3.3.14).
-         * Strings longer than 255 bytes are split into multiple chunks.
-         * txt_data[512] → at most 3 chunks → max RDATA = 3*256 = 768 bytes. */
-        unsigned char rdata[800];
-        int rdata_len = 0;
-        if (tlen == 0) {
-            rdata[rdata_len++] = 0;   /* empty string: one zero-length character-string */
-        } else {
-            size_t off = 0;
-            while (off < tlen) {
-                size_t chunk = tlen - off;
-                if (chunk > 255) chunk = 255;
-                rdata[rdata_len++] = (unsigned char)chunk;
-                memcpy(rdata + rdata_len, txt_vals[i] + off, chunk);
-                rdata_len += (int)chunk;
-                off += chunk;
-            }
-        }
-
-        if (pos + 2+2+2+4+2+rdata_len > MAXLINE) { rr_count = i; break; }
-        *(uint16_t*)(r->request + pos) = htons(DNS_NAME_PTR);             pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(QTYPE_TXT);          pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(1);                  pos += 2;
-        *(uint32_t*)(r->request + pos) = htonl(ttl);                pos += 4;
-        *(uint16_t*)(r->request + pos) = htons((uint16_t)rdata_len); pos += 2;
-        memcpy(r->request + pos, rdata, rdata_len);                  pos += rdata_len;
-
-        canon_rr_append(canon, &canon_pos, sizeof(canon),
-                        owner, QTYPE_TXT, ttl, rdata, rdata_len);
-    }
-    *(uint16_t*)(r->request + 6) = htons((uint16_t)rr_count);
-
-    if (req->do_bit && canon_pos > 0) {
-        const ZoneKey *zsk = find_zsk_for_owner(owner);
-        if (zsk && append_rrsig(r->request, &pos, owner, QTYPE_TXT, ttl,
-                                 canon, canon_pos, zsk, false, NULL))
-            *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
-    }
+    emit_signed_rrset(r, &pos, owner, QTYPE_TXT, ttl, blobs, rr_count,
+                      req->do_bit, req->do_bit ? find_zsk_for_owner(owner) : NULL);
 
     r->recv_len = pos;
     return r;
@@ -874,41 +888,25 @@ static struct Packet *build_srv_response(struct Packet *req, const char *owner)
     }
     if (rr_count == 0) return NULL;
 
+    /* SRV RDATA: priority(2) + weight(2) + port(2) + target.  The target name
+     * is downcased for canonical form (SRV is in the RFC 4034 §6.2 list). */
+    RrBlob blobs[16];
+    for (int i = 0; i < rr_count; i++) {
+        int len = 0;
+        *(uint16_t*)(blobs[i].data + len) = htons(srvs[i].prio);   len += 2;
+        *(uint16_t*)(blobs[i].data + len) = htons(srvs[i].weight); len += 2;
+        *(uint16_t*)(blobs[i].data + len) = htons(srvs[i].port);   len += 2;
+        write_dns_labels(srvs[i].target, (char*)blobs[i].data, &len, sizeof(blobs[i].data));
+        wire_name_lc(blobs[i].data + 6, len - 6);
+        blobs[i].len = (uint16_t)len;
+    }
+
     int pos;
     struct Packet *r = begin_response(req, &pos, (uint16_t)rr_count);
     if (!r) return NULL;
 
-    unsigned char canon[4096];
-    size_t canon_pos = 0;
-
-    for (int i = 0; i < rr_count; i++) {
-        /* SRV RDATA: priority(2) + weight(2) + port(2) + target_wire */
-        unsigned char rdata[300];
-        int rdata_len = 0;
-        *(uint16_t*)(rdata + rdata_len) = htons(srvs[i].prio);   rdata_len += 2;
-        *(uint16_t*)(rdata + rdata_len) = htons(srvs[i].weight); rdata_len += 2;
-        *(uint16_t*)(rdata + rdata_len) = htons(srvs[i].port);   rdata_len += 2;
-        write_dns_labels(srvs[i].target, (char*)rdata, &rdata_len);
-
-        if (pos + 2+2+2+4+2+rdata_len > MAXLINE) { rr_count = i; break; }
-        *(uint16_t*)(r->request + pos) = htons(DNS_NAME_PTR);             pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(QTYPE_SRV);          pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(1);                  pos += 2;
-        *(uint32_t*)(r->request + pos) = htonl(ttl);                pos += 4;
-        *(uint16_t*)(r->request + pos) = htons((uint16_t)rdata_len); pos += 2;
-        memcpy(r->request + pos, rdata, rdata_len);                  pos += rdata_len;
-
-        canon_rr_append(canon, &canon_pos, sizeof(canon),
-                        owner, QTYPE_SRV, ttl, rdata, rdata_len);
-    }
-    *(uint16_t*)(r->request + 6) = htons((uint16_t)rr_count);
-
-    if (req->do_bit && canon_pos > 0) {
-        const ZoneKey *zsk = find_zsk_for_owner(owner);
-        if (zsk && append_rrsig(r->request, &pos, owner, QTYPE_SRV, ttl,
-                                 canon, canon_pos, zsk, false, NULL))
-            *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
-    }
+    emit_signed_rrset(r, &pos, owner, QTYPE_SRV, ttl, blobs, rr_count,
+                      req->do_bit, req->do_bit ? find_zsk_for_owner(owner) : NULL);
 
     r->recv_len = pos;
     return r;
@@ -933,43 +931,27 @@ static struct Packet *build_https_response(struct Packet *req, const char *owner
     }
     if (rr_count == 0) return NULL;
 
+    /* HTTPS/SVCB RDATA: SvcPriority(2) + TargetName + SvcParams.  Per RFC 6840
+     * §5.1 the names in RDATA of types introduced after RFC 4034 are NOT
+     * downcased, so the TargetName is kept as-is for canonical form. */
+    RrBlob blobs[16];
+    for (int i = 0; i < rr_count; i++) {
+        int len = 0;
+        *(uint16_t*)(blobs[i].data + len) = htons(entries[i].prio); len += 2;
+        if (strcmp(entries[i].target, ".") == 0) {
+            blobs[i].data[len++] = 0;   /* root label: "." */
+        } else {
+            write_dns_labels(entries[i].target, (char*)blobs[i].data, &len, sizeof(blobs[i].data));
+        }
+        blobs[i].len = (uint16_t)len;
+    }
+
     int pos;
     struct Packet *r = begin_response(req, &pos, (uint16_t)rr_count);
     if (!r) return NULL;
 
-    unsigned char canon[4096];
-    size_t canon_pos = 0;
-
-    for (int i = 0; i < rr_count; i++) {
-        /* HTTPS RDATA: SvcPriority(2) + TargetName(wire) + SvcParams(none) */
-        unsigned char rdata[300];
-        int rdata_len = 0;
-        *(uint16_t*)(rdata + rdata_len) = htons(entries[i].prio); rdata_len += 2;
-        if (strcmp(entries[i].target, ".") == 0) {
-            rdata[rdata_len++] = 0;   /* root label: "." */
-        } else {
-            write_dns_labels(entries[i].target, (char*)rdata, &rdata_len);
-        }
-
-        if (pos + 2+2+2+4+2+rdata_len > MAXLINE) { rr_count = i; break; }
-        *(uint16_t*)(r->request + pos) = htons(DNS_NAME_PTR);              pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(QTYPE_HTTPS);         pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(1);                   pos += 2;
-        *(uint32_t*)(r->request + pos) = htonl(ttl);                 pos += 4;
-        *(uint16_t*)(r->request + pos) = htons((uint16_t)rdata_len); pos += 2;
-        memcpy(r->request + pos, rdata, rdata_len);                   pos += rdata_len;
-
-        canon_rr_append(canon, &canon_pos, sizeof(canon),
-                        owner, QTYPE_HTTPS, ttl, rdata, rdata_len);
-    }
-    *(uint16_t*)(r->request + 6) = htons((uint16_t)rr_count);
-
-    if (req->do_bit && canon_pos > 0) {
-        const ZoneKey *zsk = find_zsk_for_owner(owner);
-        if (zsk && append_rrsig(r->request, &pos, owner, QTYPE_HTTPS, ttl,
-                                 canon, canon_pos, zsk, false, NULL))
-            *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
-    }
+    emit_signed_rrset(r, &pos, owner, QTYPE_HTTPS, ttl, blobs, rr_count,
+                      req->do_bit, req->do_bit ? find_zsk_for_owner(owner) : NULL);
 
     r->recv_len = pos;
     return r;
@@ -990,9 +972,12 @@ static struct Packet *build_cname_response(struct Packet *req, const char *owner
 
     uint32_t ttl = d->ttl ? d->ttl : DEFAULT_RECORD_TTL;
 
+    /* CNAME RDATA is a single name, downcased for canonical form (CNAME is in
+     * the RFC 4034 §6.2 list); single-RR, so no §6.3 ordering is needed. */
     unsigned char rdata[300];
     int rdata_len = 0;
-    write_dns_labels(d->cname_target, (char*)rdata, &rdata_len);
+    write_dns_labels(d->cname_target, (char*)rdata, &rdata_len, sizeof(rdata));
+    wire_name_lc(rdata, rdata_len);
 
     int pos;
     struct Packet *r = begin_response(req, &pos, 1);
@@ -1039,11 +1024,16 @@ static struct Packet *build_soa_response(struct Packet *req, const char *owner)
 
     uint32_t ttl = d->soa_ttl ? d->soa_ttl : d->soa_refresh;
 
-    /* SOA RDATA: mname_wire + rname_wire + serial + refresh + retry + expire + minimum */
+    /* SOA RDATA: mname_wire + rname_wire + serial + refresh + retry + expire +
+     * minimum.  MNAME and RNAME are downcased for canonical form (SOA is in the
+     * RFC 4034 §6.2 list); single-RR, so no §6.3 ordering is needed. */
     unsigned char rdata[600];
-    int rdata_len = 0;
-    write_dns_labels(d->soa_mname, (char*)rdata, &rdata_len);
-    write_dns_labels(d->soa_rname, (char*)rdata, &rdata_len);
+    int mname_end = 0;
+    write_dns_labels(d->soa_mname, (char*)rdata, &mname_end, sizeof(rdata));
+    wire_name_lc(rdata, mname_end);
+    int rdata_len = mname_end;
+    write_dns_labels(d->soa_rname, (char*)rdata, &rdata_len, sizeof(rdata));
+    wire_name_lc(rdata + mname_end, rdata_len - mname_end);
     *(uint32_t*)(rdata + rdata_len) = htonl(d->soa_serial);   rdata_len += 4;
     *(uint32_t*)(rdata + rdata_len) = htonl(d->soa_refresh);  rdata_len += 4;
     *(uint32_t*)(rdata + rdata_len) = htonl(d->soa_retry);    rdata_len += 4;
@@ -1108,43 +1098,27 @@ static struct Packet *build_dnskey_response(struct Packet *req, const char *owne
     if (rr_count == 0) return NULL;
 
     uint32_t ttl = DEFAULT_RECORD_TTL;
+
+    /* DNSKEY RDATA: flags(2) + protocol(1=3) + algorithm(1) + public_key.
+     * No embedded names; multiple keys (KSK + ZSK) must be ordered per §6.3. */
+    RrBlob blobs[8];
+    for (int i = 0; i < rr_count; i++) {
+        int len = 0;
+        *(uint16_t*)(blobs[i].data + len) = htons(dkes[i].flags); len += 2;
+        blobs[i].data[len++] = 3;            /* protocol = 3 (DNSSEC) */
+        blobs[i].data[len++] = dkes[i].alg;
+        memcpy(blobs[i].data + len, dkes[i].pub, dkes[i].pub_len);
+        len += dkes[i].pub_len;
+        blobs[i].len = (uint16_t)len;
+    }
+
     int pos;
     struct Packet *r = begin_response(req, &pos, (uint16_t)rr_count);
     if (!r) return NULL;
 
-    unsigned char canon[8192];
-    size_t canon_pos = 0;
-
-    for (int i = 0; i < rr_count; i++) {
-        /* DNSKEY RDATA: flags(2) + protocol(1=3) + algorithm(1) + public_key */
-        unsigned char rdata[640];
-        int rdata_len = 0;
-        *(uint16_t*)(rdata + rdata_len) = htons(dkes[i].flags); rdata_len += 2;
-        rdata[rdata_len++] = 3;           /* protocol = 3 (DNSSEC) */
-        rdata[rdata_len++] = dkes[i].alg;
-        memcpy(rdata + rdata_len, dkes[i].pub, dkes[i].pub_len);
-        rdata_len += dkes[i].pub_len;
-
-        if (pos + 2+2+2+4+2+rdata_len > MAXLINE) { rr_count = i; break; }
-        *(uint16_t*)(r->request + pos) = htons(DNS_NAME_PTR);             pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(QTYPE_DNSKEY);       pos += 2;
-        *(uint16_t*)(r->request + pos) = htons(1);                  pos += 2;
-        *(uint32_t*)(r->request + pos) = htonl(ttl);                pos += 4;
-        *(uint16_t*)(r->request + pos) = htons((uint16_t)rdata_len); pos += 2;
-        memcpy(r->request + pos, rdata, rdata_len);                  pos += rdata_len;
-
-        canon_rr_append(canon, &canon_pos, sizeof(canon),
-                        owner, QTYPE_DNSKEY, ttl, rdata, rdata_len);
-    }
-    *(uint16_t*)(r->request + 6) = htons((uint16_t)rr_count);
-
     /* DNSKEY RRset is signed with the KSK (RFC 4035 §2.2). */
-    if (req->do_bit && canon_pos > 0) {
-        const ZoneKey *ksk = find_ksk_for_zone(owner);
-        if (ksk && append_rrsig(r->request, &pos, owner, QTYPE_DNSKEY, ttl,
-                                 canon, canon_pos, ksk, false, NULL))
-            *(uint16_t*)(r->request + 6) = htons((uint16_t)(rr_count + 1));
-    }
+    emit_signed_rrset(r, &pos, owner, QTYPE_DNSKEY, ttl, blobs, rr_count,
+                      req->do_bit, req->do_bit ? find_ksk_for_zone(owner) : NULL);
 
     r->recv_len = pos;
     return r;
@@ -1295,30 +1269,6 @@ struct Packet *check_internal(struct Packet *req)
         return r;
     }
 
-    /* Check for NXDOMAIN block. */
-    for (int i = 0; i < auth_domain_count; i++) {
-        if (auth_domains[i].is_blocked &&
-            strcmp(auth_domains[i].domain, owner) == 0) {
-            struct Packet *r = build_nxdomain_response(req, soa);
-            if (r && req->do_bit && soa) {
-                int pos = (int)r->recv_len;
-                char nsec_owner[256], nsec_next[256];
-                if (nsec_find_covering(soa->domain, owner, true,
-                                       nsec_owner, nsec_next)) {
-                    unsigned char type_bm[64];
-                    int bm_len = build_nsec_type_bitmap(nsec_owner,
-                                                        type_bm, sizeof(type_bm));
-                    if (bm_len > 0)
-                        append_nsec_authority(r->request, &pos, nsec_owner,
-                                              nsec_next, type_bm, bm_len, req);
-                    r->recv_len = pos;
-                }
-            }
-            pthread_rwlock_unlock(&g_auth_domains_lock);
-            return r;
-        }
-    }
-
     /* RFC 1034 §3.6.2: if the owner is a CNAME alias, return the CNAME RR
      * for any query type except QTYPE_CNAME (direct lookup) and QTYPE_ANY
      * (answered with HINFO per RFC 8482 regardless of record type). */
@@ -1454,7 +1404,8 @@ static void strlower(char *s)
 }
 
 /*
- * _load_domains_from_file — parse auth_domains.txt under wrlock.
+ * _load_domains_from_file — parse the [domain] sections of config.txt under
+ * wrlock.  The [blocklist] section is skipped here (policy.c owns it).
  *
  * Supported record types (second token determines type):
  *   SOA    — domain SOA mname rname serial refresh retry expire minimum
@@ -1463,7 +1414,6 @@ static void strlower(char *s)
  *   CNAME  — domain CNAME target
  *   TXT    — domain TXT rest-of-line  (quoted or unquoted)
  *   SRV    — domain SRV priority weight port target
- *   NXDOMAIN — domain NXDOMAIN
  *   IPv6   — domain 2001:db8::1   (detected by ':' in token)
  *   IPv4   — domain 192.168.1.1   (default, validated)
  *
@@ -1510,6 +1460,9 @@ static int _load_domains_from_file(const char *filename)
 
         /* Ignore record lines that appear before any [domain] header. */
         if (current_domain[0] == '\0') continue;
+
+        /* The [blocklist] section is owned by policy.c, not the zone loader. */
+        if (strcasecmp(current_domain, "blocklist") == 0) continue;
 
         if (count >= MAX_INTERNAL_HOSTS) {
             fprintf(stderr,
@@ -1656,14 +1609,6 @@ static int _load_domains_from_file(const char *filename)
                     current_domain, prio, target);
             count++;
 
-        /* --- NXDOMAIN --------------------------------------------------- */
-        } else if (strcasecmp(type_kw, "NXDOMAIN") == 0) {
-            d->is_blocked = true;
-            strcpy(d->ip, "0.0.0.0");
-            fprintf(stderr, "  Loaded: %-32s -> BLOCKED (NXDOMAIN)\n",
-                    current_domain);
-            count++;
-
         /* --- AAAA ------------------------------------------------------- */
         } else if (strcasecmp(type_kw, "AAAA") == 0) {
             char ip6[64] = {0};
@@ -1729,7 +1674,7 @@ int load_auth_domains(const char *filename)
                 "Warning: No valid domains loaded from %s\n", filename);
         return (n == 0) ? 0 : -1;
     }
-    fprintf(stderr, "✓ Loaded %d authoritative record(s)\n\n", n);
+    fprintf(stderr, "Loaded %d authoritative record(s)\n\n", n);
     return n;
 }
 
@@ -1781,7 +1726,7 @@ void reload_auth_domains(const char *filename)
 
 /*
  * lookup_auth_domain — thread-safe A-record lookup (used by external callers).
- * Returns IP string, "NXDOMAIN" if blocked, NULL if not found.
+ * Returns IP string, or NULL if not found.
  */
 const char *lookup_auth_domain(const char *full_domain)
 {
@@ -1797,7 +1742,7 @@ const char *lookup_auth_domain(const char *full_domain)
             d->has_ns || d->has_txt || d->has_srv || d->has_soa)
             continue;
         if (strcmp(d->domain, full_domain) != 0) continue;
-        result = d->is_blocked ? "NXDOMAIN" : d->ip;
+        result = d->ip;
         break;
     }
 

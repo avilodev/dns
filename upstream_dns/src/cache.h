@@ -7,10 +7,13 @@
 
 // Cache entry for nameserver mappings
 typedef struct NSCacheEntry {
-    char* domain;              // Domain name 
+    char* domain;              // Domain name
     char* ns_ip;               // Nameserver IP address
     time_t expiry;             // Expiration timestamp
     struct NSCacheEntry* next; // Linked list for hash collision
+    // Intrusive LRU list (most-recent at head) for bounded eviction.
+    struct NSCacheEntry* lru_prev;
+    struct NSCacheEntry* lru_next;
 } NSCacheEntry;
 
 // Cache entry for DNS answers (domain+type -> answer data)
@@ -22,25 +25,40 @@ typedef struct AnswerCacheEntry {
     time_t expiry;             // Expiration timestamp
     time_t stored_at;          // Time the entry was stored (for TTL decrement)
     struct AnswerCacheEntry* next;
+    // Intrusive LRU list (most-recent at head) for bounded eviction.
+    struct AnswerCacheEntry* lru_prev;
+    struct AnswerCacheEntry* lru_next;
 } AnswerCacheEntry;
 
 // Hash table for NS cache
 typedef struct NSCache {
     NSCacheEntry** buckets;
-    size_t size;
+    size_t size;               // bucket count
+    size_t count;              // live entries (for the LRU bound)
+    size_t max_entries;        // hard cap; 0 = unbounded
+    NSCacheEntry* lru_head;    // most recently used
+    NSCacheEntry* lru_tail;    // least recently used (eviction victim)
     pthread_mutex_t lock;
 } NSCache;
 
 // Hash table for Answer cache
 typedef struct AnswerCache {
     AnswerCacheEntry** buckets;
-    size_t size;
+    size_t size;               // bucket count
+    size_t count;              // live entries (for the LRU bound)
+    size_t max_entries;        // hard cap; 0 = unbounded
+    AnswerCacheEntry* lru_head;
+    AnswerCacheEntry* lru_tail;
     pthread_mutex_t lock;
 } AnswerCache;
 
 // Cache configuration
 #define NS_CACHE_SIZE 10007
 #define ANSWER_CACHE_SIZE 100003
+// Hard entry caps (LRU eviction past these) — bound memory under a flood of
+// unique names.  NS entries are tiny; answers can be up to MAXLINE each.
+#define NS_CACHE_MAX_ENTRIES     8192
+#define ANSWER_CACHE_MAX_ENTRIES 16384
 #define DEFAULT_NS_TTL 3600      // 1 hour for NS records
 #define MIN_CACHE_TTL 60         // Minimum 60 seconds
 #define MAX_CACHE_TTL 86400      // Maximum 24 hours

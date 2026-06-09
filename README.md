@@ -69,18 +69,25 @@ Port 53 requires root (or `CAP_NET_BIND_SERVICE`).
 | `-p PORT` | Upstream resolver **port** | 53 |
 | `-t N` | Number of worker threads | 20 |
 | `-q N` | Thread pool queue depth | 100 |
+| `-b ADDR` | Listen address to bind (IPv4 or IPv6) | `0.0.0.0` / `::` |
+| `-a CIDRS` | **Recursion** allow-list, comma-separated CIDRs (replaces defaults) | loopback + RFC1918 + link-local |
+| `-r N` | Per-source rate limit for recursion, queries/sec (`0` = off) | `0` |
 
 > **Note:** the authoritative server always listens on **port 53** (a compile-time
 > constant); there is no flag to change its listen port. `-p` sets the *upstream*
 > port and `-u` takes a bare IPv4 address — pass them separately
 > (`-u 127.0.0.1 -p 5335`), not as `host:port`.
 
+> **Access control:** `-a`/`-r` gate only the **recursive/forwarding** path —
+> authoritative answers for your own zones are served to every source. See
+> [Access control](#access-control) below.
+
 ### What it serves
 
-- **A, AAAA, MX, NS, SOA, TXT, CNAME, SRV** — from `auth_dns/misc/auth_domains.txt`
+- **A, AAAA, MX, NS, SOA, TXT, CNAME, SRV** — from the `[domain]` sections of `auth_dns/misc/config.txt`
 - **DNSKEY** — if DNSSEC signing keys are configured
 - **ANY** — returns an RFC 8482 HINFO response (minimal, not a full dump)
-- **NXDOMAIN** — explicitly blocked domains return NXDOMAIN immediately, no forwarding
+- **NXDOMAIN** — domains in the `[blocklist]` section return NXDOMAIN immediately, no forwarding
 - **Everything else** — forwarded to the upstream resolver
 
 Responses include a **SOA record in the authority section** for NXDOMAIN and NODATA answers (RFC 2308).
@@ -94,6 +101,13 @@ Responses include a **SOA record in the authority section** for NXDOMAIN and NOD
 | `-p PORT` | Port to listen on | 5335 |
 | `-t N` | Number of worker threads | 20 |
 | `-q N` | Thread pool queue depth | 100 |
+| `-b ADDR` | Listen address to bind (IPv4 or IPv6) | `0.0.0.0` / `::` |
+| `-a CIDRS` | Client allow-list, comma-separated CIDRs (replaces defaults) | loopback + RFC1918 + link-local |
+| `-r N` | Per-source rate limit, queries/sec (`0` = off) | `0` |
+
+> **Access control:** every query to the upstream resolver is checked against
+> the allow-list (it is a pure recursive resolver). See
+> [Access control](#access-control) below.
 
 ### How it resolves
 
@@ -107,9 +121,11 @@ The NS cache is keyed on zone apex (e.g. `example.com`, not `www.example.com`) s
 
 ---
 
-## Zone file format
+## Config file format
 
-Records live in `auth_dns/misc/auth_domains.txt`. Lines starting with `#` are comments.
+Authoritative records and the blocklist share one file, `auth_dns/misc/config.txt`:
+records go in `[domain]` sections, blocked names in the `[blocklist]` section.
+Lines starting with `#` are comments.
 
 ```
 # Record types:
@@ -161,6 +177,52 @@ kill -HUP $(pidof auth_dns)   # auth_dns only
 
 ---
 
+## Access control
+
+Both servers are intended for a **trusted LAN**. To prevent abuse as an open
+recursive resolver (DNS-amplification DDoS) and to limit remote attack surface,
+client access is controlled in two layers:
+
+**Allow-list (`-a`)** — a list of CIDRs permitted to use recursion. The default
+covers loopback, RFC1918 private ranges, and link-local addresses:
+
+```
+127.0.0.0/8  10.0.0.0/8  172.16.0.0/12  192.168.0.0/16  169.254.0.0/16
+::1/128  fc00::/7  fe80::/10
+```
+
+Passing `-a` **replaces** the defaults, so include loopback / your own LAN range
+explicitly:
+
+```bash
+./upstream_dns/bin/upstream_dns -a 127.0.0.1/32,192.168.1.0/24
+```
+
+- On the **upstream resolver**, the allow-list gates *every* query (it is a pure
+  recursive resolver). Non-allowed sources receive **REFUSED**.
+- On the **authoritative server**, the allow-list gates only the
+  **recursive/forwarding** path. Authoritative answers for your own zones are
+  served to any source; only forwarded queries from non-allowed sources are
+  **REFUSED**.
+
+**Rate limiting (`-r`)** — a per-source-IP token bucket. `-r 50` allows ~50
+queries/sec per client (burst 100). Over-limit UDP queries are dropped silently
+(responding would still amplify); `0` (default) disables it.
+
+**Bind address (`-b`)** — for defense in depth, bind the listener to a specific
+LAN interface instead of all interfaces. The port is then not even open on
+untrusted networks:
+
+```bash
+./upstream_dns/bin/upstream_dns -b 192.168.1.10
+sudo ./auth_dns/bin/auth_dns -b 192.168.1.10 -u 127.0.0.1 -p 5335
+```
+
+A bare IPv4 address binds the IPv4 sockets only; an IPv6 address binds the IPv6
+sockets only. With no `-b`, both families listen on the wildcard address.
+
+---
+
 ## DNSSEC
 
 ### Upstream — validation
@@ -175,6 +237,8 @@ Root KSK (trust anchor) -> Root ZSK signs DS(com) -> com KSK <- DS(com)
 At each delegation hop, the referral's DS records are verified against the parent's already-validated DNSKEY before being trusted. Validated intermediate keys are carried through the resolution walk so the final answer can be verified against them.
 
 When validation succeeds, the response is returned to the client with the **AD bit set**. When validation fails, the resolver returns **SERVFAIL**. When a zone is unsigned (no RRSIG/DS), the response passes through as-is.
+
+The AD bit is set **only** when the RRset that actually answers the question (or the terminal RRset of an in-packet CNAME chain) is covered by a verified RRSIG whose signer is in-bailiwick for the owner — a validated-but-irrelevant signature (e.g. a signed SOA alongside a forged answer) is not sufficient. Any AD bit present on the upstream response is cleared before our own validation runs, so a downstream client can trust AD as reflecting *this* resolver's validation.
 
 The **root trust anchor** lives at `upstream_dns/config/root-trust-anchor.key` (KSK-2017, key tag 20326, algorithm 8 / RSA-SHA256).
 
@@ -237,7 +301,7 @@ dns/
 │   ├── bin/auth_dns               # compiled binary
 │   ├── src/                       # source code
 │   ├── misc/
-│   │   └── auth_domains.txt       # zone records
+│   │   └── config.txt            # zone records + blocklist
 │   └── config/
 │       ├── dnssec.conf            # DNSSEC signing key config (optional)
 │       └── *.pem                  # zone signing keys (optional)

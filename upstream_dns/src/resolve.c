@@ -59,9 +59,7 @@ static void bootstrap_root_keys(DnssecChainCtx *chain)
     if (!resp) return;
 
     if (dnssec_validate_root_dnskey(resp, g_trust_anchors) == 1) {
-        int n = dnssec_chain_add_response_keys(chain, resp, ".");
-        if (n > 0)
-            fprintf(stderr, "DNSSEC: bootstrapped %d root key(s) into chain\n", n);
+        dnssec_chain_add_response_keys(chain, resp, ".");
     } else {
         fprintf(stderr, "DNSSEC: root DNSKEY did not validate against trust anchor\n");
     }
@@ -101,10 +99,12 @@ struct Packet* send_resolver(struct Packet* query)
     DnssecChainCtx dnssec_chain;
     dnssec_chain_init(&dnssec_chain);
 
+    resolver_deadline_begin(RECURSION_BUDGET_SEC);
     pthread_rwlock_rdlock(&g_ns_cache_rwlock);
     struct Packet* result = send_resolver_internal(query, 0, &cname_chain,
                                                    NULL, &dnssec_chain);
     pthread_rwlock_unlock(&g_ns_cache_rwlock);
+    resolver_deadline_end();
 
     free_cname_chain(&cname_chain);
     dnssec_chain_free(&dnssec_chain);
@@ -123,10 +123,15 @@ struct Packet* send_resolver_with_ns_context(struct Packet* query,
     DnssecChainCtx dnssec_chain;
     dnssec_chain_init(&dnssec_chain);
 
+    /* Ref-counted: when invoked from inside an active resolution (the common
+     * case — NS-name resolution), this shares the parent's budget instead of
+     * arming a fresh one. */
+    resolver_deadline_begin(RECURSION_BUDGET_SEC);
     pthread_rwlock_rdlock(&g_ns_cache_rwlock);
     struct Packet* result = send_resolver_internal(query, 0, &cname_chain,
                                                    ns_context, &dnssec_chain);
     pthread_rwlock_unlock(&g_ns_cache_rwlock);
+    resolver_deadline_end();
 
     free_cname_chain(&cname_chain);
     dnssec_chain_free(&dnssec_chain);
@@ -192,6 +197,13 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
     bool started_from_cache = false;
     char* tld = get_tld_from_domain(query->full_domain);
 
+    /* The zone the server we are about to query is authoritative for.  Used by
+     * the referral bailiwick check (4.1): every accepted delegation must move
+     * strictly DOWN the tree from this zone.  "" represents the root.  When we
+     * start from a cached NS we begin mid-tree, so seed it with the zone whose
+     * apex matched the cache (the full name, or the TLD). */
+    char* current_zone = NULL;
+
     /* When validating DNSSEC, the NS cache MUST be bypassed: starting from a
      * cached nameserver skips the root->TLD->zone delegation walk, and that
      * walk is exactly what carries the DS records needed to build the
@@ -200,12 +212,18 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
      * the root hints.  Non-DNSSEC queries keep the NS-cache fast path. */
     if (!want_dnssec && g_ns_cache) {
         current_server_ip = ns_cache_get(g_ns_cache, query->full_domain);
-        if (current_server_ip) started_from_cache = true;
+        if (current_server_ip) {
+            started_from_cache = true;
+            current_zone = strdup(query->full_domain);
+        }
     }
 
     if (!want_dnssec && !current_server_ip && g_ns_cache && tld) {
         current_server_ip = ns_cache_get(g_ns_cache, tld);
-        if (current_server_ip) started_from_cache = true;
+        if (current_server_ip) {
+            started_from_cache = true;
+            current_zone = strdup(tld);
+        }
     }
 
     if (!current_server_ip) {
@@ -213,6 +231,7 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
         if (server_idx < 0 || server_idx >= 13 || !g_hints[server_idx] ||
             !g_hints[server_idx]->ipv4_record || !g_hints[server_idx]->ipv4_record->ip) {
             free(tld);
+            free(current_zone);
             fprintf(stderr, "Failed to get root server\n");
             return NULL;
         }
@@ -220,11 +239,15 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
         current_server_ip = strdup(g_hints[server_idx]->ipv4_record->ip);
         if (!current_server_ip) {
             free(tld);
+            free(current_zone);
             return NULL;
         }
     }
 
     free(tld);
+
+    /* Default to the root zone when we did not start from a cached NS. */
+    if (!current_zone) current_zone = strdup("");
 
     // Resolution loop
     struct Packet* response = NULL;
@@ -243,14 +266,30 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
     char*    pending_cache_key = NULL;
     uint32_t pending_cache_ttl = DEFAULT_NS_TTL; /* actual NS TTL from referral */
 
-// Free pending_ns_list and pending_cache_key without touching anything else.
+// Free pending_ns_list, pending_cache_key and current_zone without touching
+// anything else.  (Restart-from-root paths re-seed current_zone afterwards.)
 #define RESOLVE_CLEANUP() do { \
     if (pending_ns_list) { free_ns_candidate_list(pending_ns_list); pending_ns_list = NULL; } \
     free(pending_cache_key); pending_cache_key = NULL; \
+    free(current_zone); current_zone = NULL; \
 } while(0)
 
     while (iteration < MAX_ITERATIONS) {
         iteration++;
+
+        /* Total recursion budget spent: stop walking and let the caller return
+         * SERVFAIL.  Bounds the worst-case time for one resolution so the
+         * forwarding auth server gets an answer inside its own timeout instead
+         * of giving up on a query we are still working on. */
+        if (resolver_deadline_exceeded()) {
+            fprintf(stderr, "Resolution budget (%ds) exceeded for %s — SERVFAIL\n",
+                    RECURSION_BUDGET_SEC,
+                    query->full_domain ? query->full_domain : "?");
+            free(current_server_ip);
+            free_server_history(&visited);
+            RESOLVE_CLEANUP();
+            return NULL;
+        }
 
         /* A secure delegation broke earlier in the walk (DS with no matching
          * DNSKEY): the zone is signed-but-bogus, so reject rather than query
@@ -292,7 +331,7 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
         response = query_server(current_server_ip, query);
 
         if (!response) {
-            fprintf(stderr, "✗ No response from %s\n", current_server_ip);
+            fprintf(stderr, "No response from %s\n", current_server_ip);
             free(current_server_ip);
             current_server_ip = NULL;
 
@@ -331,6 +370,7 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                     free_server_history(&visited);
                     memset(&visited, 0, sizeof(visited));
                     RESOLVE_CLEANUP();
+                    current_zone = strdup("");  /* restarting from the root */
                     started_from_cache = false;
                     iteration = 0;
                     int ridx = get_random_server();
@@ -366,6 +406,7 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
             free_server_history(&visited);
             memset(&visited, 0, sizeof(visited));
             RESOLVE_CLEANUP();
+            current_zone = strdup("");  /* restarting from the root */
             started_from_cache = false;
             iteration = 0;
             int ridx = get_random_server();
@@ -379,9 +420,17 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
         }
 
         // query_server succeeded: commit the pending NS cache entry using the
-        // IP that actually responded, then clear it.
+        // IP that actually responded, then clear it.  Guard the key one last
+        // time (4.1): never cache an NS under a zone the query is not within —
+        // the key must be a suffix of the queried name, or it could redirect
+        // unrelated victim names to this server.
         if (g_ns_cache && pending_cache_key) {
-            ns_cache_put(g_ns_cache, pending_cache_key, current_server_ip, pending_cache_ttl);
+            if (name_in_bailiwick(query->full_domain, pending_cache_key)) {
+                ns_cache_put(g_ns_cache, pending_cache_key, current_server_ip, pending_cache_ttl);
+            } else {
+                fprintf(stderr, "Refusing out-of-bailiwick NS-cache key '%s' for query '%s'\n",
+                        pending_cache_key, query->full_domain);
+            }
             free(pending_cache_key);
             pending_cache_key = NULL;
         }
@@ -411,6 +460,21 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                     current_server_ip,
                     query->full_domain ? query->full_domain : "?");
         }
+
+        /*
+         * Never trust an AD bit set by an upstream/authoritative server: this
+         * resolver is the validator, and the AD bit must reflect OUR validation
+         * only (RFC 4035 §3.2.3, RFC 6840 §5.7).  Clear it on every inbound
+         * response here; it is re-set further down solely when our own DNSSEC
+         * validation succeeds (dv == 1).  Without this, the NODATA/NXDOMAIN/
+         * CNAME-passthrough return paths could leak an attacker-set AD bit.
+         */
+        if (response->request && response->recv_len >= 4) {
+            uint16_t hflags = ntohs(*(uint16_t*)(response->request + 2));
+            hflags &= ~(1u << 5);   /* AD bit */
+            *(uint16_t*)(response->request + 2) = htons(hflags);
+        }
+        response->ad = 0;
 
         // Handle errors
         if (response->rcode == RCODE_NAME_ERROR) {
@@ -593,7 +657,7 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                 RESOLVE_CLEANUP();
 
                 if (!final_answer) {
-                    fprintf(stderr, "✗ Failed to resolve CNAME target\n");
+                    fprintf(stderr, "Failed to resolve CNAME target\n");
                     free_cname_chain_data(&chain_data);
                     return NULL;
                 }
@@ -695,7 +759,40 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                 pending_ns_idx = 0;
             }
 
-            NSCandidateList* ns_list = extract_all_ns_with_glue(response);
+            /* --- 4.1 bailiwick check on the delegation ----------------------
+             * The delegated zone apex must (a) be at or below the queried name
+             * and (b) move strictly DOWN the tree from the zone the answering
+             * server is authoritative for.  A server that delegates a name
+             * outside its own zone (e.g. an evil.com server referring "com" or
+             * "paypal.com") is the classic no-spoof recursive-resolver
+             * poisoning vector — drop the whole referral rather than trust any
+             * of its NS owners, glue, or cache keys. */
+            char* zone_apex = extract_zone_apex(response);
+            bool apex_ok = zone_apex && zone_apex[0] &&
+                           name_in_bailiwick(query->full_domain, zone_apex) &&
+                           name_in_bailiwick(zone_apex, current_zone) &&
+                           !name_in_bailiwick(current_zone, zone_apex);
+            if (!apex_ok) {
+                fprintf(stderr,
+                        "Rejecting out-of-bailiwick referral: apex='%s'"
+                        " server-zone='%s' query='%s'\n",
+                        zone_apex ? zone_apex : "(none)",
+                        current_zone ? current_zone : "(root)",
+                        query->full_domain);
+                free(zone_apex);
+                free(current_server_ip);
+                free_server_history(&visited);
+                free_packet(response);
+                RESOLVE_CLEANUP();
+                return NULL;
+            }
+
+            /* Glue is filtered to the answering server's zone (current_zone)
+             * inside this call (4.1): root vouches for *.gtld-servers.net glue,
+             * a TLD server vouches for glue under that TLD, etc.  Filtering to
+             * the delegated child instead would wrongly drop the universal case
+             * of cross-zone TLD glue and break resolution. */
+            NSCandidateList* ns_list = extract_all_ns_with_glue(response, current_zone);
             char* next_server_ip = NULL;
             int chosen_idx = -1;
 
@@ -726,8 +823,9 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
             }
 
             if (!next_server_ip) {
-                fprintf(stderr, "✗ All nameservers failed or unreachable\n");
+                fprintf(stderr, "All nameservers failed or unreachable\n");
                 if (ns_list) free_ns_candidate_list(ns_list);
+                free(zone_apex);
                 free(current_server_ip);
                 free_server_history(&visited);
                 free_packet(response);
@@ -741,18 +839,23 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
             pending_ns_list = ns_list;
             pending_ns_idx = chosen_idx + 1;
 
-            // Defer NS caching: record the zone apex now, but only write the
-            // cache entry once query_server confirms the IP actually responds.
+            // Descend the tree: the chosen NS is authoritative for the (now
+            // validated) delegated zone, which becomes the bailiwick floor for
+            // the next referral.
+            free(current_zone);
+            current_zone = strdup(zone_apex);
+
+            // Defer NS caching: record the validated zone apex now, but only
+            // write the cache entry once query_server confirms the IP actually
+            // responds.  The apex is already proven in-bailiwick above.
             free(pending_cache_key);
             pending_cache_key = NULL;
             if (g_ns_cache) {
-                char* zone_apex = extract_zone_apex(response);
-                if (zone_apex && zone_apex[0]) {
-                    pending_cache_key = zone_apex;   // transfer ownership
-                } else {
-                    free(zone_apex);
-                    pending_cache_key = strdup(query->full_domain);
-                }
+                pending_cache_key = zone_apex;   // transfer ownership
+                zone_apex = NULL;
+            } else {
+                free(zone_apex);
+                zone_apex = NULL;
             }
 
             /* Capture the actual NS TTL before freeing the referral response. */

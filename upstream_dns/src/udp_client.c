@@ -1,5 +1,68 @@
 #include "udp_client.h"
 #include <sys/random.h>
+#include <strings.h>   /* strcasecmp */
+#include <time.h>      /* clock_gettime, CLOCK_MONOTONIC */
+#include <limits.h>    /* LONG_MAX */
+
+/* ==========================================================================
+ * Per-resolution time budget (thread-local)
+ *
+ * One worker thread handles a query from start to finish, so a thread-local
+ * deadline transparently covers the whole call tree — the main delegation
+ * walk plus every CNAME and NS-name sub-resolution — without threading a
+ * parameter through a dozen signatures.  begin/end are ref-counted: only the
+ * outermost call arms the deadline, so nested sub-resolutions share it.
+ * ========================================================================== */
+
+static __thread int             tls_depth = 0;   /* 0 = no active budget */
+static __thread struct timespec tls_deadline;
+
+void resolver_deadline_begin(int budget_sec)
+{
+    if (tls_depth == 0) {
+        clock_gettime(CLOCK_MONOTONIC, &tls_deadline);
+        tls_deadline.tv_sec += budget_sec;
+    }
+    tls_depth++;
+}
+
+void resolver_deadline_end(void)
+{
+    if (tls_depth > 0) tls_depth--;
+}
+
+/* Milliseconds left on the active budget; LONG_MAX when no budget is armed.
+ * May go <= 0 once the deadline has passed. */
+static long deadline_remaining_ms(void)
+{
+    if (tls_depth == 0) return LONG_MAX;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (tls_deadline.tv_sec - now.tv_sec) * 1000L +
+           (tls_deadline.tv_nsec - now.tv_nsec) / 1000000L;
+}
+
+bool resolver_deadline_exceeded(void)
+{
+    return tls_depth != 0 && deadline_remaining_ms() <= 0;
+}
+
+/*
+ * Per-hop receive timeout (seconds) bounded by both the remaining total budget
+ * and PER_HOP_TIMEOUT_SEC.  Returns 0 when fewer than one whole second of
+ * budget remains, signalling the caller to abort rather than start a hop that
+ * could overshoot the deadline.  With no budget armed, falls back to
+ * SOCKET_TIMEOUT so out-of-band callers behave as before.
+ */
+static int per_hop_timeout_sec(void)
+{
+    if (tls_depth == 0) return SOCKET_TIMEOUT;
+    long rem_ms = deadline_remaining_ms();
+    if (rem_ms <= 0) return 0;
+    long rem_sec = rem_ms / 1000;        /* floor: a hop never outlives the budget */
+    if (rem_sec <= 0) return 0;
+    return (rem_sec < PER_HOP_TIMEOUT_SEC) ? (int)rem_sec : PER_HOP_TIMEOUT_SEC;
+}
 
 /*
  * Bind sockfd to a random source port in [1024, 65535] (RFC 5452 §3.3).
@@ -157,7 +220,7 @@ struct Packet* query_server_with_timeout(const char* server_ip, struct Packet* q
 
         if (received < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                perror("  ✗ recvfrom failed");
+                perror("  recvfrom failed");
             }
             break;  // Timeout or hard error
         }
@@ -216,6 +279,25 @@ struct Packet* query_server_with_timeout(const char* server_ip, struct Packet* q
             continue;
         }
 
+        /* RFC 5452 §6: the response's question section MUST match the query's.
+         * Anti-spoofing defense-in-depth on top of source IP + TXID + random
+         * source port, and it prevents a reply to question B being accepted
+         * (and cached) for query A.  Names are compared case-insensitively
+         * (RFC 1035 §3.1). */
+        if (!response->full_domain || !query->full_domain ||
+            strcasecmp(response->full_domain, query->full_domain) != 0 ||
+            response->q_type  != query->q_type ||
+            response->q_class != query->q_class) {
+            fprintf(stderr,
+                    "  Question mismatch: got %s/%u/%u, expected %s/%u/%u — retrying\n",
+                    response->full_domain ? response->full_domain : "(none)",
+                    (unsigned)response->q_type, (unsigned)response->q_class,
+                    query->full_domain ? query->full_domain : "(none)",
+                    (unsigned)query->q_type, (unsigned)query->q_class);
+            free_packet(response);
+            continue;
+        }
+
         // Valid response received.
         close(sockfd);
         free(recv_buffer);
@@ -228,11 +310,15 @@ struct Packet* query_server_with_timeout(const char* server_ip, struct Packet* q
 }
 
 /*
- * Default query_server with standard timeout
+ * Default query_server: one hop, bounded by the active recursion budget.
+ * Returns NULL immediately if the budget is already spent so the caller fails
+ * fast instead of starting another timed wait.
  */
 struct Packet* query_server(const char* server_ip, struct Packet* query)
 {
-    return query_server_with_timeout(server_ip, query, SOCKET_TIMEOUT);
+    int timeout_sec = per_hop_timeout_sec();
+    if (timeout_sec == 0) return NULL;   /* budget exhausted */
+    return query_server_with_timeout(server_ip, query, timeout_sec);
 }
 
 /*
@@ -244,6 +330,11 @@ struct Packet* query_server_tcp(const char* server_ip, struct Packet* query)
 {
     if (!server_ip || !query || !query->request || query->recv_len <= 0) return NULL;
 
+    /* Honour the recursion budget: a TCP fallback is one more hop and must not
+     * outlive the deadline either.  Bail if the budget is already spent. */
+    int tcp_timeout = per_hop_timeout_sec();
+    if (tcp_timeout == 0) return NULL;
+
     bool is_ipv6 = strchr(server_ip, ':') != NULL;
     int addr_family = is_ipv6 ? AF_INET6 : AF_INET;
 
@@ -253,7 +344,7 @@ struct Packet* query_server_tcp(const char* server_ip, struct Packet* query)
         return NULL;
     }
 
-    struct timeval tv = { .tv_sec = SOCKET_TIMEOUT, .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = tcp_timeout, .tv_usec = 0 };
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 

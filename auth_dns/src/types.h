@@ -17,7 +17,6 @@
 #include <arpa/inet.h>
 
 #define PORT 53
-#define VERSION "v1.2"
 
 #define MAXLINE 4096
 #define HEADER_LEN 12
@@ -52,6 +51,7 @@
 #define RCODE_SERVER_FAILURE 2
 #define RCODE_NAME_ERROR    3
 #define RCODE_NOTIMP        4
+#define RCODE_REFUSED       5   // Query refused (RFC 1035)
 #define RCODE_NOTAUTH       9   // Not Authoritative (RFC 2136)
 #define RCODE_BADVERS       16  // Bad OPT Version (RFC 6891)
 
@@ -71,7 +71,7 @@
 #endif
 
 /* Paths relative to SERVER_PATH — do not make these absolute. */
-#define AUTH_FILE_PATH "/misc/auth_domains.txt"
+#define CONFIG_FILE_PATH "/misc/config.txt"
 #define DNSSEC_CONFIG_DIR "/config"
 
 #define DEFAULT_UPSTREAM_DNS "1.1.1.1"
@@ -123,6 +123,13 @@ typedef struct ServerConfig {
 
     char* upstream_dns;
     int upstream_port;
+
+    char* bind_addr;       /* listen address (-b); NULL = INADDR_ANY/in6addr_any */
+    char* acl_csv;         /* recursion allow-list CIDRs (-a); NULL = defaults    */
+    int   rate_limit_qps;  /* per-source queries/sec for recursion (-r); 0 = off  */
+    char* drop_user;       /* drop to this user[:group] after bind (-U); NULL=off */
+    char* block_mode;      /* -S: "nxdomain"(default)|"zero"|"<ip>"; NULL=default */
+    char* config_path;     /* -c: config file path; NULL = built-in default       */
 } Config;
 
 #endif /* TYPES_H */
