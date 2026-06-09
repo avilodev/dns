@@ -33,15 +33,30 @@ Both servers are multithreaded, support UDP and TCP, and speak IPv4 and IPv6.
 You need `gcc`, `make`, OpenSSL development headers (`libssl-dev`), and `libatomic`.
 
 ```bash
-make            # build both servers
-make rebuild    # clean + build both servers
-sudo make install   # install binaries, systemd units, logrotate, and cron script
-sudo make uninstall # remove all installed files
+make                 # build both servers
+make rebuild         # clean + build both servers
+sudo make install    # build + install all cron jobs (daily + @reboot startup)
+sudo make uninstall  # remove the installed cron jobs
 ```
 
 Binaries end up at `auth_dns/bin/auth_dns` and `upstream_dns/bin/upstream_dns`.
 
-`make install` also creates the `logs/` directory and substitutes all install-time paths (binary location, log path, server directory) into the systemd service files and logrotate configs — no hardcoded paths in the source tree.
+`make install` installs three cron jobs, all rendered from generic templates in `cron_scripts/` with install-time paths substituted in — no hardcoded paths in the source tree:
+
+- `dns_log` (daily) — archives and truncates the auth `server.log`.
+- `refresh-root-hints` (daily) — refreshes the upstream resolver's root hints.
+- `dns-startup` (`@reboot`) — starts the servers at boot. This is a one-line `/etc/cron.d` entry that points back at the launcher in `cron_scripts/dns-startup`, which is the file you edit to choose what runs.
+
+## Auto-start at boot
+
+After `sudo make install`, the servers start automatically on every boot. To choose **which** servers run, edit `cron_scripts/dns-startup` and comment out a line at the bottom:
+
+```bash
+start_upstream    # comment out to disable the recursive resolver
+start_auth        # comment out to disable the authoritative server
+```
+
+Leave both for the full setup. Edits take effect on the next boot — no reinstall needed. Tunables (threads, ports, optional `-U` privilege drop) live at the top of that file.
 
 ---
 
