@@ -13,7 +13,6 @@ upstream_dns/obj/
 
 # Query logs (daily-rotating, can be large)
 logs/
-cron_scripts/
 
 # Testing scripts and results
 testing/
