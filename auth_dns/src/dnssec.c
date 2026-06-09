@@ -365,26 +365,44 @@ int dnssec_sign_rrset(const ZoneKey *key,
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
     if (!ctx) return -1;
 
-    if (EVP_DigestSignInit(ctx, NULL, md, NULL, key->pkey) != 1 ||
-        EVP_DigestSignUpdate(ctx, rrset, rrset_len) != 1) {
-        ERR_print_errors_fp(stderr);
-        EVP_MD_CTX_free(ctx);
-        return -1;
-    }
+    size_t        raw_len = 0;
+    unsigned char *raw    = NULL;
 
-    size_t raw_len = 0;
-    if (EVP_DigestSignFinal(ctx, NULL, &raw_len) != 1) {
-        EVP_MD_CTX_free(ctx);
-        return -1;
-    }
-
-    unsigned char *raw = malloc(raw_len);
-    if (!raw) { EVP_MD_CTX_free(ctx); return -1; }
-
-    if (EVP_DigestSignFinal(ctx, raw, &raw_len) != 1) {
-        ERR_print_errors_fp(stderr);
-        free(raw); EVP_MD_CTX_free(ctx);
-        return -1;
+    if (key->algorithm == 15) {
+        /* Ed25519 (RFC 8080) supports ONLY one-shot signing: OpenSSL rejects the
+         * streaming EVP_DigestSignUpdate/Final API for edwards-curve keys, so the
+         * whole message must be passed to EVP_DigestSign() in a single call. */
+        if (EVP_DigestSignInit(ctx, NULL, NULL, NULL, key->pkey) != 1 ||
+            EVP_DigestSign(ctx, NULL, &raw_len, rrset, rrset_len) != 1) {
+            ERR_print_errors_fp(stderr);
+            EVP_MD_CTX_free(ctx);
+            return -1;
+        }
+        raw = malloc(raw_len);
+        if (!raw) { EVP_MD_CTX_free(ctx); return -1; }
+        if (EVP_DigestSign(ctx, raw, &raw_len, rrset, rrset_len) != 1) {
+            ERR_print_errors_fp(stderr);
+            free(raw); EVP_MD_CTX_free(ctx);
+            return -1;
+        }
+    } else {
+        if (EVP_DigestSignInit(ctx, NULL, md, NULL, key->pkey) != 1 ||
+            EVP_DigestSignUpdate(ctx, rrset, rrset_len) != 1) {
+            ERR_print_errors_fp(stderr);
+            EVP_MD_CTX_free(ctx);
+            return -1;
+        }
+        if (EVP_DigestSignFinal(ctx, NULL, &raw_len) != 1) {
+            EVP_MD_CTX_free(ctx);
+            return -1;
+        }
+        raw = malloc(raw_len);
+        if (!raw) { EVP_MD_CTX_free(ctx); return -1; }
+        if (EVP_DigestSignFinal(ctx, raw, &raw_len) != 1) {
+            ERR_print_errors_fp(stderr);
+            free(raw); EVP_MD_CTX_free(ctx);
+            return -1;
+        }
     }
     EVP_MD_CTX_free(ctx);
 

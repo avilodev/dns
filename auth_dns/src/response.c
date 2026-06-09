@@ -1,6 +1,48 @@
 #include "response.h"
 #include "auth.h"
 #include "utils.h"
+#include <string.h>
+
+/*
+ * Echo the question section into a response, preserving the client's original
+ * QNAME case (RFC 1035 §4.1.2 — the question MUST be returned byte-for-byte;
+ * required for 0x20 mixed-case anti-spoofing, known_issues 4.8).
+ *
+ * Prefers a verbatim copy of the original question bytes (QNAME + QTYPE +
+ * QCLASS) from request->request; question-section QNAMEs are never compressed,
+ * so this is safe.  Falls back to re-encoding from the lowercased full_domain
+ * for internally-built requests that carry no raw wire copy.  Advances *pos.
+ */
+void echo_question(char* buf, int* pos, const struct Packet* request)
+{
+    if (request->request && request->recv_len > HEADER_LEN) {
+        const unsigned char* r = (const unsigned char*)request->request;
+        int len = (int)request->recv_len;
+        int q = HEADER_LEN;
+        while (q < len) {
+            unsigned char l = r[q];
+            if (l == 0)        { q++; break; }   /* root label: QNAME ends */
+            if (l & 0xC0)      { q = -1; break; }/* compression: shouldn't occur */
+            q += 1 + l;
+        }
+        if (q >= HEADER_LEN && q + 4 <= len) {
+            int qlen = (q + 4) - HEADER_LEN;     /* QNAME + QTYPE + QCLASS */
+            if (*pos + qlen <= MAXLINE) {
+                memcpy(buf + *pos, r + HEADER_LEN, (size_t)qlen);
+                *pos += qlen;
+                return;
+            }
+        }
+    }
+
+    /* Fallback: re-encode from the (lowercased) parsed name. */
+    if (request->full_domain)
+        write_dns_labels(request->full_domain, buf, pos, MAXLINE);
+    else
+        buf[(*pos)++] = 0;
+    *(uint16_t*)(buf + *pos) = htons(request->q_type);   *pos += 2;
+    *(uint16_t*)(buf + *pos) = htons(request->q_class);  *pos += 2;
+}
 
 /*
  * Append a SOA authority record to a response buffer already containing the
@@ -14,8 +56,8 @@ static void append_soa_authority(char* buf, int* pos, const struct AuthDomain* s
     // Build SOA RDATA in a temp buffer: MNAME + RNAME + 5×uint32_t
     char rdata[1024];
     int rdata_len = 0;
-    write_dns_labels(soa->soa_mname, rdata, &rdata_len);
-    write_dns_labels(soa->soa_rname, rdata, &rdata_len);
+    write_dns_labels(soa->soa_mname, rdata, &rdata_len, sizeof(rdata));
+    write_dns_labels(soa->soa_rname, rdata, &rdata_len, sizeof(rdata));
     *(uint32_t*)(rdata + rdata_len) = htonl(soa->soa_serial);   rdata_len += 4;
     *(uint32_t*)(rdata + rdata_len) = htonl(soa->soa_refresh);  rdata_len += 4;
     *(uint32_t*)(rdata + rdata_len) = htonl(soa->soa_retry);    rdata_len += 4;
@@ -26,7 +68,7 @@ static void append_soa_authority(char* buf, int* pos, const struct AuthDomain* s
     uint32_t ttl = (soa->soa_ttl < soa->soa_minimum) ? soa->soa_ttl : soa->soa_minimum;
 
     // Owner name: zone apex in wire format
-    write_dns_labels(soa->domain, buf, pos);
+    write_dns_labels(soa->domain, buf, pos, MAXLINE);
     *(uint16_t*)(buf + *pos) = htons(QTYPE_SOA);   *pos += 2;
     *(uint16_t*)(buf + *pos) = htons(1);            *pos += 2;  // CLASS IN
     *(uint32_t*)(buf + *pos) = htonl(ttl);          *pos += 4;
@@ -154,17 +196,8 @@ struct Packet* build_nxdomain_response(struct Packet* request,
     *(uint16_t*)(response->request + pos) = htons(0);  // 0 additional
     pos += 2;
 
-    // Write question QNAME using correct label encoding
-    if (request->full_domain) {
-        write_dns_labels(request->full_domain, response->request, &pos);
-    } else {
-        response->request[pos++] = 0;
-    }
-
-    *(uint16_t*)(response->request + pos) = htons(request->q_type);
-    pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(request->q_class);
-    pos += 2;
+    // Echo the question verbatim (preserves QNAME case — 4.8)
+    echo_question(response->request, &pos, request);
 
     // Append SOA in authority section (RFC 2308 §3)
     if (soa) {
@@ -223,17 +256,8 @@ struct Packet* build_nodata_response(struct Packet* request,
     *(uint16_t*)(response->request + pos) = htons(0);  // 0 additional
     pos += 2;
 
-    // Write question QNAME using correct label encoding
-    if (request->full_domain) {
-        write_dns_labels(request->full_domain, response->request, &pos);
-    } else {
-        response->request[pos++] = 0;
-    }
-
-    *(uint16_t*)(response->request + pos) = htons(request->q_type);
-    pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(request->q_class);
-    pos += 2;
+    // Echo the question verbatim (preserves QNAME case — 4.8)
+    echo_question(response->request, &pos, request);
 
     // Append SOA in authority section (RFC 2308 §3)
     if (soa) {
@@ -285,17 +309,8 @@ struct Packet* build_servfail_response(struct Packet* request) {
     *(uint16_t*)(response->request + pos) = htons(0);
     pos += 2;
 
-    // Write question QNAME using correct label encoding
-    if (request->full_domain) {
-        write_dns_labels(request->full_domain, response->request, &pos);
-    } else {
-        response->request[pos++] = 0;
-    }
-
-    *(uint16_t*)(response->request + pos) = htons(request->q_type);
-    pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(request->q_class);
-    pos += 2;
+    // Echo the question verbatim (preserves QNAME case — 4.8)
+    echo_question(response->request, &pos, request);
 
     response->recv_len = pos;
     return response;
@@ -341,14 +356,8 @@ struct Packet* build_badvers_response(struct Packet* request) {
     *(uint16_t*)(response->request + pos) = htons(1);   /* ARCOUNT = 1 (OPT) */
     pos += 2;
 
-    /* Question section */
-    if (request->full_domain)
-        write_dns_labels(request->full_domain, response->request, &pos);
-    else
-        response->request[pos++] = 0;
-
-    *(uint16_t*)(response->request + pos) = htons(request->q_type);   pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(request->q_class);  pos += 2;
+    /* Question section — echo verbatim to preserve QNAME case (4.8) */
+    echo_question(response->request, &pos, request);
 
     /* OPT RR: root name + type=41 + payload=4096 + TTL=BADVERS_extRCODE + RDLEN=0
      * OPT TTL layout (RFC 6891 §6.1.3):
@@ -410,11 +419,40 @@ static int message_has_opt(const unsigned char* buf, int len)
 }
 
 /* ==========================================================================
+ * append_edns_opt — append an EDNS0 OPT RR mirroring the client's request
+ * (RFC 6891 §6.1.1): a response to an EDNS query MUST itself carry an OPT RR.
+ *
+ * Shared by the UDP path (finalize_udp_response) and the TCP path (4.7), so
+ * EDNS/DO clients see the DO/AD signalling over TCP too.  No-op when the client
+ * sent no EDNS, when the response already carries an OPT (e.g. a forwarded
+ * upstream answer — RFC 6891 §6.1.1 allows at most one OPT), or when the OPT
+ * would not fit.  Advertises a 4096-byte UDP payload and mirrors the DO bit.
+ * ========================================================================== */
+void append_edns_opt(struct Packet *response, const struct Packet *request)
+{
+    if (!response || !response->request || !request) return;
+    if (!request->edns_present) return;
+    if (message_has_opt((const unsigned char*)response->request,
+                        (int)response->recv_len)) return;
+
+    int pos = (int)response->recv_len;
+    if (pos + 11 > MAXLINE) return;
+    response->request[pos++] = 0x00;                          /* root name  */
+    *(uint16_t*)(response->request + pos) = htons(41);        pos += 2; /* OPT  */
+    *(uint16_t*)(response->request + pos) = htons(4096);      pos += 2; /* payload */
+    /* TTL: [ext_rcode=0][version=0][flags] — mirror DO bit   */
+    uint32_t opt_ttl = request->do_bit ? 0x00008000u : 0u;
+    *(uint32_t*)(response->request + pos) = htonl(opt_ttl);   pos += 4;
+    *(uint16_t*)(response->request + pos) = htons(0);         pos += 2; /* RDLEN=0 */
+    response->recv_len = pos;
+    uint16_t arcount = ntohs(*(uint16_t*)(response->request + 10));
+    *(uint16_t*)(response->request + 10) = htons(arcount + 1);
+}
+
+/* ==========================================================================
  * finalize_udp_response — post-processing for all UDP responses.
  *
- * 1. OPT echo (RFC 6891 §6.1.1): if the client sent an OPT record,
- *    we must include one in our reply regardless of RCODE.
- *    We advertise a 4096-byte UDP payload and mirror the DO bit.
+ * 1. OPT echo (RFC 6891 §6.1.1) via append_edns_opt().
  *
  * 2. TC truncation (RFC 1035 §4.1.1 / RFC 6891 §6.2.6): if the built
  *    response exceeds the effective UDP limit (512 without EDNS, or
@@ -426,27 +464,8 @@ void finalize_udp_response(struct Packet *response, const struct Packet *request
 {
     if (!response || !response->request || !request) return;
 
-    /* --- 1. Append EDNS0 OPT RR if client sent EDNS ---
-     * Skip when the response already carries an OPT (e.g. a forwarded upstream
-     * answer that passed one through): a second OPT makes the message
-     * malformed (RFC 6891 §6.1.1 — a message may contain at most one OPT RR). */
-    if (request->edns_present &&
-        !message_has_opt((const unsigned char*)response->request,
-                         (int)response->recv_len)) {
-        int pos = (int)response->recv_len;
-        if (pos + 11 <= MAXLINE) {
-            response->request[pos++] = 0x00;                          /* root name  */
-            *(uint16_t*)(response->request + pos) = htons(41);        pos += 2; /* OPT  */
-            *(uint16_t*)(response->request + pos) = htons(4096);      pos += 2; /* payload */
-            /* TTL: [ext_rcode=0][version=0][flags] — mirror DO bit   */
-            uint32_t opt_ttl = request->do_bit ? 0x00008000u : 0u;
-            *(uint32_t*)(response->request + pos) = htonl(opt_ttl);   pos += 4;
-            *(uint16_t*)(response->request + pos) = htons(0);         pos += 2; /* RDLEN=0 */
-            response->recv_len = pos;
-            uint16_t arcount = ntohs(*(uint16_t*)(response->request + 10));
-            *(uint16_t*)(response->request + 10) = htons(arcount + 1);
-        }
-    }
+    /* --- 1. Append EDNS0 OPT RR if client sent EDNS --- */
+    append_edns_opt(response, request);
 
     /* --- 2. Truncate if response exceeds UDP payload limit --- */
     int udp_limit = request->edns_present ? (int)request->edns_udp_size : 512;

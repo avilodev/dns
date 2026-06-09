@@ -5,19 +5,26 @@ extern Config g_config;
 static void init_default_config(void) {
     g_config.upstream_dns = strdup(DEFAULT_UPSTREAM_DNS);
     g_config.upstream_port = UPSTREAM_PORT;
-    
+
     g_config.thread_count = NUM_THREADS;
     g_config.queue_size = QUEUE_SIZE;
+
+    g_config.bind_addr = NULL;
+    g_config.acl_csv = NULL;
+    g_config.rate_limit_qps = 0;
+    g_config.drop_user = NULL;
+    g_config.block_mode = NULL;
+    g_config.config_path = NULL;
 }
 
-/* Parse command-line flags (-p/-t/-u/-q) into g_config. Returns 0 on success, -1 on unknown flag. */
+/* Parse command-line flags (-p/-t/-u/-q/-b/-a/-r/-U) into g_config. Returns 0 on success, -1 on unknown flag. */
 int load_config(int argc, char** argv) {
     // Initialize defaults
     init_default_config();
-    
+
     // Parse command line arguments
     int opt;
-    while ((opt = getopt(argc, argv, "p:t:u:q:")) != -1) {
+    while ((opt = getopt(argc, argv, "p:t:u:q:b:a:r:U:S:c:")) != -1) {
         char *end;
         long v;
         switch (opt) {
@@ -37,10 +44,20 @@ int load_config(int argc, char** argv) {
                 }
                 g_config.thread_count = (int)v;
                 break;
-            case 'u':
+            case 'u': {
+                /* Validate the upstream address now: a typo would otherwise make
+                 * every forwarded query silently SERVFAIL at resolve time. */
+                struct in_addr  a4;
+                struct in6_addr a6;
+                if (inet_pton(AF_INET, optarg, &a4) != 1 &&
+                    inet_pton(AF_INET6, optarg, &a6) != 1) {
+                    fprintf(stderr, "Invalid upstream address: %s\n", optarg);
+                    return -1;
+                }
                 free(g_config.upstream_dns);
                 g_config.upstream_dns = strdup(optarg);
                 break;
+            }
             case 'q':
                 v = strtol(optarg, &end, 10);
                 if (*end != '\0' || v < 1 || v > 1048576) {
@@ -49,8 +66,34 @@ int load_config(int argc, char** argv) {
                 }
                 g_config.queue_size = (int)v;
                 break;
+            case 'b':
+                g_config.bind_addr = strdup(optarg);
+                break;
+            case 'a':
+                g_config.acl_csv = strdup(optarg);
+                break;
+            case 'r':
+                v = strtol(optarg, &end, 10);
+                if (*end != '\0' || v < 0 || v > 1000000) {
+                    fprintf(stderr, "Invalid rate limit: %s\n", optarg);
+                    return -1;
+                }
+                g_config.rate_limit_qps = (int)v;
+                break;
+            case 'U':
+                g_config.drop_user = strdup(optarg);
+                break;
+            case 'S':
+                g_config.block_mode = strdup(optarg);
+                break;
+            case 'c':
+                g_config.config_path = strdup(optarg);
+                break;
             default:
-                printf("Usage: ./auth_dns/bin/dns <-p Upstream DNS port> <-t thread_count> <-u upstream_dns> <-q queue_size>\n");
+                printf("Usage: ./bin/auth_dns <-p upstream_port> <-t thread_count> "
+                       "<-u upstream_dns> <-q queue_size> <-b bind_addr> "
+                       "<-a recursion_allow_cidrs> <-r per_source_qps> "
+                       "<-U user[:group]> <-S block_mode> <-c config_file>\n");
                 return -1;
         }
     }
@@ -63,7 +106,7 @@ int load_config(int argc, char** argv) {
  * encoding at buf[*pos], advancing *pos.  Each dot-separated label is written
  * as: <length-byte> <label-bytes>.  A final zero-length byte terminates the name.
  */
-void write_dns_labels(const char* name, char* buf, int* pos) {
+void write_dns_labels(const char* name, char* buf, int* pos, int buf_size) {
     if (!name || !buf || !pos) return;
     char copy[256];
     strncpy(copy, name, sizeof(copy) - 1);
@@ -72,12 +115,16 @@ void write_dns_labels(const char* name, char* buf, int* pos) {
     char* label = strtok_r(copy, ".", &saveptr);
     while (label) {
         uint8_t label_len = (uint8_t)strlen(label);
+        /* Need length byte + label here, and still room for the trailing null
+         * below.  Stop (truncate) rather than overflow the destination. */
+        if (*pos + 1 + (int)label_len + 1 > buf_size) break;
         buf[(*pos)++] = (char)label_len;
         memcpy(buf + *pos, label, label_len);
         *pos += label_len;
         label = strtok_r(NULL, ".", &saveptr);
     }
-    buf[(*pos)++] = 0;  // Null terminator
+    if (*pos < buf_size)
+        buf[(*pos)++] = 0;  // Null terminator
 }
 
 /*
@@ -218,42 +265,6 @@ char* extract_ip_from_response(struct Packet* response) {
     }
 
     return NULL;
-}
-
-/* Print packet header fields (for debugging). */
-void print_packet_info(const char* label, struct Packet* pkt) {
-    if (!pkt) {
-        return;
-    }
-
-    printf("\n=== %s ===\n", label);
-    printf("Transaction ID: 0x%04x\n", pkt->id);
-    printf("Flags: 0x%04x [QR=%d AA=%d RD=%d RA=%d RCODE=%d]\n", 
-           pkt->flags, pkt->qr, pkt->aa, pkt->rd, pkt->ra, pkt->rcode);
-    printf("Questions: %u, Answers: %u, Authority: %u, Additional: %u\n",
-           pkt->qdcount, pkt->ancount, pkt->nscount, pkt->arcount);
-    
-    if (pkt->full_domain) {
-        printf("Domain: %s\n", pkt->full_domain);
-    }
-    
-    printf("Query Type: %u, Class: %u\n", pkt->q_type, pkt->q_class);
-    printf("========================\n\n");
-}
-
-/* Print a hex dump of data (for debugging). */
-void print_hex_dump(const char* data, ssize_t len) {
-    printf("Hex dump (%zd bytes): ", len);
-    for (ssize_t i = 0; i < len && i < 4096; i++) {
-        printf("%02X ", (unsigned char)data[i]);
-        if ((i + 1) % 16 == 0) {
-            printf("\n                      ");
-        }
-    }
-    if (len > 4096) {
-        printf("... (truncated)");
-    }
-    printf("\n");
 }
 
 /* Free a Packet and all its heap-allocated fields. */

@@ -8,21 +8,26 @@ static void init_default_config(void) {
     g_config.port = PORT;
     g_config.thread_count = NUM_THREADS;
     g_config.queue_size = QUEUE_SIZE;
+    g_config.bind_addr = NULL;
+    g_config.acl_csv = NULL;
+    g_config.rate_limit_qps = 0;
+    g_config.drop_user = NULL;
 }
 
 /*
  * Parse command-line arguments and populate the server configuration.
  *
  * Initializes defaults then applies -p (port), -t (thread count),
- * and -q (queue size) flags. Returns -1 on unrecognized flags.
+ * -q (queue size), -b (bind address), -a (allow-list CIDRs), and
+ * -r (per-source rate limit) flags. Returns -1 on unrecognized flags.
  */
 int load_config(int argc, char** argv) {
     // Initialize defaults
     init_default_config();
-    
+
     // Parse command line arguments
     int opt;
-    while ((opt = getopt(argc, argv, "p:t:q:")) != -1) {
+    while ((opt = getopt(argc, argv, "p:t:q:b:a:r:U:")) != -1) {
         char *end;
         long v;
         switch (opt) {
@@ -50,20 +55,56 @@ int load_config(int argc, char** argv) {
                 }
                 g_config.queue_size = (int)v;
                 break;
+            case 'b':
+                g_config.bind_addr = strdup(optarg);
+                break;
+            case 'a':
+                g_config.acl_csv = strdup(optarg);
+                break;
+            case 'r':
+                v = strtol(optarg, &end, 10);
+                if (*end != '\0' || v < 0 || v > 1000000) {
+                    fprintf(stderr, "Invalid rate limit: %s\n", optarg);
+                    return -1;
+                }
+                g_config.rate_limit_qps = (int)v;
+                break;
+            case 'U':
+                g_config.drop_user = strdup(optarg);
+                break;
             default:
-                printf("Usage: ./upstream_dns/bin/dns <-p Upstream DNS port> <-t thread_count> <-q queue_size>\n");
+                printf("Usage: ./bin/upstream_dns <-p port> <-t thread_count> "
+                       "<-q queue_size> <-b bind_addr> <-a allow_cidrs> "
+                       "<-r per_source_qps> <-U user[:group]>\n");
                 return -1;
         }
     }
 
-    
-    printf("Config Loaded\n");
-    printf("Port: %d\n", g_config.port);
-    printf("Thread Count: %d\n", g_config.thread_count);
-    printf("Queue Size: %d\n", g_config.queue_size);
-    
-    
+    printf("Config: port=%d threads=%d queue=%d\n",
+           g_config.port, g_config.thread_count, g_config.queue_size);
     return 0;
+}
+
+/*
+ * Resolve the configured -b bind address for a given address family.
+ *
+ *   AF_INET : writes the network address into *out4
+ *   AF_INET6: writes the network address into *out6
+ *
+ * Returns  1 if a bind address was applied for this family,
+ *          0 if no -b was given (caller should use the wildcard address),
+ *         -1 if -b was given but is not of this family (skip this socket).
+ */
+static int resolve_bind_addr(int family, struct in_addr *out4,
+                             struct in6_addr *out6) {
+    if (!g_config.bind_addr) {
+        if (family == AF_INET)  out4->s_addr = INADDR_ANY;
+        if (family == AF_INET6) *out6 = in6addr_any;
+        return 0;
+    }
+    if (family == AF_INET)
+        return (inet_pton(AF_INET, g_config.bind_addr, out4) == 1) ? 1 : -1;
+    return (inet_pton(AF_INET6, g_config.bind_addr, out6) == 1) ? 1 : -1;
 }
 
 /*
@@ -103,8 +144,13 @@ int create_server_socket(int port) {
     // Configure server address
     memset(&dns_addr, 0, sizeof(dns_addr));
     dns_addr.sin_family = AF_INET;
-    dns_addr.sin_addr.s_addr = INADDR_ANY;
     dns_addr.sin_port = htons(port);
+    // Honor -b bind address; -1 means a non-IPv4 address was given (IPv6-only),
+    // so skip the IPv4 UDP socket entirely rather than binding the wildcard.
+    if (resolve_bind_addr(AF_INET, &dns_addr.sin_addr, NULL) < 0) {
+        close(dns_sock);
+        return -1;
+    }
 
     // Bind socket to port
     if (bind(dns_sock, (struct sockaddr*)&dns_addr, sizeof(dns_addr)) < 0) {
@@ -113,8 +159,12 @@ int create_server_socket(int port) {
         close(dns_sock);
         exit(EXIT_FAILURE);
     }
-    
-    printf("DNS Server listening on 0.0.0.0:%d (UDP IPv4)\n", port);
+
+    {
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &dns_addr.sin_addr, ip, sizeof(ip));
+        printf("DNS Server listening on %s:%d (UDP IPv4)\n", ip, port);
+    }
     return dns_sock;
 }
 
@@ -135,14 +185,21 @@ int create_server_socket_v6(int port) {
     struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin6_family = AF_INET6;
-    addr.sin6_addr   = in6addr_any;
     addr.sin6_port   = htons(port);
+    if (resolve_bind_addr(AF_INET6, NULL, &addr.sin6_addr) < 0) {
+        close(sock);   /* -b is an IPv4 address: no IPv6 socket */
+        return -1;
+    }
     if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("Warning: bind() IPv6 UDP");
         close(sock);
         return -1;
     }
-    printf("DNS Server listening on [::]:%d (UDP IPv6)\n", port);
+    {
+        char ip[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, &addr.sin6_addr, ip, sizeof(ip));
+        printf("DNS Server listening on [%s]:%d (UDP IPv6)\n", ip, port);
+    }
     return sock;
 }
 
@@ -161,15 +218,21 @@ int create_tcp_socket_v4(int port) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port        = htons(port);
+    if (resolve_bind_addr(AF_INET, &addr.sin_addr, NULL) < 0) {
+        close(sock); return -1;   /* -b is IPv6: no IPv4 TCP socket */
+    }
     if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("Warning: bind() IPv4 TCP"); close(sock); return -1;
     }
     if (listen(sock, SOMAXCONN) < 0) {
         perror("Warning: listen() IPv4 TCP"); close(sock); return -1;
     }
-    printf("DNS Server listening on 0.0.0.0:%d (TCP IPv4)\n", port);
+    {
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+        printf("DNS Server listening on %s:%d (TCP IPv4)\n", ip, port);
+    }
     return sock;
 }
 
@@ -189,19 +252,34 @@ int create_tcp_socket_v6(int port) {
     struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin6_family = AF_INET6;
-    addr.sin6_addr   = in6addr_any;
     addr.sin6_port   = htons(port);
+    if (resolve_bind_addr(AF_INET6, NULL, &addr.sin6_addr) < 0) {
+        close(sock); return -1;   /* -b is IPv4: no IPv6 TCP socket */
+    }
     if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("Warning: bind() IPv6 TCP"); close(sock); return -1;
     }
     if (listen(sock, SOMAXCONN) < 0) {
         perror("Warning: listen() IPv6 TCP"); close(sock); return -1;
     }
-    printf("DNS Server listening on [::]:%d (TCP IPv6)\n", port);
+    {
+        char ip[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, &addr.sin6_addr, ip, sizeof(ip));
+        printf("DNS Server listening on [%s]:%d (TCP IPv6)\n", ip, port);
+    }
     return sock;
 }
 
 extern Hints* g_hints[13];
+
+/* Free a single root-hint Record (ip + type + struct). */
+static void free_hint_record(Record* r)
+{
+    if (!r) return;
+    free(r->ip);
+    free(r->type);
+    free(r);
+}
 
 int load_hints(const char* filename)
 {
@@ -225,9 +303,10 @@ int load_hints(const char* filename)
             continue;
         }
 
-        // Trim leading whitespace
+        // Trim leading whitespace (cast to unsigned char: isspace() is UB for
+        // negative values other than EOF, which a signed char can produce).
         char* start = line;
-        while (*start && isspace(*start)) start++;
+        while (*start && isspace((unsigned char)*start)) start++;
         
         if (*start == '\0') continue;
 
@@ -267,6 +346,7 @@ int load_hints(const char* filename)
             rec->ip = strdup(value);
             rec->type = strdup("A");
             rec->ttl = ttl;
+            free_hint_record(g_hints[hint_index]->ipv4_record);  /* no leak on dup */
             g_hints[hint_index]->ipv4_record = rec;
         }
         // Check if this is an AAAA record (IPv6)
@@ -279,6 +359,7 @@ int load_hints(const char* filename)
             rec->ip = strdup(value);
             rec->type = strdup("AAAA");
             rec->ttl = ttl;
+            free_hint_record(g_hints[hint_index]->ipv6_record);  /* no leak on dup */
             g_hints[hint_index]->ipv6_record = rec;
         }
     }

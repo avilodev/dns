@@ -27,6 +27,35 @@ const char* qtype_name(uint16_t qtype) {
     }
 }
 
+/*
+ * Percent-encode CSV-unsafe bytes (known_issues 4.6).  DNS labels may contain
+ * arbitrary octets — commas, quotes, control chars, even newlines — and the
+ * QNAME and answer fields are attacker-influenced.  Encoding control chars,
+ * the CSV structural characters (comma, double-quote), backslash, percent, and
+ * any non-ASCII byte as %XX prevents log-line injection and column-splitting
+ * while leaving ordinary names readable.  Always NUL-terminates.
+ */
+static const char* csv_escape(const char* in, char* out, size_t out_size) {
+    static const char hex[] = "0123456789ABCDEF";
+    if (out_size == 0) return out;
+    if (!in) { out[0] = '\0'; return out; }
+    size_t o = 0;
+    for (const unsigned char* p = (const unsigned char*)in; *p; p++) {
+        unsigned char c = *p;
+        int unsafe = (c < 0x20) || (c >= 0x7f) ||
+                     c == ',' || c == '"' || c == '\\' || c == '%';
+        if (unsafe) {
+            if (o + 3 >= out_size) break;
+            out[o++] = '%'; out[o++] = hex[c >> 4]; out[o++] = hex[c & 0xF];
+        } else {
+            if (o + 1 >= out_size) break;
+            out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+    return out;
+}
+
 static const char* rcode_name(uint8_t rcode) {
     switch (rcode) {
         case 0:  return "NOERROR";
@@ -71,12 +100,16 @@ int log_entry(const char* client_ip, uint16_t port, uint16_t qtype,
     char qt_buf[12];
     if (!qt) { snprintf(qt_buf, sizeof(qt_buf), "TYPE%u", qtype); qt = qt_buf; }
 
-    /* CSV: timestamp,client_ip,port,qtype,domain,rcode,info  (info empty if none) */
+    /* CSV: timestamp,client_ip,port,qtype,domain,rcode,info  (info empty if none).
+     * domain (QNAME) and info (answer data) are attacker-influenced — escape
+     * them so they cannot inject newlines or commas (4.6). */
+    char dom_esc[512], info_esc[512];
     char log_line[512];
     int len = snprintf(log_line, sizeof(log_line), "%s,%s,%u,%s,%s,%s,%s\n",
                        timestamp, client_ip ? client_ip : "-", port,
-                       qt, domain ? domain : "-",
-                       rcode_name(rcode), info ? info : "");
+                       qt, csv_escape(domain ? domain : "-", dom_esc, sizeof(dom_esc)),
+                       rcode_name(rcode),
+                       csv_escape(info ? info : "", info_esc, sizeof(info_esc)));
 
     /* snprintf returns the number of bytes it WOULD have written, even when
      * it truncated.  Without clamping, write() reads past the end of log_line

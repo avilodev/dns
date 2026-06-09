@@ -36,7 +36,6 @@ struct AuthDomain {
 
     // A record (plain IPv4)
     char     ip[16];           // "0.0.0.0" if not an A record
-    bool     is_blocked;       // Return NXDOMAIN for this name
 
     // AAAA record
     bool     has_ipv6;
@@ -95,7 +94,7 @@ int load_auth_domains(const char* filename);
 void reload_auth_domains(const char* filename);
 
 /* Thread-safe A-record lookup.
- * Returns IP string, "NXDOMAIN" if blocked, or NULL if not found. */
+ * Returns IP string, or NULL if not found. */
 const char* lookup_auth_domain(const char* full_domain);
 
 #endif // AUTH_H

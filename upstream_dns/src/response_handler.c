@@ -302,9 +302,15 @@ char* extract_ns_name(struct Packet* response)
 }
 
 /*
- * Extract ALL nameservers with their glue records
+ * Extract ALL nameservers with their glue records.
+ *
+ * Glue A records are only accepted when their owner is in-bailiwick for the
+ * delegated zone (4.1): an authoritative server must not be able to supply
+ * glue for a name outside the zone it is delegating, which would otherwise let
+ * it redirect arbitrary victim names to an attacker-controlled address.
  */
-NSCandidateList* extract_all_ns_with_glue(struct Packet* response)
+NSCandidateList* extract_all_ns_with_glue(struct Packet* response,
+                                          const char* server_zone)
 {
     if (!response || !response->request || response->recv_len < HEADER_LEN) {
         return NULL;
@@ -382,8 +388,15 @@ NSCandidateList* extract_all_ns_with_glue(struct Packet* response)
             uint16_t type = ntohs(*(uint16_t*)(buffer + pos));
             uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
             
-            // Found matching A record
+            // Found matching A record.  Accept the glue only when its owner is
+            // within the bailiwick of the zone the answering server serves (4.1)
+            // — drop glue for any out-of-zone name an attacker might inject.
+            // The reference is the server's own zone (root contains everything),
+            // NOT the delegated child: a TLD's nameservers commonly live in a
+            // different TLD (e.g. com -> *.gtld-servers.net), and that glue is
+            // legitimately in-bailiwick of the parent that provided it.
             if (record_name && strcasecmp(record_name, list->candidates[i].ns_name) == 0 &&
+                name_in_bailiwick(record_name, server_zone) &&
                 type == QTYPE_A && rdlength == 4 && pos + 10 + 4 <= buffer_len) {
 
                 char* ip = malloc(INET_ADDRSTRLEN);

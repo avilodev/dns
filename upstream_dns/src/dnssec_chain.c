@@ -328,10 +328,6 @@ static int try_promote_dnskey(DnssecChainCtx *ctx,
 
         int r = dnssec_chain_verify_ds(&pd->ds, dk, owner_wire, owner_len);
         if (r == 1) {
-            fprintf(stderr,
-                    "DNSSEC chain: ✓ DS verified for zone '%s' "
-                    "key_tag=%u alg=%u — key added to trust chain\n",
-                    zone, key_tag, dk->algorithm);
             dnssec_chain_add_key(ctx, zone, dk, key_tag);
 
             /* Unlink and free this PendingDS */
@@ -345,7 +341,7 @@ static int try_promote_dnskey(DnssecChainCtx *ctx,
         } else {
             if (r == 0) {
                 fprintf(stderr,
-                        "DNSSEC chain: ✗ DS digest mismatch for zone '%s' "
+                        "DNSSEC chain: DS digest mismatch for zone '%s' "
                         "key_tag=%u alg=%u\n",
                         zone, key_tag, dk->algorithm);
             }
@@ -421,11 +417,6 @@ static void scan_pass(DnssecChainCtx *ctx,
             pd->ds          = ds;
             pd->next        = ctx->pending_ds;
             ctx->pending_ds = pd;
-
-            fprintf(stderr,
-                    "DNSSEC chain: stored DS for zone '%s' "
-                    "key_tag=%u alg=%u digest_type=%u\n",
-                    zone_str, ds.key_tag, ds.algorithm, ds.digest_type);
         }
 
         /* ---------- Pass 2: match DNSKEY records against pending DS ---------- */

@@ -64,11 +64,12 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
         return pkt;
     }
 
-    // Validate question count
-    if (pkt->qdcount == 0) {
-        fprintf(stderr, "Error: No questions in DNS query\n");
-        free_packet(pkt);
-        return NULL;
+    // Validate question count — exactly one question (RFC 1035).  The EDNS OPT
+    // scan below assumes a single question, so reject anything else with FORMERR.
+    if (pkt->qdcount != 1) {
+        fprintf(stderr, "Error: qdcount=%u (expected 1) — FORMERR\n", pkt->qdcount);
+        pkt->rcode = RCODE_FORMAT_ERROR;
+        return pkt;
     }
 
     // Parse domain name from question section
@@ -118,7 +119,7 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
         }
         
         /* Lowercase each byte while copying — DNS names are case-insensitive
-         * (RFC 1035 §3.1) and auth_domains.txt stores only lowercase. */
+         * (RFC 1035 §3.1) and config.txt stores only lowercase. */
         for (int j = 0; j < label_len; j++)
             domain[domain_len + j] = (char)tolower((unsigned char)buffer[pos + j]);
         domain_len += label_len;

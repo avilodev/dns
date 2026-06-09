@@ -56,11 +56,12 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
         return pkt;
     }
 
-    // Validate question count
-    if (pkt->qdcount == 0) {
-        fprintf(stderr, "Error: No questions in DNS query\n");
-        free_packet(pkt);
-        return NULL;
+    // Validate question count — exactly one question (RFC 1035).  The EDNS OPT
+    // scan below assumes a single question, so reject anything else with FORMERR.
+    if (pkt->qdcount != 1) {
+        fprintf(stderr, "Error: qdcount=%u (expected 1) — FORMERR\n", pkt->qdcount);
+        pkt->rcode = RCODE_FORMAT_ERROR;
+        return pkt;
     }
 
     // Parse domain name from question section
@@ -400,6 +401,16 @@ struct Packet* parse_response(char* buffer, ssize_t recv_len) {
         if (domain_len > 0) {
             pkt->full_domain = strdup(domain);
             parse_domain_components(pkt, domain);
+        } else {
+            /* Root QNAME (a single zero label): represent as "." so it matches
+             * the query side (format_resolver) and the rest of the resolver.
+             * Otherwise full_domain stays NULL and the RFC 5452 question match
+             * in query_server_with_timeout rejects every root response — notably
+             * the '.' DNSKEY fetched during DNSSEC bootstrap, which then never
+             * seeds the chain-of-trust, so validated answers never get the AD
+             * bit. */
+            pkt->full_domain = strdup(".");
+            parse_domain_components(pkt, ".");
         }
 
         // Advance past the QNAME terminator.  For plain-label format the loop

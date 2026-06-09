@@ -6,6 +6,7 @@
 #include "request.h"
 #include "resolve.h"
 #include "cache.h"
+#include "access_control.h"
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -15,7 +16,10 @@
 #include <inttypes.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <pwd.h>
+#include <grp.h>
 
 Config g_config;
 Hints* g_hints[13];
@@ -30,9 +34,52 @@ static void write_pid_file(void) {
     fprintf(f, "%d\n", (int)getpid());
     fclose(f);
 }
-static void remove_pid_file(void) 
-{ 
-    unlink(PID_FILE_PATH); 
+static void remove_pid_file(void)
+{
+    unlink(PID_FILE_PATH);
+}
+
+/*
+ * Drop from root to an unprivileged user[:group] after the listeners are bound.
+ * The upstream resolver's default port (5335) does not need root, but if it is
+ * started as root (e.g. a systemd unit without User=) we still drop so the
+ * network-facing parser/validator does not run privileged.  No-op when not
+ * root; fatal on any failure.  `spec` is "user" or "user:group".
+ */
+static void drop_privileges(const char *spec) {
+    if (geteuid() != 0) return;                 /* not root — nothing to drop */
+    if (!spec || !*spec) {
+        fprintf(stderr, "Warning: running as root with no -U user; "
+                        "NOT dropping privileges (set -U or a systemd User=)\n");
+        return;
+    }
+
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s", spec);
+    char *colon = strchr(buf, ':');
+    const char *gname = NULL;
+    if (colon) { *colon = '\0'; gname = colon + 1; }
+
+    struct passwd *pw = getpwnam(buf);
+    if (!pw) { fprintf(stderr, "Error: -U unknown user '%s'\n", buf); exit(EXIT_FAILURE); }
+    uid_t uid = pw->pw_uid;
+    gid_t gid = pw->pw_gid;
+    if (gname && *gname) {
+        struct group *gr = getgrnam(gname);
+        if (!gr) { fprintf(stderr, "Error: -U unknown group '%s'\n", gname); exit(EXIT_FAILURE); }
+        gid = gr->gr_gid;
+    }
+    if (uid == 0) { fprintf(stderr, "Error: -U user '%s' is root\n", buf); exit(EXIT_FAILURE); }
+
+    if (setgroups(1, &gid) != 0) { perror("Error: setgroups"); exit(EXIT_FAILURE); }
+    if (setgid(gid)        != 0) { perror("Error: setgid");    exit(EXIT_FAILURE); }
+    if (setuid(uid)        != 0) { perror("Error: setuid");    exit(EXIT_FAILURE); }
+    if (setuid(0) == 0) {
+        fprintf(stderr, "Error: privilege drop failed — still able to regain root\n");
+        exit(EXIT_FAILURE);
+    }
+    fprintf(stderr, "Dropped privileges to %s (uid=%d gid=%d)\n",
+            buf, (int)uid, (int)gid);
 }
 
 /* Protects g_ns_cache pointer across SIGHUP swaps and concurrent readers.
@@ -50,26 +97,18 @@ static _Atomic uint64_t g_total_queries;
 /* qtype_to_string() is exported from utils.c — declared in utils.h */
 
 static void print_qtype_stats(void) {
-    uint64_t total = atomic_load(&g_total_queries);
-    printf("\n╔════════════════════════════════════════════╗\n");
-    printf("║           QUERY STATISTICS                 ║\n");
-    printf("╠════════════════════════════════════════════╣\n");
-    printf("║ Total queries: %8" PRIu64 "               ║\n", total);
-    printf("╠════════════════════════════════════════════╣\n");
+    printf("Query statistics:\n");
+    printf("  Total queries: %" PRIu64 "\n", atomic_load(&g_total_queries));
     for (int i = 1; i <= 255; i++) {
         uint64_t c = atomic_load(&g_qtype_counters[i]);
         if (c == 0) continue;
         const char* name = qtype_to_string((uint16_t)i);
-        if (name)
-            printf("║  %-10s %8" PRIu64 "               ║\n", name, c);
-        else
-            printf("║  TYPE%-5d %8" PRIu64 "               ║\n", i, c);
+        if (name) printf("  %-10s %" PRIu64 "\n", name, c);
+        else      printf("  TYPE%-6d %" PRIu64 "\n", i, c);
     }
     /* index 0 = "other" (qtype >= 256, should not occur in practice) */
     uint64_t other = atomic_load(&g_qtype_counters[0]);
-    if (other)
-        printf("║  %-10s %8" PRIu64 "               ║\n", "OTHER", other);
-    printf("╚════════════════════════════════════════════╝\n\n");
+    if (other) printf("  %-10s %" PRIu64 "\n", "OTHER", other);
 }
 
 /* --------------------------------------------------------------------------
@@ -78,7 +117,24 @@ static void print_qtype_stats(void) {
  * The info column is empty when there is no answer detail.
  * -------------------------------------------------------------------------- */
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int g_log_fd = -1;
+static int   g_log_fd    = -1;
+static off_t g_log_bytes = 0;   /* bytes in the log since last truncate (g_log_mutex) */
+
+/* Cap upstream.log at this size.  When it is exceeded the log is truncated in
+ * place (ftruncate to 0) — no rotation, no upstream.log.1, no other file is
+ * ever created.  Replaces the previous logrotate-based rotation. */
+#define LOG_MAX_BYTES (20 * 1024 * 1024)
+
+/* Open the log file (O_APPEND) and seed g_log_bytes from its current size so the
+ * in-place cap accounts for bytes already on disk.  Caller holds g_log_mutex.
+ * Returns the fd, or -1 on failure. */
+static int log_open_locked(void) {
+    int fd = open(LOG_FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (fd < 0) return -1;
+    struct stat st;
+    g_log_bytes = (fstat(fd, &st) == 0) ? st.st_size : 0;
+    return fd;
+}
 
 static const char* rcode_name_up(uint8_t rcode) {
     switch (rcode) {
@@ -94,13 +150,41 @@ static const char* rcode_name_up(uint8_t rcode) {
     }
 }
 
+/*
+ * Percent-encode CSV-unsafe bytes (known_issues 4.6).  The QNAME and answer
+ * fields are attacker-influenced and DNS labels may carry arbitrary octets;
+ * encoding control chars, commas, double-quotes, backslash, percent, and
+ * non-ASCII bytes as %XX prevents log-line injection / column-splitting while
+ * keeping ordinary names readable.  Always NUL-terminates.
+ */
+static const char* csv_escape(const char* in, char* out, size_t out_size) {
+    static const char hex[] = "0123456789ABCDEF";
+    if (out_size == 0) return out;
+    if (!in) { out[0] = '\0'; return out; }
+    size_t o = 0;
+    for (const unsigned char* p = (const unsigned char*)in; *p; p++) {
+        unsigned char c = *p;
+        int unsafe = (c < 0x20) || (c >= 0x7f) ||
+                     c == ',' || c == '"' || c == '\\' || c == '%';
+        if (unsafe) {
+            if (o + 3 >= out_size) break;
+            out[o++] = '%'; out[o++] = hex[c >> 4]; out[o++] = hex[c & 0xF];
+        } else {
+            if (o + 1 >= out_size) break;
+            out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+    return out;
+}
+
 static void log_query(const char* client_ip, uint16_t port,
                       uint16_t qtype_val, const char* domain,
                       uint8_t rcode, const char* info) {
     pthread_mutex_lock(&g_log_mutex);
 
     if (g_log_fd < 0) {
-        g_log_fd = open(LOG_FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
+        g_log_fd = log_open_locked();
         if (g_log_fd < 0) {
             perror("Warning: Failed to open upstream log file");
             pthread_mutex_unlock(&g_log_mutex);
@@ -118,12 +202,16 @@ static void log_query(const char* client_ip, uint16_t port,
     char qt_buf[12];
     if (!qt) { snprintf(qt_buf, sizeof(qt_buf), "TYPE%u", qtype_val); qt = qt_buf; }
 
-    /* CSV: timestamp,client_ip,port,qtype,domain,rcode,info  (info empty if none) */
+    /* CSV: timestamp,client_ip,port,qtype,domain,rcode,info  (info empty if none).
+     * domain (QNAME) and info (answer data) are attacker-influenced — escape
+     * them so they cannot inject newlines or commas (4.6). */
+    char dom_esc[512], info_esc[512];
     char line[512];
     int len = snprintf(line, sizeof(line), "%s,%s,%u,%s,%s,%s,%s\n",
                        ts, client_ip ? client_ip : "-", port,
-                       qt, domain ? domain : "-", rcode_name_up(rcode),
-                       info ? info : "");
+                       qt, csv_escape(domain ? domain : "-", dom_esc, sizeof(dom_esc)),
+                       rcode_name_up(rcode),
+                       csv_escape(info ? info : "", info_esc, sizeof(info_esc)));
 
     /* snprintf returns the number of bytes it WOULD have written, even when
      * it truncated.  Without clamping, write() reads past the end of line[]
@@ -131,8 +219,16 @@ static void log_query(const char* client_ip, uint16_t port,
      * gets lost, causing log entries to run together). */
     if (len > 0) {
         if (len >= (int)sizeof(line)) len = (int)sizeof(line) - 1;
-        if (write(g_log_fd, line, len) < 0)
+        if (write(g_log_fd, line, len) < 0) {
             perror("Warning: Upstream log write failed");
+        } else {
+            /* In-place size cap: once the log passes LOG_MAX_BYTES, truncate it
+             * back to empty.  O_APPEND means the next write resumes at offset 0,
+             * so the file is reset in place and no other file is ever created. */
+            g_log_bytes += len;
+            if (g_log_bytes >= LOG_MAX_BYTES && ftruncate(g_log_fd, 0) == 0)
+                g_log_bytes = 0;
+        }
     }
 
     pthread_mutex_unlock(&g_log_mutex);
@@ -147,7 +243,7 @@ static void log_close_upstream(void) {
 static void log_reopen_upstream(void) {
     pthread_mutex_lock(&g_log_mutex);
     if (g_log_fd >= 0) { close(g_log_fd); g_log_fd = -1; }
-    g_log_fd = open(LOG_FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    g_log_fd = log_open_locked();
     if (g_log_fd < 0) perror("Warning: log_reopen: Failed to open upstream log file");
     pthread_mutex_unlock(&g_log_mutex);
 }
@@ -195,7 +291,7 @@ void signal_handler(int signum) {
             if (stats_pipe[1] >= 0) {
                 char b = 's';
                 // write() is async-signal-safe; O_NONBLOCK prevents blocking
-                write(stats_pipe[1], &b, 1);
+                if (write(stats_pipe[1], &b, 1) < 0) { /* best-effort */ }
             }
             break;
         default:
@@ -269,15 +365,39 @@ static void send_servfail(int sock, const struct sockaddr* client_addr, socklen_
 }
 
 /*
+ * Send a minimal REFUSED reply (RFC 1035 RCODE 5) — used to reject queries
+ * from sources outside the configured allow-list (known_issues 4.3).  A small
+ * header-only reply keeps the refusal from being usable for amplification.
+ */
+static void send_refused(int sock, const struct sockaddr* client_addr,
+                         socklen_t addr_len,
+                         const unsigned char* req_buf, ssize_t req_len) {
+    if (!client_addr || !req_buf || req_len < 2) return;
+
+    unsigned char resp[12] = {0};
+    resp[0] = req_buf[0];  // Transaction ID high byte
+    resp[1] = req_buf[1];  // Transaction ID low byte
+    // QR=1, copy OPCODE and RD from query, clear AA and TC
+    resp[2] = 0x80 | (req_buf[2] & 0x79);
+    // RA=1, RCODE=REFUSED(5)
+    resp[3] = 0x80 | RCODE_REFUSED;
+    // qdcount, ancount, nscount, arcount all 0
+
+    sendto(sock, resp, sizeof(resp), 0, client_addr, addr_len);
+}
+
+/*
  * Lightweight inline parser: extract the QNAME (dotted string) and QTYPE
  * from a raw DNS query packet without allocating any memory.
  * Returns 1 on success, 0 if the packet is malformed or not a standard query.
  */
 static int quick_parse_query(const char* buf, ssize_t len,
                               char* domain_out, int domain_max,
-                              uint16_t* qtype_out, bool* do_out)
+                              uint16_t* qtype_out, bool* do_out,
+                              uint16_t* edns_size_out)
 {
     if (do_out) *do_out = false;
+    if (edns_size_out) *edns_size_out = 0;   /* 0 = client sent no EDNS OPT */
     if (len < 17) return 0;                          // header(12) + min QNAME(1) + null(1) + QTYPE(2) + QCLASS(2)
     if (buf[2] & 0x80) return 0;                     // QR=1 means response, not a query
     if ((uint8_t)buf[4] != 0 || (uint8_t)buf[5] != 1) return 0;  // QDCOUNT must be 1
@@ -302,10 +422,12 @@ static int quick_parse_query(const char* buf, ssize_t len,
     if (pos + 4 > len) return 0;
     *qtype_out = (uint16_t)(((uint8_t)buf[pos] << 8) | (uint8_t)buf[pos + 1]);
 
-    /* Scan the additional section for the EDNS OPT record to learn whether the
-     * client set the DO (DNSSEC OK) bit — the fast path needs this to avoid
-     * serving a signed-but-unvalidated cached answer to a validating client. */
-    if (do_out) {
+    /* Scan the additional section for the EDNS OPT record to learn (a) whether
+     * the client set the DO (DNSSEC OK) bit — needed so the fast path never
+     * serves a signed-but-unvalidated cached answer to a validating client —
+     * and (b) the client's advertised UDP payload size, needed so the fast
+     * path can apply EDNS-aware TC truncation just like the worker path. */
+    if (do_out || edns_size_out) {
         int p = pos + 4;  /* past QTYPE(2) + QCLASS(2) */
         int an = ((uint8_t)buf[6]  << 8) | (uint8_t)buf[7];
         int ns = ((uint8_t)buf[8]  << 8) | (uint8_t)buf[9];
@@ -319,17 +441,121 @@ static int quick_parse_query(const char* buf, ssize_t len,
                 p += 1 + l;
             }
             if (p + 10 > len) break;
-            uint16_t rtype = ((uint8_t)buf[p] << 8) | (uint8_t)buf[p + 1];
+            uint16_t rtype  = ((uint8_t)buf[p] << 8) | (uint8_t)buf[p + 1];
+            uint16_t rclass = ((uint8_t)buf[p + 2] << 8) | (uint8_t)buf[p + 3];
             uint32_t rttl  = ((uint32_t)(uint8_t)buf[p + 4] << 24) |
                              ((uint32_t)(uint8_t)buf[p + 5] << 16) |
                              ((uint32_t)(uint8_t)buf[p + 6] <<  8) |
                               (uint32_t)(uint8_t)buf[p + 7];
             uint16_t rdlen = ((uint8_t)buf[p + 8] << 8) | (uint8_t)buf[p + 9];
-            if (rtype == 41) { *do_out = (rttl & 0x00008000u) != 0; break; }  /* OPT */
+            if (rtype == 41) {                       /* OPT: CLASS = UDP size */
+                if (do_out)        *do_out = (rttl & 0x00008000u) != 0;
+                if (edns_size_out) *edns_size_out = rclass ? rclass : 512;
+                break;
+            }
             p += 10 + rdlen;
         }
     }
     return 1;
+}
+
+/*
+ * Apply EDNS-aware UDP truncation to a finished response buffer, in place.
+ * Shared by the worker path (process_query) and the zero-alloc cache fast
+ * path so the two can never drift (the fast path previously skipped this and
+ * could send a >512-byte UDP answer to a non-EDNS client — RFC 1035 §4.2.1).
+ *
+ *   *buf / *len    : malloc'd response bytes; updated (may be realloc'd).
+ *   edns_udp_size  : client's advertised EDNS UDP payload size, or 0 when the
+ *                    client sent no OPT (→ 512-byte limit).
+ *
+ * Over the limit → set TC=1, drop the answer/authority sections, and (for EDNS
+ * clients) append a bare OPT RR (RFC 6891 §7).  Truncation only shrinks the
+ * buffer, so that OPT always fits without a realloc.  Within the limit, a bare
+ * OPT is appended for EDNS clients that lack one (best-effort).
+ */
+static void finalize_udp_truncation(char** buf, ssize_t* len, uint16_t edns_udp_size)
+{
+    if (!buf || !*buf || !len || *len < HEADER_LEN) return;
+
+    bool     edns      = (edns_udp_size != 0);
+    uint16_t udp_limit = (edns && edns_udp_size >= 512) ? edns_udp_size : 512;
+    unsigned char* r   = (unsigned char*)*buf;
+
+    if (*len > (ssize_t)udp_limit) {
+        /* Find end of the question section. */
+        int qend = HEADER_LEN;
+        while (qend < *len) {
+            uint8_t ll = r[qend];
+            if (ll == 0)             { qend++; break; }
+            if ((ll & 0xC0) == 0xC0) { qend += 2; break; }
+            qend += 1 + ll;
+        }
+        if (qend + 4 <= *len) qend += 4;       /* QTYPE + QCLASS */
+
+        r[2] |= 0x02;                           /* TC = 1                  */
+        r[6] = 0; r[7] = 0;                     /* ANCOUNT = 0             */
+        r[8] = 0; r[9] = 0;                     /* NSCOUNT = 0             */
+
+        if (edns && qend + 11 <= *len) {        /* room guaranteed (shrank) */
+            r[10] = 0; r[11] = 1;               /* ARCOUNT = 1             */
+            r[qend + 0] = 0x00;                 /* root owner              */
+            r[qend + 1] = 0x00; r[qend + 2] = 0x29;            /* TYPE = OPT */
+            r[qend + 3] = (uint8_t)(udp_limit >> 8);
+            r[qend + 4] = (uint8_t)(udp_limit & 0xFF);         /* UDP size  */
+            r[qend + 5] = 0x00; r[qend + 6] = 0x00;            /* xRCODE/ver */
+            r[qend + 7] = 0x00; r[qend + 8] = 0x00;            /* flags     */
+            r[qend + 9] = 0x00; r[qend +10] = 0x00;            /* RDLEN = 0 */
+            *len = qend + 11;
+        } else {
+            r[10] = 0; r[11] = 0;               /* ARCOUNT = 0             */
+            *len = qend;
+        }
+        return;
+    }
+
+    /* Within the limit: ensure an OPT is present for EDNS clients (RFC 6891 §7). */
+    if (edns) {
+        uint16_t arcount = (uint16_t)((r[10] << 8) | r[11]);
+        if (arcount == 0 && *len + 11 <= MAXLINE) {
+            unsigned char* np = realloc(*buf, (size_t)*len + 11);
+            if (np) {
+                int base = (int)*len;
+                *buf = (char*)np;
+                np[10] = 0; np[11] = 1;
+                np[base + 0] = 0x00;
+                np[base + 1] = 0x00; np[base + 2] = 0x29;
+                np[base + 3] = (uint8_t)(udp_limit >> 8);
+                np[base + 4] = (uint8_t)(udp_limit & 0xFF);
+                np[base + 5] = 0x00; np[base + 6] = 0x00;
+                np[base + 7] = 0x00; np[base + 8] = 0x00;
+                np[base + 9] = 0x00; np[base +10] = 0x00;
+                *len += 11;
+            }
+        }
+    }
+}
+
+/*
+ * Normalize the header flags of a forwarded (recursively-resolved) answer in
+ * place.  send_resolver() returns the raw authoritative-server response, whose
+ * flags describe THAT server, not us.  This resolver has no zones of its own, so
+ * every answer it returns is recursive and MUST fix three bits (RFC 1035 §4.1.1):
+ *   - clear AA — we are not authoritative for forwarded names
+ *   - set   RA — this server provides recursion
+ *   - echo  RD — mirror the client's query
+ * QR, opcode, TC, AD, CD and RCODE are left exactly as the upstream set them.
+ * (auth_dns carries the identical fix in its own normalize_forwarded_flags.)
+ */
+static void normalize_forwarded_flags(unsigned char* resp, ssize_t len, int client_rd)
+{
+    if (!resp || len < 4) return;
+    uint16_t flags = ntohs(*(uint16_t*)(resp + 2));
+    flags &= ~(1u << 10);                /* AA = 0 */
+    flags |=  (1u << 7);                 /* RA = 1 */
+    if (client_rd) flags |=  (1u << 8);  /* RD echo */
+    else           flags &= ~(1u << 8);
+    *(uint16_t*)(resp + 2) = htons(flags);
 }
 
 void* process_query(void* arg) {
@@ -462,67 +688,16 @@ void* process_query(void* arg) {
         ((unsigned char*)ret->request)[1] = ret->id & 0xFF;
     }
 
-    // EDNS-aware TC truncation + OPT echo (RFC 6891 §7)
-    {
-        uint16_t udp_limit = (pkt->edns_present && pkt->edns_udp_size >= 512)
-                             ? pkt->edns_udp_size : 512;
-        unsigned char* r = (ret->request && ret->recv_len >= HEADER_LEN)
-                           ? (unsigned char*)ret->request : NULL;
-        if (r && ret->recv_len > (ssize_t)udp_limit) {
-            // Find end of question section in the response
-            int qend = HEADER_LEN;
-            while (qend < ret->recv_len) {
-                uint8_t ll = r[qend];
-                if (ll == 0)          { qend++; break; }
-                if ((ll & 0xC0) == 0xC0) { qend += 2; break; }
-                qend += 1 + ll;
-            }
-            if (qend + 4 <= ret->recv_len) qend += 4;  // skip QTYPE + QCLASS
-            // Set TC=1, clear answer/authority sections
-            r[2] |= 0x02;
-            r[6] = 0; r[7] = 0;  // ANCOUNT = 0
-            r[8] = 0; r[9] = 0;  // NSCOUNT = 0
-            if (pkt->edns_present && qend + 11 <= MAXLINE) {
-                // Append OPT RR: RFC 6891 §7 MUST include OPT in TC=1 response
-                unsigned char* np = realloc(ret->request, qend + 11);
-                if (np) {
-                    ret->request = (char*)np; ret->recv_len = qend + 11; r = np;
-                    r[10] = 0; r[11] = 1;  // ARCOUNT = 1
-                    r[qend +  0] = 0x00;
-                    r[qend +  1] = 0x00; r[qend + 2] = 0x29;  // OPT
-                    r[qend +  3] = (uint8_t)(udp_limit >> 8);
-                    r[qend +  4] = (uint8_t)(udp_limit & 0xFF);
-                    r[qend +  5] = 0x00; r[qend + 6] = 0x00;  // ext RCODE + version
-                    r[qend +  7] = 0x00; r[qend + 8] = 0x00;  // flags
-                    r[qend +  9] = 0x00; r[qend +10] = 0x00;  // RDLEN
-                } else {
-                    ret->recv_len = qend;
-                    r[10] = 0; r[11] = 0;  // ARCOUNT = 0
-                }
-            } else {
-                ret->recv_len = qend;
-                r[10] = 0; r[11] = 0;
-            }
-        } else if (r && pkt->edns_present) {
-            // Response fits. Ensure at least one OPT is present (RFC 6891 §7 MUST).
-            uint16_t arcount = ntohs(*(uint16_t*)(r + 10));
-            if (arcount == 0 && ret->recv_len + 11 <= MAXLINE) {
-                unsigned char* np = realloc(ret->request, ret->recv_len + 11);
-                if (np) {
-                    int base = (int)ret->recv_len;
-                    ret->request = (char*)np; ret->recv_len += 11; r = np;
-                    np[10] = 0; np[11] = 1;
-                    np[base +  0] = 0x00;
-                    np[base +  1] = 0x00; np[base + 2] = 0x29;
-                    np[base +  3] = (uint8_t)(udp_limit >> 8);
-                    np[base +  4] = (uint8_t)(udp_limit & 0xFF);
-                    np[base +  5] = 0x00; np[base + 6] = 0x00;
-                    np[base +  7] = 0x00; np[base + 8] = 0x00;
-                    np[base +  9] = 0x00; np[base +10] = 0x00;
-                }
-            }
-        }
-    }
+    // Present our own recursive-resolver flags, not the upstream authority's
+    // (clear AA, set RA, echo client RD) — RFC 1035 §4.1.1.
+    normalize_forwarded_flags((unsigned char*)ret->request, ret->recv_len, pkt->rd);
+
+    // EDNS-aware TC truncation + OPT echo (RFC 6891 §7), shared with the
+    // cache fast path.  Pass the client's UDP size (0 = no EDNS → 512 limit).
+    finalize_udp_truncation(&ret->request, &ret->recv_len,
+                            pkt->edns_present
+                                ? (pkt->edns_udp_size ? pkt->edns_udp_size : 512)
+                                : 0);
 
     // Log and send response
     {
@@ -592,8 +767,7 @@ void* process_tcp_query(void* arg) {
             sf[1] = (unsigned char)buffer[1];
             sf[2] = 0x80;
             sf[3] = 0x80 | RCODE_SERVER_FAILURE;
-            write(fd, &sf_len_net, 2);
-            write(fd, sf, 12);
+            if (write(fd, &sf_len_net, 2) == 2 && write(fd, sf, 12) == 12) {}
             free(buffer); continue;
         }
 
@@ -605,8 +779,7 @@ void* process_tcp_query(void* arg) {
             notimp[1] = (unsigned char)buffer[1];
             notimp[2] = 0x80;                   // QR=1
             notimp[3] = 0x80 | RCODE_NOTIMP;   // RA=1, RCODE=4
-            write(fd, &notimp_len_net, 2);
-            write(fd, notimp, 12);
+            if (write(fd, &notimp_len_net, 2) == 2 && write(fd, notimp, 12) == 12) {}
             free_packet(pkt); free(buffer);
             continue;
         }
@@ -619,8 +792,7 @@ void* process_tcp_query(void* arg) {
             err[1] = (unsigned char)buffer[1];
             err[2] = 0x80;
             err[3] = 0x80 | (pkt->rcode & 0xF);
-            write(fd, &err_len_net, 2);
-            write(fd, err, 12);
+            if (write(fd, &err_len_net, 2) == 2 && write(fd, err, 12) == 12) {}
             free_packet(pkt); free(buffer); continue;
         }
 
@@ -631,8 +803,7 @@ void* process_tcp_query(void* arg) {
             sf[1] = (unsigned char)buffer[1];
             sf[2] = 0x80;
             sf[3] = 0x80 | RCODE_SERVER_FAILURE;
-            write(fd, &sf_len_net, 2);
-            write(fd, sf, 12);
+            if (write(fd, &sf_len_net, 2) == 2 && write(fd, sf, 12) == 12) {}
             free_packet(pkt); free(buffer); continue;
         }
 
@@ -644,8 +815,7 @@ void* process_tcp_query(void* arg) {
             sf[1] = pkt->id & 0xFF;
             sf[2] = 0x80;
             sf[3] = 0x80 | RCODE_SERVER_FAILURE;
-            write(fd, &sf_len_net, 2);
-            write(fd, sf, 12);
+            if (write(fd, &sf_len_net, 2) == 2 && write(fd, sf, 12) == 12) {}
             free_packet(pkt); free(buffer); continue;
         }
 
@@ -665,8 +835,7 @@ void* process_tcp_query(void* arg) {
             sf[1] = pkt->id & 0xFF;
             sf[2] = 0x80;
             sf[3] = 0x80 | RCODE_SERVER_FAILURE;
-            write(fd, &sf_len_net, 2);
-            write(fd, sf, 12);
+            if (write(fd, &sf_len_net, 2) == 2 && write(fd, sf, 12) == 12) {}
             free_packet(pkt); free_packet(answer); free(buffer);
             continue;
         }
@@ -677,6 +846,9 @@ void* process_tcp_query(void* arg) {
             ((unsigned char*)ret->request)[0] = (ret->id >> 8) & 0xFF;
             ((unsigned char*)ret->request)[1] = ret->id & 0xFF;
         }
+        // Present our own recursive-resolver flags, not the upstream authority's
+        // (clear AA, set RA, echo client RD) — RFC 1035 §4.1.1.
+        normalize_forwarded_flags((unsigned char*)ret->request, ret->recv_len, pkt->rd);
         // Note: do NOT set TC bit for TCP responses — TCP has no 512-byte limit
 
         {
@@ -724,9 +896,26 @@ int main(int argc, char** argv)
 {
     int ret = load_config(argc, argv);
     if (ret < 0) {
-        printf("Usage: ./upstream_dns/bin/dns <-p Upstream DNS port> <-t thread_count> <-q queue_size>\n");
+        printf("Usage: ./bin/upstream_dns <-p port> <-t thread_count> "
+               "<-q queue_size> <-b bind_addr> <-a allow_cidrs> "
+               "<-r per_source_qps>\n");
         exit(1);
     }
+
+    /* Client access control (known_issues 4.3): install the default allow-list
+     * (loopback + RFC1918 + link-local), then apply any -a override.  An open
+     * resolver reachable from the internet is a DNS-amplification vector. */
+    acl_init_defaults();
+    if (g_config.acl_csv && acl_set_list(g_config.acl_csv) != 0) {
+        fprintf(stderr, "Error: invalid -a allow-list: %s\n", g_config.acl_csv);
+        exit(1);
+    }
+    rl_configure(g_config.rate_limit_qps, 0);
+    if (g_config.rate_limit_qps > 0)
+        printf("Rate limiting: %d queries/sec per source IP\n",
+               g_config.rate_limit_qps);
+    printf("Client allow-list active%s\n",
+           g_config.acl_csv ? " (custom)" : " (defaults: loopback + RFC1918)");
 
     // Create self-pipe before setting up signals so the handler can use it.
     // Write end is O_NONBLOCK so writes in signal context never block.
@@ -743,7 +932,6 @@ int main(int argc, char** argv)
     write_pid_file();
 
     // Initialize caches BEFORE creating threads
-    printf("\n=== Initializing DNS Caches ===\n");
     g_ns_cache = ns_cache_create(NS_CACHE_SIZE);
     g_answer_cache = answer_cache_create(ANSWER_CACHE_SIZE);
 
@@ -751,7 +939,6 @@ int main(int argc, char** argv)
         fprintf(stderr, "Error: Failed to create caches\n");
         exit(EXIT_FAILURE);
     }
-    printf("=================================\n\n");
 
     // Start background cache cleanup thread.
     // Not detached — we join it during shutdown to avoid a race where
@@ -789,10 +976,27 @@ int main(int argc, char** argv)
     // Create all listeners
     // Bind the port the user actually requested via -p (defaults to PORT).
     int listen_port = g_config.port;
-    int udp4_sock = create_server_socket(listen_port);
+    int udp4_sock = create_server_socket(listen_port);     // -1 if -b is IPv6
     int udp6_sock = create_server_socket_v6(listen_port);  // may be -1
     int tcp4_sock = create_tcp_socket_v4(listen_port);     // may be -1
     int tcp6_sock = create_tcp_socket_v6(listen_port);     // may be -1
+
+    // At least one UDP listener must be up (both -1 only if -b is unusable).
+    if (udp4_sock < 0 && udp6_sock < 0) {
+        fprintf(stderr, "Error: no UDP listener could be bound"
+                        " (check -b %s)\n",
+                g_config.bind_addr ? g_config.bind_addr : "");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Open the query log while still privileged so its fd survives the drop
+     * (writes use the fd, not the path).  Otherwise the lazy open in the worker
+     * threads would run as the dropped user and fail on a root-owned log dir. */
+    if (g_config.drop_user) log_reopen_upstream();
+
+    /* Listeners are bound — drop root before serving any query (glibc setuid()
+     * applies to every thread, incl. the cache-cleanup thread already running). */
+    drop_privileges(g_config.drop_user);
 
     // Create thread pool — use g_config.queue_size for the work queue
     struct ThreadPoolConfig pool_config = {
@@ -814,9 +1018,9 @@ int main(int argc, char** argv)
     // Build poll() fd set — up to 5 fds: UDP4, stats pipe, UDP6, TCP4, TCP6
     struct pollfd pfds[5];
     int nfds = 0;
-    int udp4_idx, stats_idx, udp6_idx = -1, tcp4_idx = -1, tcp6_idx = -1;
+    int udp4_idx = -1, stats_idx, udp6_idx = -1, tcp4_idx = -1, tcp6_idx = -1;
 
-    pfds[nfds].fd = udp4_sock; pfds[nfds].events = POLLIN; udp4_idx = nfds++;
+    if (udp4_sock >= 0) { pfds[nfds].fd = udp4_sock; pfds[nfds].events = POLLIN; udp4_idx = nfds++; }
     pfds[nfds].fd = stats_pipe[0];
     pfds[nfds].events = (stats_pipe[0] >= 0) ? POLLIN : 0;
     stats_idx = nfds++;
@@ -880,7 +1084,7 @@ int main(int argc, char** argv)
         }
 
         // --- UDP IPv4 — drain all pending datagrams before returning to poll() ---
-        if (pfds[udp4_idx].revents & POLLIN) {
+        if (udp4_idx >= 0 && (pfds[udp4_idx].revents & POLLIN)) {
             while (1) {
                 // Receive into a stack buffer first.
                 // Cache hits are served here with zero heap allocation.
@@ -900,14 +1104,31 @@ int main(int argc, char** argv)
 
                 query_count++;
 
+                // Access control (4.3): reject out-of-allow-list sources with
+                // REFUSED and drop rate-limited sources, BEFORE the cache path
+                // (cached DNSSEC answers are prime amplification payloads).
+                {
+                    struct sockaddr_storage ss;
+                    memset(&ss, 0, sizeof(ss));
+                    memcpy(&ss, &client_addr, client_len);
+                    if (!acl_allows(&ss)) {
+                        send_refused(udp4_sock, (const struct sockaddr*)&client_addr,
+                                     client_len, (unsigned char*)recv_buf, recv_len);
+                        continue;
+                    }
+                    if (!rl_allow(&ss))
+                        continue;   // over rate — drop silently
+                }
+
                 // Cache hit: respond entirely from the poll loop — no thread wakeup.
                 if (g_answer_cache) {
                     char domain_fast[256];
                     uint16_t qtype_fast;
                     bool do_fast = false;
+                    uint16_t edns_size_fast = 0;
                     if (quick_parse_query(recv_buf, recv_len,
                                           domain_fast, sizeof(domain_fast),
-                                          &qtype_fast, &do_fast)) {
+                                          &qtype_fast, &do_fast, &edns_size_fast)) {
                         ssize_t cached_len = 0;
                         char* cached_raw = answer_cache_get_raw(g_answer_cache,
                                                                 domain_fast, qtype_fast,
@@ -928,6 +1149,15 @@ int main(int argc, char** argv)
                                     ((unsigned char*)cached_raw)[0] = (unsigned char)recv_buf[0];
                                     ((unsigned char*)cached_raw)[1] = (unsigned char)recv_buf[1];
                                 }
+                                /* Forwarded answer: our recursive-resolver flags,
+                                 * not the cached upstream authority's (RFC 1035
+                                 * §4.1.1).  RD echoes the query's RD bit. */
+                                normalize_forwarded_flags((unsigned char*)cached_raw,
+                                                          cached_len,
+                                                          (unsigned char)recv_buf[2] & 0x01);
+                                /* Same EDNS-aware truncation the worker applies. */
+                                finalize_udp_truncation(&cached_raw, &cached_len,
+                                                        edns_size_fast);
                                 sendto(udp4_sock, cached_raw, cached_len, 0,
                                        (const struct sockaddr*)&client_addr, client_len);
                                 free(cached_raw);
@@ -981,13 +1211,28 @@ int main(int argc, char** argv)
 
                 query_count++;
 
+                // Access control (4.3) — same gate as the IPv4 path above.
+                {
+                    struct sockaddr_storage ss;
+                    memset(&ss, 0, sizeof(ss));
+                    memcpy(&ss, &client_addr6, client_len);
+                    if (!acl_allows(&ss)) {
+                        send_refused(udp6_sock, (const struct sockaddr*)&client_addr6,
+                                     client_len, (unsigned char*)recv_buf, recv_len);
+                        continue;
+                    }
+                    if (!rl_allow(&ss))
+                        continue;   // over rate — drop silently
+                }
+
                 if (g_answer_cache) {
                     char domain_fast[256];
                     uint16_t qtype_fast;
                     bool do_fast = false;
+                    uint16_t edns_size_fast = 0;
                     if (quick_parse_query(recv_buf, recv_len,
                                           domain_fast, sizeof(domain_fast),
-                                          &qtype_fast, &do_fast)) {
+                                          &qtype_fast, &do_fast, &edns_size_fast)) {
                         ssize_t cached_len = 0;
                         char* cached_raw = answer_cache_get_raw(g_answer_cache,
                                                                 domain_fast, qtype_fast,
@@ -1004,6 +1249,15 @@ int main(int argc, char** argv)
                                     ((unsigned char*)cached_raw)[0] = (unsigned char)recv_buf[0];
                                     ((unsigned char*)cached_raw)[1] = (unsigned char)recv_buf[1];
                                 }
+                                /* Forwarded answer: our recursive-resolver flags,
+                                 * not the cached upstream authority's (RFC 1035
+                                 * §4.1.1).  RD echoes the query's RD bit. */
+                                normalize_forwarded_flags((unsigned char*)cached_raw,
+                                                          cached_len,
+                                                          (unsigned char)recv_buf[2] & 0x01);
+                                /* Same EDNS-aware truncation the worker applies. */
+                                finalize_udp_truncation(&cached_raw, &cached_len,
+                                                        edns_size_fast);
                                 sendto(udp6_sock, cached_raw, cached_len, 0,
                                        (const struct sockaddr*)&client_addr6, client_len);
                                 free(cached_raw);
@@ -1043,15 +1297,24 @@ int main(int argc, char** argv)
             socklen_t clen = sizeof(caddr);
             int cfd = accept(tcp4_sock, (struct sockaddr*)&caddr, &clen);
             if (cfd >= 0) {
-                struct TCPQueryContext* ctx = malloc(sizeof(*ctx));
-                if (ctx) {
-                    ctx->client_fd = cfd;
-                    inet_ntop(AF_INET, &caddr.sin_addr, ctx->client_ip, sizeof(ctx->client_ip));
-                    ctx->client_port = ntohs(caddr.sin_port);
-                    if (threadpool_add_work(thread_pool, process_tcp_query, ctx) < 0) {
-                        close(cfd); free(ctx);
-                    }
-                } else { close(cfd); }
+                // Access control (4.3): drop connections from non-allowed
+                // sources before spending a worker on them.
+                struct sockaddr_storage ss;
+                memset(&ss, 0, sizeof(ss));
+                memcpy(&ss, &caddr, clen);
+                if (!acl_allows(&ss)) {
+                    close(cfd);
+                } else {
+                    struct TCPQueryContext* ctx = malloc(sizeof(*ctx));
+                    if (ctx) {
+                        ctx->client_fd = cfd;
+                        inet_ntop(AF_INET, &caddr.sin_addr, ctx->client_ip, sizeof(ctx->client_ip));
+                        ctx->client_port = ntohs(caddr.sin_port);
+                        if (threadpool_add_work(thread_pool, process_tcp_query, ctx) < 0) {
+                            close(cfd); free(ctx);
+                        }
+                    } else { close(cfd); }
+                }
             }
         }
 
@@ -1061,15 +1324,23 @@ int main(int argc, char** argv)
             socklen_t clen = sizeof(caddr6);
             int cfd = accept(tcp6_sock, (struct sockaddr*)&caddr6, &clen);
             if (cfd >= 0) {
-                struct TCPQueryContext* ctx = malloc(sizeof(*ctx));
-                if (ctx) {
-                    ctx->client_fd = cfd;
-                    inet_ntop(AF_INET6, &caddr6.sin6_addr, ctx->client_ip, sizeof(ctx->client_ip));
-                    ctx->client_port = ntohs(caddr6.sin6_port);
-                    if (threadpool_add_work(thread_pool, process_tcp_query, ctx) < 0) {
-                        close(cfd); free(ctx);
-                    }
-                } else { close(cfd); }
+                // Access control (4.3) — same gate as the IPv4 TCP path above.
+                struct sockaddr_storage ss;
+                memset(&ss, 0, sizeof(ss));
+                memcpy(&ss, &caddr6, clen);
+                if (!acl_allows(&ss)) {
+                    close(cfd);
+                } else {
+                    struct TCPQueryContext* ctx = malloc(sizeof(*ctx));
+                    if (ctx) {
+                        ctx->client_fd = cfd;
+                        inet_ntop(AF_INET6, &caddr6.sin6_addr, ctx->client_ip, sizeof(ctx->client_ip));
+                        ctx->client_port = ntohs(caddr6.sin6_port);
+                        if (threadpool_add_work(thread_pool, process_tcp_query, ctx) < 0) {
+                            close(cfd); free(ctx);
+                        }
+                    } else { close(cfd); }
+                }
             }
         }
     }

@@ -12,11 +12,21 @@ SERVER_PATH   := $(abspath .)
 LOG_DIR       := $(abspath ..)/logs
 LOG_FILE_PATH := $(LOG_DIR)/server.log
 
-CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP \
+# Hardening (known_issues 4.9):
+#   -fno-strict-aliasing   make the wire-parsing type-punning well-defined
+#   -fstack-protector-strong / _FORTIFY_SOURCE=2 / PIE / -Wformat-security
+#                          standard exploit-mitigation hardening
+# The `asan` target overrides HARDEN_* to build with the sanitizers instead.
+HARDEN_CFLAGS  = -fno-strict-aliasing -fstack-protector-strong \
+                 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 \
+                 -fPIE -Wformat -Wformat-security
+HARDEN_LDFLAGS = -pie
+
+CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP $(HARDEN_CFLAGS) \
          -DSERVER_PATH='"$(SERVER_PATH)"' \
          -DLOG_FILE_PATH='"$(LOG_FILE_PATH)"' \
          -DPID_FILE_PATH='"$(PID_FILE_PATH)"'
-LDFLAGS = -pthread -lssl -lcrypto -latomic
+LDFLAGS = -pthread -lssl -lcrypto -latomic $(HARDEN_LDFLAGS)
 
 # Directories
 SRC_DIR = src
@@ -25,7 +35,8 @@ BIN_DIR = bin
 
 # Source files (just the names)
 SOURCES = main.c auth.c logger.c request.c resolve.c \
-          response.c utils.c thread_pool.c dnssec.c
+          response.c utils.c thread_pool.c dnssec.c \
+          access_control.c policy.c dns_synth.c
 
 # Full paths
 SRC_FILES = $(addprefix $(SRC_DIR)/, $(SOURCES))
@@ -58,6 +69,15 @@ clean:
 
 # Rebuild from scratch
 rebuild: clean all
+
+# Sanitizer build (ASan + UBSan) — run the pytest suite against this to surface
+# memory/UB bugs in the hand-rolled wire parsing (known_issues 4.9).
+# Drops the PIE/FORTIFY hardening (incompatible with ASan) for the sanitizers.
+asan: HARDEN_CFLAGS  = -fno-strict-aliasing -fno-omit-frame-pointer \
+                       -fsanitize=address,undefined -fno-sanitize-recover=all
+asan: HARDEN_LDFLAGS = -fsanitize=address,undefined
+asan: clean all
+	@echo "ASan/UBSan build complete: $(TARGET)"
 
 # Run the server
 run: $(TARGET)
@@ -99,4 +119,4 @@ debug:
 # Auto-generated header dependency files (from -MMD -MP)
 -include $(OBJECTS:.o=.d)
 
-.PHONY: all clean rebuild run debug directories install uninstall install-service uninstall-service
+.PHONY: all clean rebuild asan run debug directories install uninstall install-service uninstall-service

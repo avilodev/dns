@@ -12,11 +12,21 @@ SERVER_PATH   := $(abspath .)
 LOG_DIR       := $(abspath ..)/logs
 LOG_FILE_PATH := $(LOG_DIR)/upstream.log
 
-CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP \
+# Hardening (known_issues 4.9):
+#   -fno-strict-aliasing   make the wire-parsing type-punning well-defined
+#   -fstack-protector-strong / _FORTIFY_SOURCE=2 / PIE / -Wformat-security
+#                          standard exploit-mitigation hardening
+# The `asan` target overrides HARDEN_* to build with the sanitizers instead.
+HARDEN_CFLAGS  = -fno-strict-aliasing -fstack-protector-strong \
+                 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 \
+                 -fPIE -Wformat -Wformat-security
+HARDEN_LDFLAGS = -pie
+
+CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP $(HARDEN_CFLAGS) \
          -DSERVER_PATH='"$(SERVER_PATH)"' \
          -DLOG_FILE_PATH='"$(LOG_FILE_PATH)"' \
          -DPID_FILE_PATH='"$(PID_FILE_PATH)"'
-LDFLAGS = -pthread -lssl -lcrypto -latomic
+LDFLAGS = -pthread -lssl -lcrypto -latomic $(HARDEN_LDFLAGS)
 
 # Directories
 SRC_DIR = src
@@ -28,7 +38,8 @@ SOURCES = main.c config.c thread_pool.c utils.c      \
           request.c resolve.c cache.c                \
 		  dns_wire.c dns_packet.c response_handler.c \
 		  cname_handler.c ns_resolver.c udp_client.c \
-		  ns_resolution_context.c dnssec.c dnssec_chain.c
+		  ns_resolution_context.c dnssec.c dnssec_chain.c \
+		  access_control.c
 
 # Full paths
 SRC_FILES = $(addprefix $(SRC_DIR)/, $(SOURCES))
@@ -62,14 +73,24 @@ clean:
 # Rebuild from scratch
 rebuild: clean all
 
+# Sanitizer build (ASan + UBSan) — run the pytest suite against this to surface
+# memory/UB bugs in the hand-rolled wire parsing (known_issues 4.9).
+# Drops the PIE/FORTIFY hardening (incompatible with ASan) for the sanitizers.
+asan: HARDEN_CFLAGS  = -fno-strict-aliasing -fno-omit-frame-pointer \
+                       -fsanitize=address,undefined -fno-sanitize-recover=all
+asan: HARDEN_LDFLAGS = -fsanitize=address,undefined
+asan: clean all
+	@echo "ASan/UBSan build complete: $(TARGET)"
+
 # Run the server
 run: $(TARGET)
 	sudo ./$(TARGET)
 
-# Install binary, systemd service, logrotate config, and cron script
+# Install binary, systemd service, and cron script.
+# Log size is capped in-process (the server truncates upstream.log in place once
+# it passes LOG_MAX_BYTES), so there is no logrotate config to install.
 INSTALL_BIN   = /usr/local/sbin
 SYSTEMD_DIR   = /etc/systemd/system
-LOGROTATE_DIR = /etc/logrotate.d
 
 install: $(TARGET) install-cron
 	install -d $(INSTALL_BIN)
@@ -79,8 +100,6 @@ install: $(TARGET) install-cron
 	    -e 's|@LOG_DIR@|$(LOG_DIR)|g' \
 	    -e 's|@SERVER_PATH@|$(SERVER_PATH)|g' \
 	    upstream_dns.service > $(SYSTEMD_DIR)/upstream_dns.service
-	sed 's|@LOG_FILE_PATH@|$(LOG_FILE_PATH)|g' misc/logrotate-upstream \
-	    > $(LOGROTATE_DIR)/upstream_dns
 	systemctl daemon-reload
 	@echo "Installed upstream_dns. Enable with: systemctl enable --now upstream_dns"
 
@@ -89,7 +108,6 @@ uninstall: uninstall-cron
 	systemctl disable upstream_dns 2>/dev/null || true
 	rm -f $(INSTALL_BIN)/upstream_dns
 	rm -f $(SYSTEMD_DIR)/upstream_dns.service
-	rm -f $(LOGROTATE_DIR)/upstream_dns
 	systemctl daemon-reload
 	@echo "Removed upstream_dns"
 
@@ -118,4 +136,4 @@ debug:
 # Auto-generated header dependency files (from -MMD -MP)
 -include $(OBJECTS:.o=.d)
 
-.PHONY: all clean rebuild run debug directories install uninstall install-cron uninstall-cron install-service uninstall-service
+.PHONY: all clean rebuild asan run debug directories install uninstall install-cron uninstall-cron install-service uninstall-service
