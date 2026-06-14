@@ -77,3 +77,5 @@ A      192.168.1.3
 ads.google.com
 doubleclick.net
 example.com
+example.org
+example.net

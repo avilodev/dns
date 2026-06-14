@@ -27,6 +27,23 @@ typedef struct {
 } NSCandidateList;
 
 bool is_cname_only_answer(struct Packet* response, uint16_t original_qtype);
+
+/* Like is_cname_only_answer(), but also re-chases when the answering server
+ * stapled out-of-bailiwick address records onto a CNAME (RFC 2181 §5.4.1,
+ * anti cache-poisoning).  Returns true when the response has a CNAME but no
+ * record of `original_qtype` whose owner is within `server_zone` (the zone the
+ * answering server is authoritative for).  Pass the current zone, or "" / NULL
+ * for the root (which trusts any final record, preserving prior behaviour). */
+bool cname_answer_needs_rechase(struct Packet* response, uint16_t original_qtype,
+                                const char* server_zone);
+
+/* Rewrite a finished response in place for a client that did NOT set the EDNS
+ * DO bit: strip RRSIG/NSEC/NSEC3/NSEC3PARAM records (unless explicitly queried),
+ * clear the AD bit, and clear DO in the OPT (RFC 4035 §3.2.1, RFC 6840 §5.7).
+ * Only ever shrinks *lenp; compression-safe (leaves records intact rather than
+ * emit a corrupt packet).  `qtype` is the client's queried type. */
+void strip_dnssec_for_non_do(char** bufp, ssize_t* lenp, uint16_t qtype);
+
 char* extract_cname_target(struct Packet* response);
 char* extract_ip_from_answer(struct Packet* response, uint16_t qtype);
 char* extract_ns_server_ip(struct Packet* response, const char* ns_name);

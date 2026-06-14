@@ -50,6 +50,308 @@ bool is_cname_only_answer(struct Packet* response, uint16_t original_qtype)
 }
 
 /*
+ * Decide whether a CNAME answer must be re-chased because the answering server
+ * attached out-of-bailiwick address records to it (RFC 2181 §5.4.1).
+ *
+ * Returns true when the response contains a CNAME but has NO record of
+ * original_qtype whose owner lies within server_zone — the zone the answering
+ * server is authoritative for.  Such "final" records were supplied by a server
+ * with no authority over their names (e.g. a parking host stapling its own A
+ * record onto a CNAME that points into a different provider's zone), so they
+ * must be discarded and the CNAME target re-resolved from its real authority.
+ * Trusting them is a cache-poisoning vector: any authoritative server could
+ * staple A/AAAA records for arbitrary out-of-zone names onto a CNAME answer.
+ *
+ * This supersedes is_cname_only_answer(): when no final record is present at
+ * all it still returns true (ordinary CNAME chasing); when an in-bailiwick
+ * final record IS present it returns false (legitimate same-authority CNAME+A,
+ * kept as a complete answer).  server_zone == NULL or "" (the root) makes every
+ * owner in-bailiwick, so the function returns false and behaviour is unchanged
+ * on the root / non-validating fast paths.
+ */
+bool cname_answer_needs_rechase(struct Packet* response, uint16_t original_qtype,
+                                const char* server_zone)
+{
+    if (!response || !response->request || response->recv_len < HEADER_LEN) {
+        return false;
+    }
+
+    if (response->ancount == 0) {
+        return false;
+    }
+
+    const char* zone = server_zone ? server_zone : "";
+
+    unsigned char* buffer = (unsigned char*)response->request;
+    int pos = HEADER_LEN;
+    int buffer_len = response->recv_len;
+
+    bool has_cname = false;
+    bool has_inbailiwick_final = false;
+
+    // Skip question section
+    for (int i = 0; i < response->qdcount && pos < buffer_len; i++) {
+        skip_dns_name(buffer, buffer_len, &pos);
+        pos += 4; // QTYPE + QCLASS
+    }
+
+    // Check answer section
+    for (int i = 0; i < response->ancount && pos < buffer_len; i++) {
+        char* owner = parse_dns_name_from_wire(buffer, buffer_len, pos);
+        skip_dns_name(buffer, buffer_len, &pos);
+
+        if (pos + 10 > buffer_len) {
+            free(owner);
+            break;
+        }
+
+        uint16_t type = ntohs(*(uint16_t*)(buffer + pos));
+        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+
+        if (type == QTYPE_CNAME) {
+            has_cname = true;
+        } else if (type == original_qtype || original_qtype == QTYPE_ANY) {
+            /* A final record only counts when its owner is within the zone the
+             * answering server is authoritative for.  Out-of-bailiwick owners
+             * are stapled-on and must not satisfy the query. */
+            if (owner && name_in_bailiwick(owner, zone)) {
+                has_inbailiwick_final = true;
+            }
+        }
+
+        free(owner);
+        pos += 10 + rdlength;
+    }
+
+    return has_cname && !has_inbailiwick_final;
+}
+
+/* ==========================================================================
+ * DNSSEC stripping for non-DO clients (RFC 4035 §3.2.1, RFC 6840 §5.7)
+ * ==========================================================================
+ *
+ * This resolver fetches DNSSEC records (DO=1) from authoritative servers so it
+ * can validate.  But a *client* that did not set the DO bit must be answered
+ * exactly like a plain, non-DNSSEC resolver: no RRSIG / NSEC / NSEC3 records,
+ * the AD bit cleared, and DO=0 in the OPT — matching what 1.1.1.1 returns.
+ * Leaving the DNSSEC machinery in leaks signatures, inflates UDP answers
+ * (fragmentation / amplification), and is non-conformant.
+ */
+
+#define WIRE_TYPE_OPT 41
+
+/* DNSSEC "meta" RR types — present only to convey signatures / authenticated
+ * denial.  Stripped for non-DO clients unless explicitly the queried type. */
+static bool is_dnssec_meta_type(uint16_t t)
+{
+    return t == QTYPE_RRSIG || t == QTYPE_NSEC ||
+           t == QTYPE_NSEC3 || t == QTYPE_NSEC3PARAM;
+}
+
+/* Walk one wire-format name starting at `off` WITHOUT following pointers.
+ * Sets *bad_ptr when a compression pointer targets an offset >= `threshold`
+ * (i.e. into or past a region that byte-removal would shift).  Returns the
+ * offset just past the name, or -1 on a malformed name. */
+static int scan_name_skip(const unsigned char* m, int len, int off,
+                          int threshold, bool* bad_ptr)
+{
+    while (off >= 0 && off < len) {
+        uint8_t l = m[off];
+        if (l == 0) return off + 1;
+        if ((l & 0xC0) == 0xC0) {
+            if (off + 2 > len) return -1;
+            int target = ((l & 0x3F) << 8) | m[off + 1];
+            if (target >= threshold) *bad_ptr = true;
+            return off + 2;
+        }
+        if (l > 63) return -1;
+        off += 1 + l;
+    }
+    return -1;
+}
+
+/* Read the name at in[off] (following compression) and append it UNCOMPRESSED
+ * to out[*op].  Returns the offset in `in` just past the name *as stored at
+ * off* (i.e. not following the pointer), or -1 on a malformed name / overflow.
+ * A pointer-chase guard caps following at 128 hops. */
+static int copy_name_decompressed(const unsigned char* in, int len, int off,
+                                  unsigned char* out, int out_cap, int* op)
+{
+    int ret = -1;       /* input offset just past the in-place name */
+    int cur = off;
+    int guard = 0;
+    while (cur >= 0 && cur < len) {
+        uint8_t l = in[cur];
+        if (l == 0) {
+            if (ret < 0) ret = cur + 1;
+            if (*op + 1 > out_cap) return -1;
+            out[(*op)++] = 0;
+            return ret;
+        }
+        if ((l & 0xC0) == 0xC0) {
+            if (cur + 2 > len) return -1;
+            int target = ((l & 0x3F) << 8) | in[cur + 1];
+            if (target >= cur) return -1;            /* must point backward */
+            if (ret < 0) ret = cur + 2;
+            cur = target;
+            if (++guard > 128) return -1;
+            continue;
+        }
+        if (l > 63) return -1;
+        if (cur + 1 + l > len) return -1;
+        if (*op + 1 + l > out_cap) return -1;
+        out[(*op)++] = l;
+        memcpy(out + *op, in + cur + 1, l);
+        *op += l;
+        cur += 1 + l;
+    }
+    return -1;
+}
+
+/* Append one RR's RDATA to out, decompressing any embedded domain names.  Only
+ * the legacy compressible types may carry compressed names in RDATA (RFC 3597
+ * §4); every other type's RDATA is opaque and copied verbatim.  Returns false
+ * on malformed input / overflow. */
+static bool emit_rdata_decompressed(const unsigned char* m, int len, uint16_t type,
+                                    int rdata, int rdlen, unsigned char* out,
+                                    int out_cap, int* op)
+{
+    switch (type) {
+        case QTYPE_NS: case QTYPE_CNAME: case QTYPE_PTR:
+            return copy_name_decompressed(m, len, rdata, out, out_cap, op) >= 0;
+        case QTYPE_MX: {
+            if (rdlen < 3 || *op + 2 > out_cap) return false;
+            memcpy(out + *op, m + rdata, 2); *op += 2;          /* preference */
+            return copy_name_decompressed(m, len, rdata + 2, out, out_cap, op) >= 0;
+        }
+        case QTYPE_SOA: {
+            int p = copy_name_decompressed(m, len, rdata, out, out_cap, op);   /* MNAME */
+            if (p < 0) return false;
+            p = copy_name_decompressed(m, len, p, out, out_cap, op);           /* RNAME */
+            if (p < 0 || p + 20 > rdata + rdlen || *op + 20 > out_cap) return false;
+            memcpy(out + *op, m + p, 20); *op += 20;            /* 5×uint32 */
+            return true;
+        }
+        default:    /* opaque RDATA (A, AAAA, TXT, SRV, DS, DNSKEY, OPT, ...) */
+            if (rdlen < 0 || *op + rdlen > out_cap) return false;
+            memcpy(out + *op, m + rdata, (size_t)rdlen); *op += rdlen;
+            return true;
+    }
+}
+
+/*
+ * Rewrite a finished response for a client that did NOT set DO:
+ *   - drop RRSIG / NSEC / NSEC3 / NSEC3PARAM records (unless == qtype),
+ *   - clear the AD bit, clear the DO bit in any OPT.
+ *
+ * The rebuild decompresses every name, so removing interleaved records can never
+ * orphan a compression pointer (the failure mode of naive byte-removal: glue
+ * whose owner name was first introduced after the first dropped RRSIG).  On any
+ * malformed input or buffer overflow the original packet is left untouched
+ * (AD/OPT-DO are still cleared in place) rather than risk a corrupt answer.
+ */
+void strip_dnssec_for_non_do(char** bufp, ssize_t* lenp, uint16_t qtype)
+{
+    if (!bufp || !*bufp || !lenp || *lenp < HEADER_LEN) return;
+    unsigned char* m = (unsigned char*)*bufp;
+    int len = (int)*lenp;
+
+    int an = (m[6] << 8) | m[7];
+    int ns = (m[8] << 8) | m[9];
+    int ar = (m[10] << 8) | m[11];
+    int qd = (m[4] << 8) | m[5];
+    int total = an + ns + ar;
+
+    /* AD is always cleared for a non-DO client (RFC 6840 §5.7). */
+    m[3] &= (unsigned char)~0x20;
+    if (total == 0) return;
+
+    /* Pass 1: skip the question, then walk the RRs to clear any OPT DO bit in
+     * place and learn whether there is anything to drop at all. */
+    int pos = HEADER_LEN;
+    for (int i = 0; i < qd; i++) {
+        bool d = false;
+        pos = scan_name_skip(m, len, pos, len, &d);
+        if (pos < 0 || pos + 4 > len) return;   /* malformed -> leave as-is */
+        pos += 4;
+    }
+    int q_end = pos;
+
+    bool any_drop = false;
+    int scan = pos;
+    for (int i = 0; i < total; i++) {
+        bool d = false;
+        int name_end = scan_name_skip(m, len, scan, len, &d);
+        if (name_end < 0 || name_end + 10 > len) return;
+        uint16_t type  = (uint16_t)((m[name_end] << 8) | m[name_end + 1]);
+        uint16_t rdlen = (uint16_t)((m[name_end + 8] << 8) | m[name_end + 9]);
+        if (type == WIRE_TYPE_OPT) m[name_end + 6] &= (unsigned char)~0x80; /* DO=0 */
+        if (is_dnssec_meta_type(type) && type != qtype) any_drop = true;
+        scan = name_end + 10 + rdlen;
+        if (scan > len) return;
+    }
+    if (!any_drop) return;   /* AD + OPT-DO already fixed in place */
+
+    /* Pass 2: decompressing rebuild without the dropped records. */
+    int out_cap = len * 4 + 2048;        /* generous; abort if a name overflows */
+    unsigned char* out = malloc((size_t)out_cap);
+    if (!out) return;
+    memcpy(out, m, (size_t)q_end);       /* header + question (uncompressed) */
+    out[3] &= (unsigned char)~0x20;
+    int op = q_end;
+
+    int rd_pos = q_end;
+    int kept_an = 0, kept_ns = 0, kept_ar = 0;
+    bool ok = true;
+    for (int i = 0; i < total && ok; i++) {
+        bool d = false;
+        int rr_start = rd_pos;
+        int name_end = scan_name_skip(m, len, rd_pos, len, &d);
+        if (name_end < 0 || name_end + 10 > len) { ok = false; break; }
+        uint16_t type  = (uint16_t)((m[name_end] << 8) | m[name_end + 1]);
+        uint16_t rdlen = (uint16_t)((m[name_end + 8] << 8) | m[name_end + 9]);
+        int rdata = name_end + 10;
+        if (rdata + rdlen > len) { ok = false; break; }
+
+        if (!(is_dnssec_meta_type(type) && type != qtype)) {
+            /* owner (decompressed) */
+            if (copy_name_decompressed(m, len, rr_start, out, out_cap, &op) < 0) {
+                ok = false; break;
+            }
+            /* TYPE + CLASS + TTL (10 bytes minus RDLENGTH); clear OPT DO */
+            if (op + 8 > out_cap) { ok = false; break; }
+            memcpy(out + op, m + name_end, 8);
+            if (type == WIRE_TYPE_OPT) out[op + 6] &= (unsigned char)~0x80;
+            op += 8;
+            /* RDLENGTH placeholder, then decompressed RDATA, then patch length */
+            if (op + 2 > out_cap) { ok = false; break; }
+            int rdlen_at = op; op += 2;
+            int rdata_out = op;
+            if (!emit_rdata_decompressed(m, len, type, rdata, rdlen,
+                                         out, out_cap, &op)) { ok = false; break; }
+            int new_rdlen = op - rdata_out;
+            out[rdlen_at]     = (unsigned char)(new_rdlen >> 8);
+            out[rdlen_at + 1] = (unsigned char)(new_rdlen & 0xFF);
+
+            if (i < an)            kept_an++;
+            else if (i < an + ns)  kept_ns++;
+            else                   kept_ar++;
+        }
+        rd_pos = rdata + rdlen;
+    }
+
+    if (!ok) { free(out); return; }   /* anything odd -> keep original intact */
+
+    out[6]  = (unsigned char)(kept_an >> 8); out[7]  = (unsigned char)(kept_an & 0xFF);
+    out[8]  = (unsigned char)(kept_ns >> 8); out[9]  = (unsigned char)(kept_ns & 0xFF);
+    out[10] = (unsigned char)(kept_ar >> 8); out[11] = (unsigned char)(kept_ar & 0xFF);
+
+    free(*bufp);
+    *bufp = (char*)out;
+    *lenp = op;
+}
+
+/*
  * Extract CNAME target from answer section
  */
 char* extract_cname_target(struct Packet* response)

@@ -692,6 +692,12 @@ void* process_query(void* arg) {
     // (clear AA, set RA, echo client RD) — RFC 1035 §4.1.1.
     normalize_forwarded_flags((unsigned char*)ret->request, ret->recv_len, pkt->rd);
 
+    // A client that did not set DO must not receive DNSSEC records / AD / DO
+    // (RFC 4035 §3.2.1) — we validated upstream with DO=1, now strip on the way
+    // out so the answer matches a plain resolver (e.g. 1.1.1.1).
+    if (!pkt->do_bit)
+        strip_dnssec_for_non_do(&ret->request, &ret->recv_len, pkt->q_type);
+
     // EDNS-aware TC truncation + OPT echo (RFC 6891 §7), shared with the
     // cache fast path.  Pass the client's UDP size (0 = no EDNS → 512 limit).
     finalize_udp_truncation(&ret->request, &ret->recv_len,
@@ -849,6 +855,9 @@ void* process_tcp_query(void* arg) {
         // Present our own recursive-resolver flags, not the upstream authority's
         // (clear AA, set RA, echo client RD) — RFC 1035 §4.1.1.
         normalize_forwarded_flags((unsigned char*)ret->request, ret->recv_len, pkt->rd);
+        // Strip DNSSEC machinery for a non-DO client (RFC 4035 §3.2.1).
+        if (!pkt->do_bit)
+            strip_dnssec_for_non_do(&ret->request, &ret->recv_len, pkt->q_type);
         // Note: do NOT set TC bit for TCP responses — TCP has no 512-byte limit
 
         {
@@ -1155,6 +1164,11 @@ int main(int argc, char** argv)
                                 normalize_forwarded_flags((unsigned char*)cached_raw,
                                                           cached_len,
                                                           (unsigned char)recv_buf[2] & 0x01);
+                                /* Non-DO client: strip DNSSEC RRs/AD/DO from the
+                                 * cached (signed) answer (RFC 4035 §3.2.1). */
+                                if (!do_fast)
+                                    strip_dnssec_for_non_do(&cached_raw, &cached_len,
+                                                            qtype_fast);
                                 /* Same EDNS-aware truncation the worker applies. */
                                 finalize_udp_truncation(&cached_raw, &cached_len,
                                                         edns_size_fast);
@@ -1255,6 +1269,11 @@ int main(int argc, char** argv)
                                 normalize_forwarded_flags((unsigned char*)cached_raw,
                                                           cached_len,
                                                           (unsigned char)recv_buf[2] & 0x01);
+                                /* Non-DO client: strip DNSSEC RRs/AD/DO from the
+                                 * cached (signed) answer (RFC 4035 §3.2.1). */
+                                if (!do_fast)
+                                    strip_dnssec_for_non_do(&cached_raw, &cached_len,
+                                                            qtype_fast);
                                 /* Same EDNS-aware truncation the worker applies. */
                                 finalize_udp_truncation(&cached_raw, &cached_len,
                                                         edns_size_fast);

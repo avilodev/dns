@@ -555,7 +555,17 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                 return response;
             }
 
-            bool cname_only = is_cname_only_answer(response, query->q_type);
+            /* Re-chase the CNAME target when the answer is a bare CNAME *or*
+             * when the answering server stapled out-of-bailiwick address
+             * records onto it (RFC 2181 §5.4.1).  Trusting a foreign A/AAAA
+             * would serve a parked/poisoned address instead of re-resolving
+             * the target from its real authority — the bug that made Bluehost-
+             * parked CNAME targets (e.g. destinyemblemcollector.com) resolve to
+             * 74.220.199.6 here while public resolvers returned the correct
+             * Heroku endpoints.  current_zone is the zone the responding server
+             * is authoritative for. */
+            bool cname_only = cname_answer_needs_rechase(response, query->q_type,
+                                                         current_zone);
 
             if (cname_only) {
                 // Handle CNAME resolution
