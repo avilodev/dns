@@ -17,6 +17,10 @@ logs/
 # Testing scripts and results
 testing/
 
+# Fuzzer-generated corpus and crash artifacts (harness source is tracked)
+auth_dns/fuzz/corpus/
+auth_dns/fuzz/artifacts/
+
 # Optional local env for docker compose (GHCR_OWNER / DNS_TAG image selectors)
 .env
 
