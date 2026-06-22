@@ -1,0 +1,22 @@
+# Build context for the multi-stage image. We now compile inside the image, so
+# src/ and the Makefile MUST stay in context — exclude only stale artifacts and
+# secrets.
+
+# Stale host build artifacts (the image compiles fresh)
+obj/
+bin/
+
+# DNSSEC zone-signing keys — secrets. Mounted read-only at runtime, never baked.
+config/*.pem
+config/*.key
+
+# Query logs (mounted at runtime)
+../logs/
+logs/
+
+# Tests are not needed to build the runtime binary
+tests/
+
+# Docker / VCS noise
+Dockerfile
+.dockerignore

@@ -131,6 +131,19 @@ static off_t g_log_bytes = 0;   /* bytes in the log since last truncate (g_log_m
 static int log_open_locked(void) {
     int fd = open(LOG_FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
     if (fd < 0) return -1;
+    /* If we still hold root and will drop to an unprivileged user, hand the log
+     * to that user now.  Later reopens (SIGHUP/logrotate) run AFTER the drop, so
+     * without this they fail with EACCES on a root-owned 0644 log. */
+    if (geteuid() == 0 && g_config.drop_user && *g_config.drop_user) {
+        char u[128];
+        snprintf(u, sizeof(u), "%s", g_config.drop_user);
+        char *colon = strchr(u, ':');
+        if (colon) *colon = '\0';
+        struct passwd *pw = getpwnam(u);
+        if (pw && fchown(fd, pw->pw_uid, pw->pw_gid) != 0) {
+            /* best-effort: the fd we just opened still works regardless */
+        }
+    }
     struct stat st;
     g_log_bytes = (fstat(fd, &st) == 0) ? st.st_size : 0;
     return fd;
@@ -903,6 +916,10 @@ void* process_tcp_query(void* arg) {
 
 int main(int argc, char** argv)
 {
+    /* Line-buffer stdout so startup/status lines stream to `docker logs`
+     * instead of sitting in libc's block buffer when stdout isn't a TTY. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     int ret = load_config(argc, argv);
     if (ret < 0) {
         printf("Usage: ./bin/upstream_dns <-p port> <-t thread_count> "

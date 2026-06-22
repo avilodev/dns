@@ -60,6 +60,82 @@ Leave both for the full setup. Edits take effect on the next boot — no reinsta
 
 ---
 
+## Docker deployment
+
+The images are **self-contained and multi-arch**: each `Dockerfile` compiles its
+binary inside a build stage with fixed container paths baked in (`/opt/<svc>`,
+`/var/log/dns`), so there is no host build step and no `.env`/`DNS_ROOT` to
+manage. Networking is bridge: `auth_dns` publishes `:53`, while `upstream_dns`
+stays private on the `dnsnet` network at a static IP (`172.28.0.2`) that auth
+forwards to.
+
+```bash
+sudo make docker        # build images, start the servers in dns.conf + daily cron
+sudo make docker-down   # stop containers, remove images + daily cron
+```
+
+### Configuration: `dns.conf`
+
+**One file** drives both the Docker deployment *and* the native build
+(`cron_scripts/dns-startup` reads the same file). Edit `dns.conf`, then re-run
+`sudo make docker`. Each server is independent, with its own flags and an
+enable/disable toggle:
+
+```sh
+AUTH_ENABLED=true          # run the authoritative front door (:53)?
+UPSTREAM_ENABLED=true      # run the recursive resolver?
+AUTH_THREADS=20            # per-server flags: threads, queue, drop-user,
+UPSTREAM_THREADS=20        #   rate limit, ACL CIDRs, bind addr, block mode ...
+```
+
+- **Just auth:** `AUTH_ENABLED=true`, `UPSTREAM_ENABLED=false`, and set
+  `AUTH_UPSTREAM_IP` to an external resolver (e.g. `1.1.1.1`).
+- **Just upstream:** `UPSTREAM_ENABLED=true`, `AUTH_ENABLED=false`.
+- **Both (default):** leave `AUTH_UPSTREAM_IP` blank — auth auto-targets the
+  bundled upstream.
+
+`make docker` reads `dns.conf`, builds each server's flags
+(`cron_scripts/dns-args.sh` — the same builder the native launcher uses), and
+starts only the enabled servers via Compose profiles. The compose file itself
+holds no config and reads no env file.
+
+### Required host-daemon setting (client source IP)
+
+`auth_dns` rate-limits and applies ACLs per **client source IP**. Under the
+default Docker bridge, published-port traffic is SNAT'd and every query appears
+to come from the gateway — which collapses rate limiting and breaks ACLs/logs.
+Set this once per host in `/etc/docker/daemon.json`, then restart Docker:
+
+```json
+{ "userland-proxy": false }
+```
+
+This makes DNAT preserve the real client IP. (For maximum fidelity a `macvlan`
+network — giving the container its own LAN IP — is an alternative.)
+
+### Multi-arch release to GHCR
+
+```bash
+docker login ghcr.io
+docker run --privileged tonistiigi/binfmt          # once, for cross-arch builds
+make release VERSION=1.0 GHCR_OWNER=<your-gh-user>  # builds arm64+amd64, pushes
+```
+
+### Deploy on another host
+
+DNSSEC keys (`config/*.pem|*.key`) are gitignored — provision them into the
+`config/` dirs out-of-band first. Then pull the pre-built images and start the
+servers selected in `dns.conf` (no local build):
+
+```bash
+git clone <repo> && cd dns          # provides compose + dns.conf + misc/ + config.txt
+docker login ghcr.io
+export GHCR_OWNER=<your-gh-user> DNS_TAG=1.0
+make deploy                         # pulls from GHCR, starts per dns.conf
+```
+
+---
+
 ## Running
 
 Start the upstream resolver first, then the authoritative server.

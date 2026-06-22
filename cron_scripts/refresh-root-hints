@@ -29,14 +29,18 @@ fi
 cp "$TMP" "$DEST"
 echo "refresh-root-hints: root hints updated at $DEST"
 
-# Signal the running upstream_dns to reload hints (SIGHUP).
-# Tries a PID file first, then falls back to pgrep.
+# Signal the running upstream_dns to reload hints (SIGHUP). Works for either
+# deployment and stops at the first method that lands:
+#   native     — PID file, then pgrep
+#   containers — docker kill (the container has its own PID namespace, so the
+#                host-side methods above can't see it)
 PIDFILE="/run/upstream_dns.pid"
-if [ -f "$PIDFILE" ]; then
-    kill -HUP "$(cat "$PIDFILE")" 2>/dev/null && \
-        echo "refresh-root-hints: sent SIGHUP to upstream_dns (pid file)" || true
+if [ -f "$PIDFILE" ] && kill -HUP "$(cat "$PIDFILE")" 2>/dev/null; then
+    echo "refresh-root-hints: sent SIGHUP to upstream_dns (pid file)"
+elif pkill -HUP -x upstream_dns 2>/dev/null; then
+    echo "refresh-root-hints: sent SIGHUP to upstream_dns (pgrep)"
+elif command -v docker >/dev/null 2>&1 && docker kill --signal=HUP upstream_dns >/dev/null 2>&1; then
+    echo "refresh-root-hints: sent SIGHUP to upstream_dns (docker)"
 else
-    pkill -HUP -x upstream_dns 2>/dev/null && \
-        echo "refresh-root-hints: sent SIGHUP to upstream_dns (pgrep)" || \
-        echo "refresh-root-hints: could not signal upstream_dns (not running?)"
+    echo "refresh-root-hints: could not signal upstream_dns (not running?)"
 fi

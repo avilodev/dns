@@ -1,0 +1,113 @@
+# Run the DNS servers in containers. All tuning lives in ONE file: ./dns.conf,
+# and the MAKEFILE is the only thing that reads it — this compose file holds no
+# config and reads no env file. `make docker` / `make deploy` source dns.conf,
+# build each server's flags (cron_scripts/dns-args.sh), and pass them in as the
+# variables below:
+#
+#   AUTH_ARGS / UPSTREAM_ARGS  -> the binary's CLI flags (the container command)
+#   UPSTREAM_PORT              -> the recursor's port (for the healthcheck probe)
+#   GHCR_OWNER / DNS_TAG       -> the image to run (registry path / version)
+#
+# which servers run is chosen by Compose PROFILES (auth / upstream), activated
+# from AUTH_ENABLED / UPSTREAM_ENABLED by the Makefile.
+#
+# The image is self-contained: paths are baked to FIXED container locations at
+# build time (/opt/<svc>, /var/log/dns), so no .env / DNS_ROOT is needed.
+#
+# NETWORKING: bridge, not host. auth publishes :53; upstream is private on
+# `dnsnet` with a STATIC IP (auth's -u takes an IP literal, not a hostname).
+# REQUIRED host-daemon setting for correct client-IP-based rate limiting/ACLs:
+# set `"userland-proxy": false` in /etc/docker/daemon.json so DNAT preserves the
+# real client source IP (otherwise every query appears to come from the gateway).
+services:
+  auth_dns:
+    image: ghcr.io/${GHCR_OWNER:-local}/auth_dns:${DNS_TAG:-dev}
+    build: ./auth_dns
+    container_name: auth_dns
+    profiles: ["auth"]
+    restart: unless-stopped
+    # Flags built from dns.conf by the Makefile (-u defaults to upstream's
+    # static IP 172.28.0.2 when AUTH_UPSTREAM_IP is blank).
+    command: ${AUTH_ARGS:-}
+    networks:
+      dnsnet:
+        ipv4_address: 172.28.0.3      # pinned so auth never grabs upstream's .2
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    volumes:
+      - ./auth_dns/misc:/opt/auth_dns/misc:ro
+      - ./auth_dns/config:/opt/auth_dns/config:ro
+      - ./logs:/var/log/dns
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /run                          # pid file: /run/auth_dns.pid
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN                         # logger fchown's the log file to the drop user
+      - DAC_OVERRIDE                  # open/create the log in ./logs (host-owned dir)
+      - SETUID                        # binary drops root itself
+      - SETGID
+      - NET_BIND_SERVICE              # bind the privileged :53
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # auth always listens on :53.
+    healthcheck:
+      test: ["CMD", "kdig", "+timeout=2", "+retry=0", "@127.0.0.1", "-p", "53", ".", "NS"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  upstream_dns:
+    image: ghcr.io/${GHCR_OWNER:-local}/upstream_dns:${DNS_TAG:-dev}
+    build: ./upstream_dns
+    container_name: upstream_dns
+    profiles: ["upstream"]
+    restart: unless-stopped
+    command: ${UPSTREAM_ARGS:-}
+    networks:
+      dnsnet:
+        ipv4_address: 172.28.0.2      # the IP auth's -u defaults to
+    # No published ports — only auth talks to it, over the private network.
+    volumes:
+      - ./upstream_dns/misc:/opt/upstream_dns/misc:ro
+      - ./upstream_dns/config:/opt/upstream_dns/config:ro
+      - ./logs:/var/log/dns
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /run                          # pid file: /run/upstream_dns.pid
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN                         # logger fchown's the log file to the drop user
+      - DAC_OVERRIDE                  # open/create the log in ./logs (host-owned dir)
+      - SETUID
+      - SETGID                        # :5335 is unprivileged, so no NET_BIND_SERVICE
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Compose interpolates ${UPSTREAM_PORT} from the Makefile's exported env.
+    healthcheck:
+      test: ["CMD-SHELL", "kdig +timeout=2 +retry=0 @127.0.0.1 -p ${UPSTREAM_PORT:-5335} . NS"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  dnsnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
