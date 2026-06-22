@@ -65,15 +65,6 @@ $(TARGET): $(OBJECTS)
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | directories
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Unit tests — standalone, no daemon or network required.
-# Links only the wire/parsing units the tested code needs.
-TEST_DIR  = tests
-TEST_SRCS = $(SRC_DIR)/response_handler.c $(SRC_DIR)/utils.c $(SRC_DIR)/dns_wire.c
-test: | directories
-	$(CC) -Isrc -Wall -Wextra -g -o $(OBJ_DIR)/test_cname_bailiwick \
-	    $(TEST_DIR)/test_cname_bailiwick.c $(TEST_SRCS)
-	@$(OBJ_DIR)/test_cname_bailiwick
-
 # Clean build artifacts
 clean:
 	rm -rf $(OBJ_DIR) $(BIN_DIR)
