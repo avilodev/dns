@@ -120,8 +120,13 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
     
     pos++; // Skip null terminator
     domain[domain_len] = '\0';
-    
-    pkt->full_domain = strdup(domain);
+
+    /* A root query (a single zero label) parses to an empty name. Normalize it
+     * to "." — the form parse_response() already uses and that the resolver's
+     * root-query branch (resolve.c:166) and the answer cache key on. Without
+     * this, `. NS`/`. SOA` skip build_root_hints_response, fall through the
+     * delegation walk on a zero-label name, and SERVFAIL with QUERY:0. */
+    pkt->full_domain = (domain_len > 0) ? strdup(domain) : strdup(".");
     if (!pkt->full_domain) {
         perror("Error: Failed to allocate domain string");
         free_packet(pkt);
