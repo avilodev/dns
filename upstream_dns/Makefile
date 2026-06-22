@@ -82,6 +82,17 @@ asan: HARDEN_LDFLAGS = -fsanitize=address,undefined
 asan: clean all
 	@echo "ASan/UBSan build complete: $(TARGET)"
 
+# Fuzz target — libFuzzer over the untrusted wire-format query parser, built
+# with ASan+UBSan (clang). Feeds arbitrary network bytes to parse_request_headers
+# to surface memory/alignment/UB bugs. Standalone — no daemon or network.
+#   make fuzz && obj/fuzz_request -max_total_time=30
+FUZZ_DIR  = fuzz
+FUZZ_SRCS = $(SRC_DIR)/request.c $(SRC_DIR)/utils.c $(SRC_DIR)/dns_packet.c $(SRC_DIR)/dns_wire.c
+fuzz: | directories
+	clang -g -O1 -Isrc -fno-strict-aliasing -fsanitize=fuzzer,address,undefined \
+	    $(FUZZ_DIR)/fuzz_request.c $(FUZZ_SRCS) -o $(OBJ_DIR)/fuzz_request
+	@echo "Fuzzer built: $(OBJ_DIR)/fuzz_request"
+
 # Run the server
 run: $(TARGET)
 	sudo ./$(TARGET)
@@ -95,4 +106,4 @@ debug:
 # Auto-generated header dependency files (from -MMD -MP)
 -include $(OBJECTS:.o=.d)
 
-.PHONY: all clean rebuild asan run debug directories
+.PHONY: all clean rebuild asan fuzz run debug directories
