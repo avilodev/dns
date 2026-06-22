@@ -708,6 +708,10 @@ void* process_tcp_query(void* arg) {
 /* --- Main ---------------------------------------------------------------- */
 
 int main(int argc, char** argv) {
+    /* Line-buffer stdout so startup/status lines stream to `docker logs`
+     * instead of sitting in libc's block buffer when stdout isn't a TTY. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     if (load_config(argc, argv) < 0) {
         printf("Usage: ./bin/auth_dns <-p upstream_port> <-t thread_count> "
                "<-u upstream_dns> <-q queue_size> <-b bind_addr> "

@@ -17,8 +17,10 @@ logs/
 # Testing scripts and results
 testing/
 
-# DNSSEC zone signing key
-s (private — never commit)
+# Optional local env for docker compose (GHCR_OWNER / DNS_TAG image selectors)
+.env
+
+# DNSSEC zone signing keys
 auth_dns/config/*.pem
 auth_dns/config/*.key
 

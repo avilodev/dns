@@ -1,8 +1,31 @@
 #include "logger.h"
 #include <pthread.h>
+#include <pwd.h>
+
+extern Config g_config;
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int log_fd = -1;
+
+/* Open the query log (O_APPEND).  If we still hold root and a privilege drop is
+ * configured (-U), hand the file to that user now so reopens AFTER the drop
+ * (SIGHUP / logrotate) succeed instead of failing EACCES on a 0644 log it does
+ * not own.  Returns the fd, or -1 on failure. */
+static int open_log_fd(void) {
+    int fd = open(LOG_FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (fd < 0) return -1;
+    if (geteuid() == 0 && g_config.drop_user && *g_config.drop_user) {
+        char u[128];
+        snprintf(u, sizeof(u), "%s", g_config.drop_user);
+        char *colon = strchr(u, ':');
+        if (colon) *colon = '\0';
+        struct passwd *pw = getpwnam(u);
+        if (pw && fchown(fd, pw->pw_uid, pw->pw_gid) != 0) {
+            /* best-effort: the fd we just opened still works regardless */
+        }
+    }
+    return fd;
+}
 
 /* Exported — also used by main.c print_qtype_stats(). Returns NULL for unknown. */
 const char* qtype_name(uint16_t qtype) {
@@ -82,7 +105,7 @@ int log_entry(const char* client_ip, uint16_t port, uint16_t qtype,
 
     // Open the log file lazily and keep it open for the server's lifetime
     if (log_fd < 0) {
-        log_fd = open(LOG_FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
+        log_fd = open_log_fd();
         if (log_fd < 0) {
             perror("Warning: Failed to open log file");
             pthread_mutex_unlock(&log_mutex);
@@ -145,7 +168,7 @@ void log_close(void) {
 void log_reopen(void) {
     pthread_mutex_lock(&log_mutex);
     if (log_fd >= 0) { close(log_fd); log_fd = -1; }
-    log_fd = open(LOG_FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    log_fd = open_log_fd();
     if (log_fd < 0) perror("Warning: log_reopen: Failed to open log file");
     pthread_mutex_unlock(&log_mutex);
 }
