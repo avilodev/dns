@@ -162,8 +162,11 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
      * complete and a later DO=1 client can validate the cached RRSIGs. */
     bool want_dnssec = (g_trust_anchors != NULL) && query->do_bit && !query->cd;
 
-    // Handle root domain queries
-    if (strcmp(query->full_domain, ".") == 0) {
+    // Handle root domain queries. Root NS is answerable offline from the hints.
+    // Other root qtypes (SOA, DNSKEY, A→NODATA, ...) fall through to normal
+    // resolution, which queries a root server — authoritative for "." — and
+    // relays the real answer instead of the NS-only synthesis.
+    if (strcmp(query->full_domain, ".") == 0 && query->q_type == QTYPE_NS) {
         return build_root_hints_response(query);
     }
 
