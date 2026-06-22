@@ -95,4 +95,4 @@ debug:
 # Auto-generated header dependency files (from -MMD -MP)
 -include $(OBJECTS:.o=.d)
 
-.PHONY: all clean rebuild asan run debug directories test
+.PHONY: all clean rebuild asan run debug directories
