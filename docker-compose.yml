@@ -57,9 +57,11 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    # auth always listens on :53.
+    # Liveness: probe an AUTHORITATIVE name auth serves directly (instant, no
+    # forwarding). Avoid `. NS` — it's forwarded to upstream, which SERVFAILs on
+    # root-zone queries, falsely marking auth unhealthy.
     healthcheck:
-      test: ["CMD", "kdig", "+timeout=2", "+retry=0", "@127.0.0.1", "-p", "53", ".", "NS"]
+      test: ["CMD", "kdig", "+timeout=2", "+retry=0", "@127.0.0.1", "-p", "53", "avilo.com", "SOA"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -98,8 +100,11 @@ services:
         max-size: "10m"
         max-file: "3"
     # Compose interpolates ${UPSTREAM_PORT} from the Makefile's exported env.
+    # Liveness: resolve a normal, highly-stable name (real recursion). Avoid
+    # `. NS` — the resolver SERVFAILs on root-zone queries. Slightly longer
+    # timeout + one retry since recursion can briefly exceed 2s on a cold cache.
     healthcheck:
-      test: ["CMD-SHELL", "kdig +timeout=2 +retry=0 @127.0.0.1 -p ${UPSTREAM_PORT:-5335} . NS"]
+      test: ["CMD-SHELL", "kdig +timeout=3 +retry=1 @127.0.0.1 -p ${UPSTREAM_PORT:-5335} a.root-servers.net A"]
       interval: 30s
       timeout: 5s
       retries: 3
