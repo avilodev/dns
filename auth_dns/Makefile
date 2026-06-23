@@ -36,7 +36,7 @@ BIN_DIR = bin
 # Source files (just the names)
 SOURCES = main.c auth.c logger.c request.c resolve.c \
           response.c utils.c thread_pool.c dnssec.c \
-          access_control.c policy.c dns_synth.c
+          access_control.c policy.c dns_synth.c auth_net.c auth_process.c
 
 # Full paths
 SRC_FILES = $(addprefix $(SRC_DIR)/, $(SOURCES))
