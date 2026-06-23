@@ -821,7 +821,13 @@ struct Packet* build_root_hints_response(struct Packet* query)
     }
     buf[6] = (root_count >> 8) & 0xFF;
     buf[7] = root_count & 0xFF;
-    
+    /* This is an answer-only response; clear NS/AR counts inherited from the
+     * copied query header. Otherwise a stale ARCOUNT (e.g. the client's OPT)
+     * makes finalize_udp_truncation skip appending its own OPT, leaving the
+     * header advertising an additional RR that isn't there (malformed). */
+    buf[8] = 0; buf[9] = 0;    /* NSCOUNT = 0 */
+    buf[10] = 0; buf[11] = 0;  /* ARCOUNT = 0 */
+
     pos = HEADER_LEN;
     
     // Skip question section (already in buffer from query)
