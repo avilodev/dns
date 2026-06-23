@@ -82,6 +82,12 @@ struct AuthDomain {
     uint32_t soa_ttl;       // TTL for the SOA RR itself
 };
 
+/* The authoritative record store. Defined in auth_zonefile.c (which owns
+ * loading); the serving path (check_internal) reads it. Guard with
+ * g_auth_domains_lock. */
+extern struct AuthDomain auth_domains[];
+extern int auth_domain_count;
+
 /* Check if domain should be handled authoritatively.
  * Returns a response Packet, or NULL to forward to upstream. */
 struct Packet* check_internal(struct Packet* request);
