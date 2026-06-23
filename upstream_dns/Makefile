@@ -38,7 +38,7 @@ SOURCES = main.c config.c thread_pool.c utils.c      \
           request.c resolve.c cache.c                \
 		  dns_wire.c dns_packet.c response_handler.c \
 		  cname_handler.c ns_resolver.c udp_client.c \
-		  ns_resolution_context.c dnssec.c dnssec_chain.c \
+		  ns_resolution_context.c dnssec.c dnssec_chain.c dnssec_wire.c \
 		  access_control.c query_log.c udp_helpers.c workers.c
 
 # Full paths
