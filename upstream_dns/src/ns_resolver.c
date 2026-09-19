@@ -89,17 +89,3 @@ char* resolve_ns_name_internal(const char* ns_name, uint16_t qtype,
     free_packet(ns_response);
     return ip;
 }
-
-/*
- * Extract TLD from domain name
- */
-char* get_tld_from_domain(const char* domain)
-{
-    if (!domain) return NULL;
-    
-    const char* last_dot = strrchr(domain, '.');
-    if (!last_dot || last_dot == domain) return NULL;
-    
-    // Return everything after the last dot
-    return strdup(last_dot + 1);
-}

@@ -78,29 +78,9 @@ static int dc_expand_name(const uint8_t *buf, int len, int pos,
 static int dc_wire_to_str(const uint8_t *wire, int wire_len,
                            char *out, int out_size)
 {
-    int pos = 0, opos = 0;
-    while (pos < wire_len) {
-        int llen = (int)(unsigned char)wire[pos++];
-        if (llen == 0) {
-            /* root terminator — if nothing was written yet it's the root zone */
-            if (opos == 0) {
-                if (opos + 1 >= out_size) return -1;
-                out[opos++] = '.';
-            }
-            break;
-        }
-        if (opos > 0) {
-            if (opos + 1 >= out_size) return -1;
-            out[opos++] = '.';
-        }
-        if (opos + llen >= out_size || pos + llen > wire_len) return -1;
-        memcpy(out + opos, wire + pos, (size_t)llen);
-        opos += llen;
-        pos  += llen;
-    }
-    if (opos >= out_size) return -1;
-    out[opos] = '\0';
-    return 0;
+    /* Shared codec: escapes label bytes so the text matches every other
+     * name the resolver compares against. */
+    return dname_from_wire(wire, wire_len, 0, false, out, (size_t)out_size) < 0 ? -1 : 0;
 }
 
 /* ==========================================================================
@@ -390,7 +370,7 @@ static void scan_pass(DnssecChainCtx *ctx,
             uint8_t owner_wire[256];
             int owner_len = dc_expand_name(buf, buf_len, name_pos,
                                            owner_wire, sizeof(owner_wire));
-            char zone_str[256];
+            char zone_str[DNAME_TEXT_MAX];
             if (owner_len < 0 ||
                 dc_wire_to_str(owner_wire, owner_len,
                                zone_str, sizeof(zone_str)) < 0)
@@ -424,7 +404,7 @@ static void scan_pass(DnssecChainCtx *ctx,
             uint8_t owner_wire[256];
             int owner_len = dc_expand_name(buf, buf_len, name_pos,
                                            owner_wire, sizeof(owner_wire));
-            char zone_str[256];
+            char zone_str[DNAME_TEXT_MAX];
             if (owner_len < 0 ||
                 dc_wire_to_str(owner_wire, owner_len,
                                zone_str, sizeof(zone_str)) < 0)

@@ -46,9 +46,6 @@ struct Packet* copy_packet(struct Packet* pkt)
 
 
     copy->full_domain = pkt->full_domain ? strdup(pkt->full_domain) : NULL;
-    copy->authoritative_domain = pkt->authoritative_domain ? strdup(pkt->authoritative_domain) : NULL;
-    copy->domain = pkt->domain ? strdup(pkt->domain) : NULL;
-    copy->top_level_domain = pkt->top_level_domain ? strdup(pkt->top_level_domain) : NULL;
 
     copy->q_type = pkt->q_type; 
     copy->q_class = pkt->q_class;
@@ -147,9 +144,11 @@ int construct_dns_packet(struct Packet* pkt)
         *ptr++ = 0x00;
         *ptr++ = 0x29;
         
-        // CLASS: UDP payload size (4096 = 0x1000) (2 bytes)
-        *ptr++ = 0x10;
-        *ptr++ = 0x00;
+        // CLASS: UDP payload size (2 bytes) — EDNS_UDP_PAYLOAD (1232) so
+        // authoritative answers never need IP fragmentation; bigger ones come
+        // back TC=1 and are re-fetched over TCP.
+        *ptr++ = (EDNS_UDP_PAYLOAD >> 8) & 0xFF;
+        *ptr++ = EDNS_UDP_PAYLOAD & 0xFF;
         
         // TTL: Extended RCODE and flags (4 bytes)
         // Byte 0: extended RCODE, Byte 1: EDNS version
@@ -187,15 +186,6 @@ int free_packet(struct Packet* pkt) {
 
     if(pkt->full_domain)
         free(pkt->full_domain);
-
-    if(pkt->authoritative_domain)
-        free(pkt->authoritative_domain);
-
-    if(pkt->domain)
-        free(pkt->domain);
-
-    if(pkt->top_level_domain)
-        free(pkt->top_level_domain);
 
     free(pkt);
 

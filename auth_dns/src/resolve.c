@@ -34,6 +34,28 @@ static int question_matches(const char* qbuf, ssize_t qlen,
     return memcmp(qbuf + qp, rbuf + rp, 4) == 0;  /* QTYPE + QCLASS */
 }
 
+/*
+ * Fill *ss with the configured upstream address (IPv4 or IPv6 literal, as
+ * accepted by -u).  Returns the sockaddr length, or 0 if the address is invalid.
+ */
+static socklen_t upstream_sockaddr(struct sockaddr_storage* ss) {
+    memset(ss, 0, sizeof(*ss));
+    struct sockaddr_in*  s4 = (struct sockaddr_in*)ss;
+    struct sockaddr_in6* s6 = (struct sockaddr_in6*)ss;
+    if (inet_pton(AF_INET, g_config.upstream_dns, &s4->sin_addr) == 1) {
+        s4->sin_family = AF_INET;
+        s4->sin_port   = htons(g_config.upstream_port);
+        return sizeof(*s4);
+    }
+    if (inet_pton(AF_INET6, g_config.upstream_dns, &s6->sin6_addr) == 1) {
+        s6->sin6_family = AF_INET6;
+        s6->sin6_port   = htons(g_config.upstream_port);
+        return sizeof(*s6);
+    }
+    fprintf(stderr, "Error: Invalid upstream DNS address\n");
+    return 0;
+}
+
 /* Write exactly len bytes to fd, looping over short writes.
  * Returns 0 on success, -1 on error. */
 static int write_all(int fd, const void* buf, size_t len) {
@@ -56,7 +78,11 @@ static int write_all(int fd, const void* buf, size_t len) {
  * validation, then remap the TX ID back to the client's.
  */
 static struct Packet* query_upstream_tcp(struct Packet* pkt) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_storage upstream_server;
+    socklen_t upstream_len = upstream_sockaddr(&upstream_server);
+    if (!upstream_len) return NULL;
+
+    int sock = socket(upstream_server.ss_family, SOCK_STREAM, 0);
     if (sock < 0) {
         perror("Error: TCP socket creation failed for upstream query");
         return NULL;
@@ -66,25 +92,14 @@ static struct Packet* query_upstream_tcp(struct Packet* pkt) {
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-    struct sockaddr_in upstream_server;
-    memset(&upstream_server, 0, sizeof(upstream_server));
-    upstream_server.sin_family = AF_INET;
-    upstream_server.sin_port = htons(g_config.upstream_port);
-    if (inet_pton(AF_INET, g_config.upstream_dns, &upstream_server.sin_addr) <= 0) {
-        fprintf(stderr, "Error: Invalid upstream DNS address\n");
-        close(sock);
-        return NULL;
-    }
-
-    if (connect(sock, (struct sockaddr*)&upstream_server,
-                sizeof(upstream_server)) < 0) {
+    if (connect(sock, (struct sockaddr*)&upstream_server, upstream_len) < 0) {
         perror("Error: TCP connect() to upstream failed");
         close(sock);
         return NULL;
     }
 
     // Randomize TX ID before forwarding (RFC 5452 anti-spoofing)
-    uint16_t client_txid = ntohs(*(uint16_t*)pkt->request);
+    uint16_t client_txid = rd16(pkt->request);
     uint16_t random_txid;
     if (getrandom(&random_txid, sizeof(random_txid), 0) != (ssize_t)sizeof(random_txid)) {
         random_txid = (uint16_t)(rand() & 0xFFFF);
@@ -128,8 +143,10 @@ static struct Packet* query_upstream_tcp(struct Packet* pkt) {
         return NULL;
     }
     /* TCP answers can be up to 65535 bytes — size the buffer to the prefix,
-     * not MAXLINE (which only bounds the UDP path). */
-    response->request = malloc(rlen);
+     * but never below MAXLINE: callers (append_edns_opt) append to a response
+     * in place and assume the MAXLINE capacity every other response buffer
+     * has.  An exact-size buffer here was overrun by the EDNS OPT append. */
+    response->request = malloc(rlen > MAXLINE ? rlen : MAXLINE);
     if (!response->request) {
         perror("Error: Failed to allocate response buffer");
         free(response);
@@ -147,7 +164,7 @@ static struct Packet* query_upstream_tcp(struct Packet* pkt) {
     response->recv_len = rlen;
 
     /* Validate TX ID (RFC 5452). */
-    if (ntohs(*(uint16_t*)response->request) != random_txid) {
+    if (rd16(response->request) != random_txid) {
         fprintf(stderr, "Warning: TX ID mismatch from upstream (TCP) — dropping\n");
         free_packet(response);
         return NULL;
@@ -165,21 +182,18 @@ static struct Packet* query_upstream_tcp(struct Packet* pkt) {
     ((uint8_t*)response->request)[0] = (client_txid >> 8) & 0xFF;
     ((uint8_t*)response->request)[1] =  client_txid       & 0xFF;
 
-    // Copy domain information for logging
-    if (pkt->domain) {
-        response->domain = strdup(pkt->domain);
-    }
-    if (pkt->top_level_domain) {
-        response->top_level_domain = strdup(pkt->top_level_domain);
-    }
 
     return response;
 }
 
 /* Forward pkt to the configured upstream over UDP and return the response, or NULL on error. */
 static struct Packet* query_upstream_udp(struct Packet* pkt) {
+    struct sockaddr_storage upstream_server;
+    socklen_t upstream_len = upstream_sockaddr(&upstream_server);
+    if (!upstream_len) return NULL;
+
     // Create UDP socket for upstream query
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock = socket(upstream_server.ss_family, SOCK_DGRAM, 0);
     if (sock < 0) {
         perror("Error: Socket creation failed for upstream query");
         return NULL;
@@ -195,30 +209,17 @@ static struct Packet* query_upstream_udp(struct Packet* pkt) {
         perror("Warning: Failed to set socket timeout");
     }
 
-    // Configure upstream server address
-    struct sockaddr_in upstream_server;
-    memset(&upstream_server, 0, sizeof(upstream_server));
-    upstream_server.sin_family = AF_INET;
-    upstream_server.sin_port = htons(g_config.upstream_port);
-    
-    if (inet_pton(AF_INET, g_config.upstream_dns, &upstream_server.sin_addr) <= 0) {
-        fprintf(stderr, "Error: Invalid upstream DNS address\n");
-        close(sock);
-        return NULL;
-    }
-
     /* connect() the UDP socket so the kernel only delivers datagrams from the
      * exact upstream IP *and port* — closes the "accepts any source port" gap
      * (RFC 5452); the source-port entropy of an off-path spoofer now matters. */
-    if (connect(sock, (struct sockaddr*)&upstream_server,
-                sizeof(upstream_server)) < 0) {
+    if (connect(sock, (struct sockaddr*)&upstream_server, upstream_len) < 0) {
         perror("Error: connect() to upstream failed");
         close(sock);
         return NULL;
     }
 
     // Randomize TX ID before forwarding (RFC 5452 anti-spoofing)
-    uint16_t client_txid = ntohs(*(uint16_t*)pkt->request);
+    uint16_t client_txid = rd16(pkt->request);
     uint16_t random_txid;
     if (getrandom(&random_txid, sizeof(random_txid), 0) != (ssize_t)sizeof(random_txid)) {
         // getrandom() should never fail on Linux, but fall back gracefully
@@ -262,25 +263,17 @@ static struct Packet* query_upstream_udp(struct Packet* pkt) {
         return NULL;
     }
 
-    // Save expected source IP before recvfrom overwrites the address struct
-    char expected_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &upstream_server.sin_addr, expected_ip, sizeof(expected_ip));
-
-    // Receive response — retry on stray packets (wrong source IP or TX ID).
-    // The socket timeout covers the total wait; we keep recvfrom-ing until we
-    // get a valid response or the timeout fires.
-    struct sockaddr_in recv_addr;
-    socklen_t server_len;
-    char recv_ip[INET_ADDRSTRLEN];
+    // Receive response — retry on stray packets (wrong TX ID or question).
+    // The connect()ed socket already restricts the source to the upstream's
+    // IP and port.  The socket timeout covers each wait; we keep receiving
+    // until we get a valid response or the timeout fires.
     uint16_t recv_id;
 
     for (;;) {
-        server_len = sizeof(recv_addr);
-        response->recv_len = recvfrom(sock, response->request, MAXLINE, 0,
-                                      (struct sockaddr*)&recv_addr, &server_len);
+        response->recv_len = recv(sock, response->request, MAXLINE, 0);
 
         if (response->recv_len < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (errno_is_timeout(errno)) {
                 fprintf(stderr, "Error: Upstream DNS query timed out\n");
             } else {
                 perror("Error: Failed to receive upstream response");
@@ -295,22 +288,25 @@ static struct Packet* query_upstream_udp(struct Packet* pkt) {
             continue;
         }
 
-        /* Validate source IP. */
-        inet_ntop(AF_INET, &recv_addr.sin_addr, recv_ip, sizeof(recv_ip));
-        if (strcmp(recv_ip, expected_ip) != 0) {
-            fprintf(stderr, "Warning: Source IP mismatch from upstream "
-                    "(expected %s, got %s) — ignoring stray packet\n",
-                    expected_ip, recv_ip);
-            continue;
-        }
-
         /* Validate TX ID. */
-        recv_id = ntohs(*(uint16_t*)response->request);
+        recv_id = rd16(response->request);
         if (random_txid != recv_id) {
             fprintf(stderr, "Warning: TX ID mismatch from upstream "
                     "(sent %u, got %u) — ignoring stray packet\n",
                     random_txid, recv_id);
             continue;
+        }
+
+        /* A TX-ID-matching error reply with no question section (some servers
+         * send SERVFAIL/REFUSED that way): treat it as a failure now instead of
+         * discarding it and sitting out the whole timeout. */
+        if (response->request[4] == 0 && response->request[5] == 0 &&
+            (response->request[3] & 0x0F) != 0) {
+            fprintf(stderr, "Upstream returned rcode %d without a question\n",
+                    response->request[3] & 0x0F);
+            close(sock);
+            free_packet(response);
+            return NULL;
         }
 
         /* Validate the question matches what we asked (RFC 5452 §6). */
@@ -330,13 +326,6 @@ static struct Packet* query_upstream_udp(struct Packet* pkt) {
     ((uint8_t*)response->request)[0] = (client_txid >> 8) & 0xFF;
     ((uint8_t*)response->request)[1] =  client_txid       & 0xFF;
 
-    // Copy domain information for logging
-    if (pkt->domain) {
-        response->domain = strdup(pkt->domain);
-    }
-    if (pkt->top_level_domain) {
-        response->top_level_domain = strdup(pkt->top_level_domain);
-    }
 
     return response;
 }

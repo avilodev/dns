@@ -1,4 +1,61 @@
 #include "utils.h"
+#include "dns_name.h"
+#include <pthread.h>
+
+/* ---- Pinned paths (see utils.h) ---------------------------------------- */
+
+#define MAX_PINS 8
+static struct { char* path; char* base; int dirfd; } g_pins[MAX_PINS];
+static int g_pin_count = 0;
+static pthread_mutex_t g_pin_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void path_pin(const char* path)
+{
+    if (!path || !*path) return;
+    pthread_mutex_lock(&g_pin_lock);
+    for (int i = 0; i < g_pin_count; i++)
+        if (strcmp(g_pins[i].path, path) == 0) { pthread_mutex_unlock(&g_pin_lock); return; }
+    if (g_pin_count < MAX_PINS) {
+        const char* slash = strrchr(path, '/');
+        char dir[1024];
+        if (!slash)             snprintf(dir, sizeof(dir), ".");
+        else if (slash == path) snprintf(dir, sizeof(dir), "/");
+        else                    snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
+        int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd >= 0) {
+            g_pins[g_pin_count].path  = strdup(path);
+            g_pins[g_pin_count].base  = strdup(slash ? slash + 1 : path);
+            g_pins[g_pin_count].dirfd = fd;
+            if (g_pins[g_pin_count].path && g_pins[g_pin_count].base) g_pin_count++;
+            else { free(g_pins[g_pin_count].path); free(g_pins[g_pin_count].base); close(fd); }
+        }
+    }
+    pthread_mutex_unlock(&g_pin_lock);
+}
+
+int path_open(const char* path, int flags, int mode)
+{
+    if (!path) return -1;
+    pthread_mutex_lock(&g_pin_lock);
+    for (int i = 0; i < g_pin_count; i++) {
+        if (strcmp(g_pins[i].path, path) == 0) {
+            int fd = openat(g_pins[i].dirfd, g_pins[i].base, flags | O_CLOEXEC, mode);
+            pthread_mutex_unlock(&g_pin_lock);
+            return fd;
+        }
+    }
+    pthread_mutex_unlock(&g_pin_lock);
+    return open(path, flags | O_CLOEXEC, mode);
+}
+
+FILE* path_fopen(const char* path)
+{
+    int fd = path_open(path, O_RDONLY, 0);
+    if (fd < 0) return NULL;
+    FILE* f = fdopen(fd, "r");
+    if (!f) close(fd);
+    return f;
+}
 
 extern Config g_config;
 
@@ -107,40 +164,35 @@ int load_config(int argc, char** argv) {
  * as: <length-byte> <label-bytes>.  A final zero-length byte terminates the name.
  */
 void write_dns_labels(const char* name, char* buf, int* pos, int buf_size) {
-    if (!name || !buf || !pos) return;
-    char copy[256];
-    strncpy(copy, name, sizeof(copy) - 1);
-    copy[sizeof(copy) - 1] = '\0';
-    char *saveptr;
-    char* label = strtok_r(copy, ".", &saveptr);
-    while (label) {
-        uint8_t label_len = (uint8_t)strlen(label);
-        /* Need length byte + label here, and still room for the trailing null
-         * below.  Stop (truncate) rather than overflow the destination. */
-        if (*pos + 1 + (int)label_len + 1 > buf_size) break;
-        buf[(*pos)++] = (char)label_len;
-        memcpy(buf + *pos, label, label_len);
-        *pos += label_len;
-        label = strtok_r(NULL, ".", &saveptr);
+    if (!name || !buf || !pos || *pos >= buf_size) return;
+    int n = dname_to_wire(name, (uint8_t*)buf + *pos, buf_size - *pos);
+    if (n < 0) {
+        /* Malformed or oversized name: emit the root label so the message
+         * stays well-formed rather than writing a partial name. */
+        fprintf(stderr, "Warning: cannot encode name '%s'\n", name);
+        buf[(*pos)++] = 0;
+        return;
     }
-    if (*pos < buf_size)
-        buf[(*pos)++] = 0;  // Null terminator
+    *pos += n;
 }
 
 /*
  * Extract IP addresses from a DNS response packet.
  * Returns comma-separated IPs, a record type label (e.g. "MX_RECORD"), or NULL.
  */
-char* extract_ip_from_response(struct Packet* response) {
+char* extract_ip_from_response(const struct Packet* response) {
     if (!response || !response->request || response->recv_len < HEADER_LEN) {
         return NULL;
     }
 
-    uint16_t qdcount = ntohs(*(uint16_t*)(response->request + 4));
-    uint16_t ancount = ntohs(*(uint16_t*)(response->request + 6));
+    uint16_t qdcount = rd16(response->request + 4);
+    uint16_t ancount = rd16(response->request + 6);
     
     if (ancount == 0) {
-        return strdup("NXDOMAIN");
+        /* The RCODE column already says NXDOMAIN/SERVFAIL; an empty NOERROR
+         * answer is NODATA (the name exists, not with that type). */
+        uint8_t rcode = (uint8_t)(response->request[3] & 0x0F);
+        return rcode == RCODE_NO_ERROR ? strdup("NODATA") : NULL;
     }
 
     unsigned char* ptr = (unsigned char*)response->request + HEADER_LEN;
@@ -189,11 +241,11 @@ char* extract_ip_from_response(struct Packet* response) {
         
         if (ptr + 10 > end) break;
         
-        uint16_t atype = ntohs(*(uint16_t*)ptr);
+        uint16_t atype = rd16(ptr);
         ptr += 2;
         ptr += 2; // Skip CLASS
         ptr += 4; // Skip TTL
-        uint16_t rdlength = ntohs(*(uint16_t*)ptr);
+        uint16_t rdlength = rd16(ptr);
         ptr += 2;
         
         if (ptr + rdlength > end) break;
@@ -216,14 +268,14 @@ char* extract_ip_from_response(struct Packet* response) {
         else if (atype == 28 && rdlength == 16) {
             char ip_str[40];
             snprintf(ip_str, sizeof(ip_str), "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
-                    ntohs(*(uint16_t*)(ptr)),
-                    ntohs(*(uint16_t*)(ptr + 2)),
-                    ntohs(*(uint16_t*)(ptr + 4)),
-                    ntohs(*(uint16_t*)(ptr + 6)),
-                    ntohs(*(uint16_t*)(ptr + 8)),
-                    ntohs(*(uint16_t*)(ptr + 10)),
-                    ntohs(*(uint16_t*)(ptr + 12)),
-                    ntohs(*(uint16_t*)(ptr + 14)));
+                    rd16(ptr),
+                    rd16(ptr + 2),
+                    rd16(ptr + 4),
+                    rd16(ptr + 6),
+                    rd16(ptr + 8),
+                    rd16(ptr + 10),
+                    rd16(ptr + 12),
+                    rd16(ptr + 14));
             
             if (ip_count > 0) {
                 /* Space-separate multiple IPs so the CSV log's info column
@@ -275,9 +327,6 @@ int free_packet(struct Packet* pkt) {
 
     free(pkt->request);
     free(pkt->full_domain);
-    free(pkt->authoritative_domain);
-    free(pkt->domain);
-    free(pkt->top_level_domain);
     free(pkt);
 
     return 0;

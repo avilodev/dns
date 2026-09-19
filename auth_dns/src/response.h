@@ -26,7 +26,7 @@ struct Packet* build_nodata_response(struct Packet* request,
                                       const struct AuthDomain* soa);
 struct Packet* build_servfail_response(struct Packet* request);
 struct Packet* build_badvers_response(struct Packet* request);
-char* extract_ip_from_response(struct Packet* response);
+char* extract_ip_from_response(const struct Packet* response);
 
 /*
  * Echo the question section (QNAME + QTYPE + QCLASS) into a response, advancing

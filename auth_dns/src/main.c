@@ -12,6 +12,8 @@
 #include "dns_synth.h"
 #include "auth_net.h"
 #include "auth_process.h"
+#include "auth_chase.h"
+#include "dns_name.h"
 
 #include <poll.h>
 #include <pthread.h>
@@ -117,12 +119,12 @@ static void setup_signals(void) {
  */
 static void normalize_forwarded_flags(struct Packet* ans, const struct Packet* req) {
     if (!ans || !ans->request || ans->recv_len < 4 || !req) return;
-    uint16_t flags = ntohs(*(uint16_t*)(ans->request + 2));
+    uint16_t flags = rd16(ans->request + 2);
     flags &= ~(1u << 10);              /* AA = 0 */
     flags |=  (1u << 7);               /* RA = 1 */
     if (req->rd) flags |=  (1u << 8);  /* RD echo */
     else         flags &= ~(1u << 8);
-    *(uint16_t*)(ans->request + 2) = htons(flags);
+    wr16(ans->request + 2, flags);
 }
 
 /*
@@ -132,6 +134,16 @@ static void normalize_forwarded_flags(struct Packet* ans, const struct Packet* r
  *   QGATE_DROP    — source over its rate limit → drop (UDP) / REFUSED (TCP)
  */
 typedef enum { QGATE_OK = 0, QGATE_REFUSED, QGATE_DROP } QueryGate;
+
+/* What the local stage left for the remote (forwarding) stage to do. */
+typedef enum {
+    LOCAL_DONE = 0,   /* answer is complete                                   */
+    LOCAL_FORWARD,    /* nothing local: forward the whole query upstream      */
+    LOCAL_CHASE       /* local CNAME chain ends outside our data: resolve the */
+                      /* target upstream and append it                        */
+} LocalResult;
+
+#define MAX_CNAME_CHASE 8
 
 /*
  * Local query policy: build a synthesized response for a blocklist hit
@@ -162,107 +174,173 @@ static struct Packet* policy_answer(const struct Packet* pkt) {
 }
 
 /*
- * Core resolution: authoritative first, then local policy, then recursive
- * upstream.
- *
- * Authoritative answers (our own zones) are served to ANY source — the auth
- * server is, by design, publicly answerable for its zones.  Local policy
- * (blocklist + overrides) is likewise served to any source, before the
- * recursion gate.  Only the recursive forwarding path is access-controlled:
- * it is the DNS-amplification vector and the remote attack surface for the
- * upstream resolver's 4.1/4.2 issues.
+ * Locally served reverse zones for private address space (RFC 6303): PTR
+ * lookups for RFC 1918, loopback, link-local and ULA addresses never leave the
+ * network.  Names we hold records for are answered by check_internal() first;
+ * everything else under these zones is NXDOMAIN (NODATA at the zone apex),
+ * with the RFC 6303 SOA so clients can cache the answer.
  */
-static struct Packet* resolve_query(struct Packet* pkt,
-                                    const struct sockaddr_storage* src,
-                                    QueryGate* gate,
-                                    int client_tcp) {
+static const char* const k_private_reverse[] = {
+    "10.in-addr.arpa",   "127.in-addr.arpa",  "254.169.in-addr.arpa",
+    "168.192.in-addr.arpa",
+    "16.172.in-addr.arpa", "17.172.in-addr.arpa", "18.172.in-addr.arpa",
+    "19.172.in-addr.arpa", "20.172.in-addr.arpa", "21.172.in-addr.arpa",
+    "22.172.in-addr.arpa", "23.172.in-addr.arpa", "24.172.in-addr.arpa",
+    "25.172.in-addr.arpa", "26.172.in-addr.arpa", "27.172.in-addr.arpa",
+    "28.172.in-addr.arpa", "29.172.in-addr.arpa", "30.172.in-addr.arpa",
+    "31.172.in-addr.arpa",
+    "d.f.ip6.arpa", "8.e.f.ip6.arpa", "9.e.f.ip6.arpa", "a.e.f.ip6.arpa",
+    "b.e.f.ip6.arpa",
+};
+
+static struct Packet* private_reverse_answer(struct Packet* pkt) {
+    if (!pkt || !pkt->full_domain) return NULL;
+    const char* name = pkt->full_domain;
+    for (size_t i = 0; i < sizeof(k_private_reverse) / sizeof(k_private_reverse[0]); i++) {
+        const char* zone = k_private_reverse[i];
+        if (!dname_is_subdomain(name, zone)) continue;
+        bool apex = (strcmp(name, zone) == 0);
+
+        /* RFC 6303 §3: "@ 10800 IN SOA @ nobody.invalid. 1 3600 1200 604800 10800" */
+        static __thread struct AuthDomain soa;
+        memset(&soa, 0, sizeof(soa));
+        snprintf(soa.domain, sizeof(soa.domain), "%s", zone);
+        snprintf(soa.soa_mname, sizeof(soa.soa_mname), "%s", zone);
+        snprintf(soa.soa_rname, sizeof(soa.soa_rname), "nobody.invalid");
+        soa.has_soa = true;
+        soa.soa_serial = 1; soa.soa_refresh = 3600; soa.soa_retry = 1200;
+        soa.soa_expire = 604800; soa.soa_minimum = 10800; soa.soa_ttl = 10800;
+        return apex ? build_nodata_response(pkt, &soa)
+                    : build_nxdomain_response(pkt, &soa);
+    }
+    return NULL;
+}
+
+/* Local answer for `q` from zones, blocklist and private reverse zones. */
+static struct Packet* local_lookup(struct Packet* q) {
+    struct Packet* a = check_internal(q);
+    if (!a) a = policy_answer(q);
+    if (!a) a = private_reverse_answer(q);
+    return a;
+}
+
+/*
+ * Local stage — everything answerable without the network: our zones, the
+ * blocklist, private reverse zones, and CNAME chains whose targets are also
+ * local.  Never blocks on I/O, so it is safe on the UDP receive threads.
+ *
+ * Authoritative answers (our own zones) and local policy are served to ANY
+ * source — the auth server is, by design, publicly answerable for its zones.
+ * Only the remote stage is access-controlled.
+ */
+static struct Packet* resolve_local(struct Packet* pkt, LocalResult* how) {
+    *how = LOCAL_DONE;
+    struct Packet* answer = local_lookup(pkt);
+    if (!answer) { *how = LOCAL_FORWARD; return NULL; }
+
+    /* RFC 1034 §4.3.2: an alias answer must carry its target's records too;
+     * stub resolvers do not chase a bare CNAME themselves. */
+    char target[DNAME_TEXT_MAX];
+    for (int depth = 0; depth < MAX_CNAME_CHASE &&
+                        cname_needs_chase(answer, pkt->q_type, target); depth++) {
+        struct Packet* sub = make_chase_query(pkt, target);
+        if (!sub) break;
+        struct Packet* sub_ans = local_lookup(sub);
+        free_packet(sub);
+        if (!sub_ans) { *how = LOCAL_CHASE; break; }   /* target is not ours */
+        int rc = merge_chased_answer(answer, sub_ans);
+        free_packet(sub_ans);
+        if (rc != 0) break;
+    }
+    return answer;
+}
+
+/*
+ * Remote stage — may block for up to the upstream timeout.  Applies the
+ * recursion gate (the DNS-amplification vector), then forwards the query or,
+ * for LOCAL_CHASE, resolves the CNAME target and appends it to `partial`.
+ * Returns the final answer (NULL → SERVFAIL).  Takes ownership of `partial`.
+ */
+static struct Packet* resolve_remote(struct Packet* pkt, struct Packet* partial,
+                                     LocalResult how,
+                                     const struct sockaddr_storage* src,
+                                     QueryGate* gate, int client_tcp) {
     *gate = QGATE_OK;
-    struct Packet* answer = check_internal(pkt);
-    if (answer) return answer;               /* authoritative — always served */
+    if (how == LOCAL_DONE) return partial;
 
-    /* Local policy: blocklist + local overrides, before forwarding. */
-    answer = policy_answer(pkt);
-    if (answer) return answer;
+    QueryGate g = QGATE_OK;
+    if (src && !acl_allows(src))    g = QGATE_REFUSED;
+    else if (src && !rl_allow(src)) g = QGATE_DROP;
 
-    /* Recursion/forwarding gate. */
-    if (src && !acl_allows(src)) { *gate = QGATE_REFUSED; return NULL; }
-    if (src && !rl_allow(src))   { *gate = QGATE_DROP;    return NULL; }
+    if (how == LOCAL_CHASE) {
+        /* Our own alias is always served; only its external target needs the
+         * recursion permission.  Without it, return the CNAME alone. */
+        if (g != QGATE_OK) return partial;
+        char target[DNAME_TEXT_MAX];
+        if (!cname_needs_chase(partial, pkt->q_type, target)) return partial;
+        struct Packet* sub = make_chase_query(pkt, target);
+        struct Packet* sub_ans = sub ? resolve_recursive(sub, client_tcp) : NULL;
+        if (sub_ans) merge_chased_answer(partial, sub_ans);
+        free_packet(sub_ans);
+        free_packet(sub);
+        return partial;
+    }
 
+    /* LOCAL_FORWARD */
+    free_packet(partial);
+    if (g != QGATE_OK) { *gate = g; return NULL; }
     /* Forward upstream over the same transport the client used: a TCP client
      * needs a TCP upstream query to receive answers too large for UDP. */
-    answer = resolve_recursive(pkt, client_tcp);
+    struct Packet* answer = resolve_recursive(pkt, client_tcp);
     if (answer) normalize_forwarded_flags(answer, pkt);
     return answer;
 }
 
-/* --- UDP packet handler — called inline by each SO_REUSEPORT worker ------- */
+/* Parse-level handling shared by UDP and TCP.  Returns the parsed packet, or
+ * NULL after having dealt with the message (dropped it or sent an error). */
+typedef void (*ErrorSender)(void* ctx, const char* buf, ssize_t n, int rcode);
+typedef void (*PacketSender)(void* ctx, struct Packet* resp);
 
-/*
- * handle_udp_packet — core UDP query processing.
- * buf is a caller-owned stack buffer; no heap allocation needed for this path.
- */
-static void handle_udp_packet(int sock,
-                               const struct sockaddr_storage *caddr,
-                               socklen_t clen,
-                               char *buf, ssize_t n)
-{
-    char client_ip[INET6_ADDRSTRLEN] = "?";
-    uint16_t client_port = 0;
-    if (caddr->ss_family == AF_INET6) {
-        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6*)caddr;
-        inet_ntop(AF_INET6, &s6->sin6_addr, client_ip, sizeof(client_ip));
-        client_port = ntohs(s6->sin6_port);
-    } else {
-        const struct sockaddr_in *s4 = (const struct sockaddr_in*)caddr;
-        inet_ntop(AF_INET, &s4->sin_addr, client_ip, sizeof(client_ip));
-        client_port = ntohs(s4->sin_port);
-    }
+static struct Packet* accept_query(char* buf, ssize_t n, void* ctx,
+                                   ErrorSender send_err, PacketSender send_pkt,
+                                   const char* client_ip, uint16_t client_port) {
+    /* A QR=1 message is a response, not a query: never answer it (answering
+     * responses invites reflection loops between two servers). */
+    if (n >= 3 && ((unsigned char)buf[2] & 0x80)) return NULL;
 
-    struct Packet *pkt = parse_request_headers(buf, n);
+    struct Packet* pkt = parse_request_headers(buf, n);
     if (!pkt) {
-        log_entry(client_ip, client_port, 0, "PARSE_ERROR", RCODE_SERVER_FAILURE, NULL);
-        send_servfail_udp(sock, (const struct sockaddr*)caddr, clen, buf, n);
-        return;
+        log_entry(client_ip, client_port, 0, "PARSE_ERROR", RCODE_FORMAT_ERROR, NULL);
+        send_err(ctx, buf, n, RCODE_FORMAT_ERROR);   /* malformed → FORMERR */
+        return NULL;
     }
 
-    // Non-standard opcode: special-case NOTIFY (opcode 4, RFC 1996)
-    if (pkt->rcode == RCODE_NOTIMP) {
-        unsigned char reply[12] = {0};
-        reply[0] = (unsigned char)buf[0];
-        reply[1] = (unsigned char)buf[1];
-        if (pkt->opcode == 4) {
-            reply[2] = 0x80 | (4 << 3);
-            reply[3] = 0x00;
-        } else {
-            reply[2] = 0x80;
-            reply[3] = 0x80 | RCODE_NOTIMP;
+    // Non-standard opcode: NOTIFY (opcode 4, RFC 1996) is acknowledged.
+    if (pkt->rcode == RCODE_NOTIMP && pkt->opcode == 4) {
+        unsigned char reply[HEADER_LEN + 260];
+        int len = build_error_reply((const unsigned char*)buf, n, 0, reply, sizeof(reply));
+        if (len > 0) {
+            reply[3] &= 0x7F;                         /* RA=0 on a NOTIFY ack */
+            struct Packet ack = { .request = (char*)reply, .recv_len = len };
+            send_pkt(ctx, &ack);
         }
-        sendto(sock, reply, sizeof(reply), 0, (const struct sockaddr*)caddr, clen);
         free_packet(pkt);
-        return;
+        return NULL;
     }
 
-    // Pre-set parser errors (e.g. FORMERR for invalid QCLASS, RFC 1035)
+    // NOTIMP and parser errors (e.g. FORMERR for an invalid QCLASS, RFC 1035)
     if (pkt->rcode != 0) {
-        unsigned char err[12] = {0};
-        err[0] = (unsigned char)buf[0];
-        err[1] = (unsigned char)buf[1];
-        err[2] = 0x80;
-        err[3] = 0x80 | (pkt->rcode & 0xF);
-        sendto(sock, err, sizeof(err), 0, (const struct sockaddr*)caddr, clen);
+        send_err(ctx, buf, n, pkt->rcode);
         free_packet(pkt);
-        return;
+        return NULL;
     }
 
     // Unsupported EDNS version: send BADVERS (RFC 6891 §6.1.3)
     if (pkt->edns_present && pkt->edns_version > 0) {
         struct Packet *bv = build_badvers_response(pkt);
-        if (bv) {
-            send_response(sock, bv, (const struct sockaddr*)caddr, clen);
-            free_packet(bv);
-        }
+        if (bv) { send_pkt(ctx, bv); free_packet(bv); }
         free_packet(pkt);
-        return;
+        return NULL;
     }
 
     atomic_fetch_add(&g_total_queries, 1);
@@ -270,45 +348,130 @@ static void handle_udp_packet(int sock,
         uint8_t idx = (pkt->q_type < 256) ? (uint8_t)pkt->q_type : 0;
         atomic_fetch_add(&g_qtype_counters[idx], 1);
     }
+    return pkt;
+}
 
-    QueryGate gate;
-    struct Packet *answer = resolve_query(pkt, caddr, &gate, 0 /* UDP client */);
-
-    if (gate == QGATE_REFUSED) {
-        log_entry(client_ip, client_port, pkt->q_type, pkt->full_domain, RCODE_REFUSED, NULL);
-        send_refused_udp(sock, (const struct sockaddr*)caddr, clen, buf, n);
-        free_packet(pkt);
-        return;
-    }
-    if (gate == QGATE_DROP) {
-        /* Over rate — drop silently; responding would still amplify. */
-        free_packet(pkt);
-        return;
-    }
-
+/* Log the outcome of a query. */
+static void log_answer(const char* ip, uint16_t port, const struct Packet* pkt,
+                       const struct Packet* answer) {
     if (!answer) {
-        log_entry(client_ip, client_port, pkt->q_type, pkt->full_domain, RCODE_SERVER_FAILURE, NULL);
-        struct Packet *sf = build_servfail_response(pkt);
-        if (sf) {
-            send_response(sock, sf, (const struct sockaddr*)caddr, clen);
-            free_packet(sf);
-        }
+        log_entry(ip, port, pkt->q_type, pkt->full_domain, RCODE_SERVER_FAILURE, NULL);
+        return;
+    }
+    char *resolved_ip = extract_ip_from_response(answer);
+    uint8_t ans_rcode = (answer->recv_len >= HEADER_LEN && answer->request)
+        ? (uint8_t)(rd16(answer->request + 2) & 0xF) : 0;
+    log_entry(ip, port, pkt->q_type, pkt->full_domain, ans_rcode, resolved_ip);
+    free(resolved_ip);
+}
+
+/* --- UDP ------------------------------------------------------------------ */
+
+struct UdpClient {
+    int sock;
+    struct sockaddr_storage addr;
+    socklen_t addr_len;
+    char ip[INET6_ADDRSTRLEN];
+    uint16_t port;
+};
+
+static void udp_send_err(void* ctx, const char* buf, ssize_t n, int rcode) {
+    struct UdpClient* c = ctx;
+    send_error_udp(c->sock, (const struct sockaddr*)&c->addr, c->addr_len, buf, n, rcode);
+}
+
+static void udp_send_pkt(void* ctx, struct Packet* resp) {
+    struct UdpClient* c = ctx;
+    send_response(c->sock, resp, (const struct sockaddr*)&c->addr, c->addr_len);
+}
+
+/* Log, finalize and send a UDP answer (SERVFAIL when NULL); frees `answer`. */
+static void udp_finish(struct UdpClient* c, struct Packet* pkt, struct Packet* answer) {
+    log_answer(c->ip, c->port, pkt, answer);
+    if (!answer) {
+        answer = build_servfail_response(pkt);
+        if (!answer) return;
+    }
+    finalize_udp_response(answer, pkt);
+    udp_send_pkt(c, answer);
+    free_packet(answer);
+}
+
+/* A query handed from a UDP receive thread to the forwarder pool. */
+struct ForwardJob {
+    struct UdpClient client;
+    struct Packet* pkt;
+    struct Packet* partial;
+    LocalResult how;
+};
+
+static struct ThreadPool* g_forward_pool = NULL;
+
+static void* forward_job(void* arg) {
+    struct ForwardJob* job = arg;
+    QueryGate gate;
+    struct Packet* answer = resolve_remote(job->pkt, job->partial, job->how,
+                                           &job->client.addr, &gate, 0 /* UDP */);
+    if (gate == QGATE_REFUSED) {
+        log_entry(job->client.ip, job->client.port, job->pkt->q_type,
+                  job->pkt->full_domain, RCODE_REFUSED, NULL);
+        send_error_udp(job->client.sock, (const struct sockaddr*)&job->client.addr,
+                       job->client.addr_len, job->pkt->request, job->pkt->recv_len,
+                       RCODE_REFUSED);
+    } else if (gate == QGATE_OK) {
+        udp_finish(&job->client, job->pkt, answer);
+    }
+    /* QGATE_DROP: over rate — drop silently; responding would still amplify. */
+    free_packet(job->pkt);
+    free(job);
+    return NULL;
+}
+
+/*
+ * handle_udp_packet — core UDP query processing on a receive thread.
+ * Local answers are sent inline; anything that needs the upstream resolver is
+ * handed to the forwarder pool, so a slow recursion never delays the answers
+ * behind it on this socket (head-of-line blocking).
+ */
+static void handle_udp_packet(int sock,
+                               const struct sockaddr_storage *caddr,
+                               socklen_t clen,
+                               char *buf, ssize_t n)
+{
+    struct UdpClient c = { .sock = sock, .addr_len = clen, .ip = "?" };
+    memcpy(&c.addr, caddr, clen);
+    if (caddr->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6*)caddr;
+        inet_ntop(AF_INET6, &s6->sin6_addr, c.ip, sizeof(c.ip));
+        c.port = ntohs(s6->sin6_port);
+    } else {
+        const struct sockaddr_in *s4 = (const struct sockaddr_in*)caddr;
+        inet_ntop(AF_INET, &s4->sin_addr, c.ip, sizeof(c.ip));
+        c.port = ntohs(s4->sin_port);
+    }
+
+    struct Packet *pkt = accept_query(buf, n, &c, udp_send_err, udp_send_pkt, c.ip, c.port);
+    if (!pkt) return;
+
+    LocalResult how;
+    struct Packet *answer = resolve_local(pkt, &how);
+    if (how == LOCAL_DONE) {
+        udp_finish(&c, pkt, answer);
         free_packet(pkt);
         return;
     }
 
-    char *resolved_ip = extract_ip_from_response(answer);
-    {
-        uint8_t ans_rcode = (answer->recv_len >= HEADER_LEN && answer->request)
-            ? (uint8_t)(ntohs(*(uint16_t*)(answer->request + 2)) & 0xF) : 0;
-        log_entry(client_ip, client_port, pkt->q_type, pkt->full_domain, ans_rcode, resolved_ip);
+    struct ForwardJob *job = malloc(sizeof(*job));
+    if (job) {
+        job->client = c;
+        job->pkt = pkt;
+        job->partial = answer;
+        job->how = how;
+        if (threadpool_add_work(g_forward_pool, forward_job, job) == 0) return;
+        free(job);
     }
-    free(resolved_ip);
-
-    finalize_udp_response(answer, pkt);
-    send_response(sock, answer, (const struct sockaddr*)caddr, clen);
-
-    free_packet(answer);
+    /* Forwarder pool saturated: serve what we have (our CNAME) or SERVFAIL. */
+    udp_finish(&c, pkt, how == LOCAL_CHASE ? answer : (free_packet(answer), NULL));
     free_packet(pkt);
 }
 
@@ -339,7 +502,7 @@ static void* udp_worker_thread(void *arg)
         ssize_t n = recvfrom(sock, buf, sizeof(buf), 0,
                              (struct sockaddr*)&caddr, &clen);
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            if (errno_is_timeout(errno) || errno == EINTR)
                 continue;   /* timeout — re-check g_running */
             perror("worker: recvfrom");
             break;
@@ -354,14 +517,31 @@ static void* udp_worker_thread(void *arg)
 
 /* --- Worker: TCP query --------------------------------------------------- */
 
-void* process_tcp_query(void* arg) {
+/* Idle time allowed before (and between pipelined) queries on one TCP
+ * connection.  Each connection holds a TCP worker, so idle connections are
+ * closed promptly (RFC 7766 §6.2.3) rather than starving new clients. */
+#define TCP_IDLE_TIMEOUT 2
+
+static void tcp_send_err(void* ctx, const char* buf, ssize_t n, int rcode) {
+    send_error_tcp(*(int*)ctx, buf, n, rcode);
+}
+
+static void tcp_send_pkt(void* ctx, struct Packet* resp) {
+    send_tcp_response(*(int*)ctx, resp);
+}
+
+static void* process_tcp_query(void* arg) {
     struct TCPQueryContext* ctx = (struct TCPQueryContext*)arg;
     int fd = ctx->client_fd;
 
-    // Guard against slow clients
-    struct timeval tv = { .tv_sec = SOCKET_TIMEOUT, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    /* Guard against slow and idle clients.  Real clients send their query
+     * immediately after connecting, so the short idle limit applies from the
+     * start — a connection that sits silent is closed within
+     * TCP_IDLE_TIMEOUT and frees its worker. */
+    struct timeval rtv = { .tv_sec = TCP_IDLE_TIMEOUT, .tv_usec = 0 };
+    struct timeval wtv = { .tv_sec = SOCKET_TIMEOUT,   .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &wtv, sizeof(wtv));
 
     // SO_KEEPALIVE: detect dead half-open connections (RFC 7766 §6.2.3)
     int ka = 1;
@@ -373,7 +553,7 @@ void* process_tcp_query(void* arg) {
 
     /* RFC 7766: process multiple queries on one TCP connection (pipelining).
      * Loop until EOF, timeout (RCVTIMEO fires), or a hard error. */
-    while (1) {
+    for (;;) {
         // DNS-over-TCP: 2-byte length prefix
         uint16_t msg_len_net;
         ssize_t n = recv(fd, &msg_len_net, 2, MSG_WAITALL);
@@ -388,66 +568,14 @@ void* process_tcp_query(void* arg) {
         n = recv(fd, buffer, msg_len, MSG_WAITALL);
         if (n != msg_len) { free(buffer); break; }
 
-        struct Packet* pkt = parse_request_headers(buffer, msg_len);
-        if (!pkt) {
-            // Cannot parse: send SERVFAIL using raw TX ID, keep connection alive (RFC 7766)
-            unsigned char sf[12] = {0};
-            sf[0] = (unsigned char)buffer[0];
-            sf[1] = (unsigned char)buffer[1];
-            sf[2] = 0x80;
-            sf[3] = 0x80 | RCODE_SERVER_FAILURE;
-            tcp_write_msg(fd, sf, 12);
-            free(buffer); continue;
-        }
+        struct Packet* pkt = accept_query(buffer, msg_len, &fd, tcp_send_err, tcp_send_pkt,
+                                          ctx->client_ip, ctx->client_port);
+        if (!pkt) { free(buffer); continue; }
 
-        // Non-standard opcode: special-case NOTIFY (opcode 4, RFC 1996)
-        if (pkt->rcode == RCODE_NOTIMP) {
-            unsigned char reply[12] = {0};
-            reply[0] = (unsigned char)buffer[0];
-            reply[1] = (unsigned char)buffer[1];
-            if (pkt->opcode == 4) {
-                /* NOTIFY: respond NOERROR QR=1 OPCODE=4 (RFC 1996 §4) */
-                reply[2] = 0x80 | (4 << 3); // QR=1, OPCODE=4
-                reply[3] = 0x00;             // RCODE=NOERROR
-            } else {
-                reply[2] = 0x80;                   // QR=1
-                reply[3] = 0x80 | RCODE_NOTIMP;   // RA=1, RCODE=4
-            }
-            tcp_write_msg(fd, reply, 12);
-            free_packet(pkt);
-            free(buffer);
-            continue;
-        }
-
-        // Pre-set parser errors (e.g. FORMERR for invalid QCLASS, RFC 1035)
-        if (pkt->rcode != 0) {
-            unsigned char err[12] = {0};
-            err[0] = (unsigned char)buffer[0];
-            err[1] = (unsigned char)buffer[1];
-            err[2] = 0x80;
-            err[3] = 0x80 | (pkt->rcode & 0xF);
-            tcp_write_msg(fd, err, 12);
-            free_packet(pkt); free(buffer); continue;
-        }
-
-        // Unsupported EDNS version: send BADVERS (RFC 6891 §6.1.3)
-        if (pkt->edns_present && pkt->edns_version > 0) {
-            struct Packet* bv = build_badvers_response(pkt);
-            if (bv) { send_tcp_response(fd, bv); free_packet(bv); }
-            free_packet(pkt);
-            free(buffer);
-            continue;
-        }
-
-        /* Count this query. */
-        atomic_fetch_add(&g_total_queries, 1);
-        {
-            uint8_t idx = (pkt->q_type < 256) ? (uint8_t)pkt->q_type : 0;
-            atomic_fetch_add(&g_qtype_counters[idx], 1);
-        }
-
+        LocalResult how;
+        struct Packet* answer = resolve_local(pkt, &how);
         QueryGate gate;
-        struct Packet* answer = resolve_query(pkt, &ctx->client_ss, &gate, 1 /* TCP client */);
+        answer = resolve_remote(pkt, answer, how, &ctx->client_ss, &gate, 1 /* TCP */);
 
         if (gate == QGATE_REFUSED || gate == QGATE_DROP) {
             /* TCP isn't an amplification vector (3-way handshake), so a
@@ -459,29 +587,16 @@ void* process_tcp_query(void* arg) {
             continue;
         }
 
-        if (!answer) {
-            log_entry(ctx->client_ip, ctx->client_port, pkt->q_type, pkt->full_domain, RCODE_SERVER_FAILURE, NULL);
-            struct Packet* sf = build_servfail_response(pkt);
-            if (sf) { append_edns_opt(sf, pkt); send_tcp_response(fd, sf); free_packet(sf); }
-            free_packet(pkt);
-            free(buffer);
-            continue;
+        log_answer(ctx->client_ip, ctx->client_port, pkt, answer);
+        if (!answer) answer = build_servfail_response(pkt);
+        if (answer) {
+            /* RFC 6891 §6.1.1: echo an OPT RR to EDNS clients over TCP too (4.7).
+             * No truncation on TCP, so only the OPT-echo half is needed. */
+            append_edns_opt(answer, pkt);
+            send_tcp_response(fd, answer);
+            free_packet(answer);
         }
 
-        char* resolved_ip = extract_ip_from_response(answer);
-        {
-            uint8_t ans_rcode = (answer->recv_len >= HEADER_LEN && answer->request)
-                ? (uint8_t)(ntohs(*(uint16_t*)(answer->request + 2)) & 0xF) : 0;
-            log_entry(ctx->client_ip, ctx->client_port, pkt->q_type, pkt->full_domain, ans_rcode, resolved_ip);
-        }
-        free(resolved_ip);
-
-        /* RFC 6891 §6.1.1: echo an OPT RR to EDNS clients over TCP too (4.7).
-         * No truncation on TCP, so only the OPT-echo half is needed. */
-        append_edns_opt(answer, pkt);
-        send_tcp_response(fd, answer);
-
-        free_packet(answer);
         free_packet(pkt);
         free(buffer);
     }
@@ -525,6 +640,12 @@ int main(int argc, char** argv) {
     else
         snprintf(g_config_path, sizeof(g_config_path),
                  "%s%s", SERVER_PATH, CONFIG_FILE_PATH);
+
+    /* Pin the config file and query log while still root, so SIGHUP reloads
+     * after the privilege drop can reach them even when an ancestor directory
+     * (e.g. a 0700 home) is not traversable by the drop user. */
+    path_pin(g_config_path);
+    path_pin(LOG_FILE_PATH);
 
     /* Blocklist (the [blocklist] section of config.txt). */
     policy_set_block_mode(g_config.block_mode);
@@ -621,6 +742,21 @@ int main(int argc, char** argv) {
     /* All listening sockets are bound — drop root before serving any query. */
     drop_privileges(g_config.drop_user);
 
+    /*
+     * Forwarder pool: UDP queries that need the upstream resolver run here, so
+     * the receive threads only ever do local, non-blocking work.
+     */
+    struct ThreadPoolConfig fwd_config = {
+        .num_threads    = g_config.thread_count,
+        .max_queue_size = g_config.queue_size
+    };
+    g_forward_pool = threadpool_create(fwd_config);
+    if (!g_forward_pool) {
+        fprintf(stderr, "Error: Failed to create forwarder thread pool\n");
+        exit(EXIT_FAILURE);
+    }
+
+
     for (int i = 0; i < n_udp; i++) {
         struct UDPWorkerArg *wa = malloc(sizeof(*wa));
         if (!wa) { fprintf(stderr, "Error: malloc UDPWorkerArg\n"); exit(EXIT_FAILURE); }
@@ -646,10 +782,11 @@ int main(int argc, char** argv) {
     free(udp6_fds);
 
     /*
-     * TCP: dedicated thread pool sized at min(4, thread_count) so that
-     * slow or idle TCP connections don't starve UDP workers.
+     * TCP: a dedicated pool (each connection holds a worker until it closes or
+     * idles out), sized like the UDP side so a few idle connections cannot
+     * lock out every other TCP client.
      */
-    int tcp_threads = g_config.thread_count < 4 ? g_config.thread_count : 4;
+    int tcp_threads = g_config.thread_count < 4 ? 4 : g_config.thread_count;
     struct ThreadPoolConfig pool_config = {
         .num_threads    = tcp_threads,
         .max_queue_size = g_config.queue_size
@@ -763,6 +900,8 @@ int main(int argc, char** argv) {
 
     threadpool_wait(thread_pool);
     threadpool_destroy(thread_pool);
+    threadpool_wait(g_forward_pool);
+    threadpool_destroy(g_forward_pool);
 
     if (tcp4_sock >= 0) close(tcp4_sock);
     if (tcp6_sock >= 0) close(tcp6_sock);

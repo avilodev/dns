@@ -10,6 +10,7 @@
 #include "query_log.h"
 #include "udp_helpers.h"
 #include "workers.h"
+#include "dns_name.h"
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -126,7 +127,7 @@ static int stats_pipe[2] = {-1, -1};
  * Writes one byte to stats_pipe for SIGUSR1/SIGUSR2 so the main loop
  * can safely call print_qtype_stats() outside signal context.
  */
-void signal_handler(int signum) {
+static void signal_handler(int signum) {
     switch (signum) {
         case SIGINT:
         case SIGTERM:
@@ -152,7 +153,7 @@ void signal_handler(int signum) {
 /*
  * Setup signal handlers for server management.
  */
-void setup_signals(void) {
+static void setup_signals(void) {
     signal(SIGPIPE, SIG_IGN);
 
     struct sigaction sa;
@@ -259,6 +260,11 @@ int main(int argc, char** argv)
 
     char hints_file[256];
     snprintf(hints_file, sizeof(hints_file), "%s%s", SERVER_PATH, HINTS_FILE);
+    /* Pin the hints file and query log while still root, so SIGHUP reloads
+     * after the privilege drop can reach them even when an ancestor directory
+     * (e.g. a 0700 home) is not traversable by the drop user. */
+    path_pin(hints_file);
+    path_pin(LOG_FILE_PATH);
     ret = load_hints(hints_file);
     if (ret < 0) {
         fprintf(stderr, "Warning: Cannot read hints file %s; using built-in root hints\n", hints_file);
@@ -319,6 +325,19 @@ int main(int argc, char** argv)
         exit(EXIT_FAILURE);
     }
 
+    /* TCP gets its own pool: a TCP connection holds its worker until the client
+     * closes or idles out, so sharing the UDP pool would let a handful of idle
+     * TCP connections stall every uncached UDP resolution. */
+    struct ThreadPoolConfig tcp_pool_config = {
+        .num_threads    = g_config.thread_count < 4 ? 4 : g_config.thread_count,
+        .max_queue_size = g_config.queue_size
+    };
+    struct ThreadPool* tcp_pool = threadpool_create(tcp_pool_config);
+    if (!tcp_pool) {
+        fprintf(stderr, "Error: Failed to create TCP thread pool\n");
+        exit(EXIT_FAILURE);
+    }
+
     unsigned long query_count = 0;
 
     // Build poll() fd set — up to 5 fds: UDP4, stats pipe, UDP6, TCP4, TCP6
@@ -341,12 +360,13 @@ int main(int argc, char** argv)
         if (g_reload_hints) {
             g_reload_hints = 0;
             printf("SIGHUP received — reloading root hints from %s\n", hints_file);
-            free_hints();
+            /* load_hints() swaps the table in atomically and leaves the
+             * current hints in service if the file can't be read. */
             int n = load_hints(hints_file);
             if (n > 0)
                 printf("Root hints reloaded: %d server(s)\n", n);
             else
-                fprintf(stderr, "Warning: Hints reload failed; root hints may be empty\n");
+                fprintf(stderr, "Warning: Hints reload failed; keeping current root hints\n");
 
             // Flush NS cache: root hint IPs may have changed and cached zone
             // apex → IP entries could now point to unreachable servers.
@@ -403,7 +423,7 @@ int main(int argc, char** argv)
                 ssize_t recv_len = recvfrom(udp4_sock, recv_buf, MAXLINE, MSG_DONTWAIT,
                                             (struct sockaddr*)&client_addr, &client_len);
                 if (recv_len < 0) {
-                    if (errno != EAGAIN && errno != EWOULDBLOCK)
+                    if (!errno_is_timeout(errno))
                         perror("Error: recvfrom UDP4");
                     break;  // kernel buffer drained
                 }
@@ -428,7 +448,7 @@ int main(int argc, char** argv)
 
                 // Cache hit: respond entirely from the poll loop — no thread wakeup.
                 if (g_answer_cache) {
-                    char domain_fast[256];
+                    char domain_fast[DNAME_TEXT_MAX];
                     uint16_t qtype_fast;
                     bool do_fast = false;
                     uint16_t edns_size_fast = 0;
@@ -515,7 +535,7 @@ int main(int argc, char** argv)
                 ssize_t recv_len = recvfrom(udp6_sock, recv_buf, MAXLINE, MSG_DONTWAIT,
                                             (struct sockaddr*)&client_addr6, &client_len);
                 if (recv_len < 0) {
-                    if (errno != EAGAIN && errno != EWOULDBLOCK)
+                    if (!errno_is_timeout(errno))
                         perror("Error: recvfrom UDP6");
                     break;  // kernel buffer drained
                 }
@@ -537,7 +557,7 @@ int main(int argc, char** argv)
                 }
 
                 if (g_answer_cache) {
-                    char domain_fast[256];
+                    char domain_fast[DNAME_TEXT_MAX];
                     uint16_t qtype_fast;
                     bool do_fast = false;
                     uint16_t edns_size_fast = 0;
@@ -626,7 +646,7 @@ int main(int argc, char** argv)
                         ctx->client_fd = cfd;
                         inet_ntop(AF_INET, &caddr.sin_addr, ctx->client_ip, sizeof(ctx->client_ip));
                         ctx->client_port = ntohs(caddr.sin_port);
-                        if (threadpool_add_work(thread_pool, process_tcp_query, ctx) < 0) {
+                        if (threadpool_add_work(tcp_pool, process_tcp_query, ctx) < 0) {
                             close(cfd); free(ctx);
                         }
                     } else { close(cfd); }
@@ -652,7 +672,7 @@ int main(int argc, char** argv)
                         ctx->client_fd = cfd;
                         inet_ntop(AF_INET6, &caddr6.sin6_addr, ctx->client_ip, sizeof(ctx->client_ip));
                         ctx->client_port = ntohs(caddr6.sin6_port);
-                        if (threadpool_add_work(thread_pool, process_tcp_query, ctx) < 0) {
+                        if (threadpool_add_work(tcp_pool, process_tcp_query, ctx) < 0) {
                             close(cfd); free(ctx);
                         }
                     } else { close(cfd); }
@@ -680,6 +700,8 @@ int main(int argc, char** argv)
 
     threadpool_wait(thread_pool);
     threadpool_destroy(thread_pool);
+    threadpool_wait(tcp_pool);
+    threadpool_destroy(tcp_pool);
 
     pthread_rwlock_destroy(&g_ns_cache_rwlock);
     ns_cache_destroy(g_ns_cache);

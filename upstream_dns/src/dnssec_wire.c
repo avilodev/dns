@@ -1,4 +1,5 @@
 #include "dnssec_wire.h"
+#include "dns_name.h"
 
 #include <ctype.h>
 #include <string.h>
@@ -65,31 +66,15 @@ int expand_name_lc(const uint8_t *buf, int buf_len, int pos,
  */
 int encode_name_lc(const char *name, uint8_t *dst, int dst_size)
 {
-    int pos = 0;
-    const char *p = name;
-    /* Root "." (or empty) is a valid name that encodes to a single zero byte.
-     * Without this, the generic loop below sees a leading '.' as a zero-length
-     * label and returns -1 — which made build_signed_data() fail for every
-     * root-signed RRSIG (signer name "."), blocking DNSSEC chain bootstrap. */
-    if (!p || p[0] == '\0' || (p[0] == '.' && p[1] == '\0')) {
-        if (dst_size < 1) return -1;
-        dst[0] = 0;
-        return 1;
-    }
-    while (*p) {
-        const char *dot = p;
-        while (*dot && *dot != '.') dot++;
-        int len = (int)(dot - p);
-        if (len == 0 || len > 63 || pos + len + 1 >= dst_size) return -1;
-        dst[pos++] = (uint8_t)len;
-        for (int i = 0; i < len; i++)
-            dst[pos++] = (uint8_t)tolower((unsigned char)p[i]);
-        p = dot;
-        if (*p == '.') p++;
-    }
-    if (pos >= dst_size) return -1;
-    dst[pos++] = 0;
-    return pos;
+    /* Canonical form (RFC 4034 §6.2): uncompressed, ASCII letters lowercased.
+     * Encoding goes through the shared codec so escaped label bytes ("\.",
+     * "\DDD") match the wire octets that were signed. */
+    int n = dname_to_wire(name, dst, dst_size);
+    if (n < 0) return -1;
+    for (int i = 0; dst[i] != 0; i += 1 + dst[i])
+        for (int k = 1; k <= dst[i]; k++)
+            if (dst[i + k] >= 'A' && dst[i + k] <= 'Z') dst[i + k] += 32;
+    return n;
 }
 
 /*

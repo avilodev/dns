@@ -44,6 +44,7 @@
  *   RFC 4035 §5   — Validating resolver algorithm
  */
 
+#include "dns_name.h"   /* DNAME_TEXT_MAX */
 #include "dnssec_types.h"
 #include "config.h"    /* TrustAnchor */
 #include "types.h"     /* struct Packet, QTYPE_*, HEADER_LEN */
@@ -62,7 +63,7 @@
  * Forms a singly-linked list headed by DnssecChainCtx.keys.
  */
 typedef struct ValidatedKey {
-    char             zone[256];  /* Canonical owner zone, e.g. "example.com"  */
+    char             zone[DNAME_TEXT_MAX];  /* Canonical owner zone, e.g. "example.com"  */
     DnskeyRdata      dk;         /* Full DNSKEY RDATA (deep-copied)           */
     uint16_t         key_tag;    /* Pre-computed key tag (RFC 4034 Appendix B)*/
     struct ValidatedKey *next;
@@ -76,7 +77,7 @@ typedef struct ValidatedKey {
  * Forms a singly-linked list headed by DnssecChainCtx.pending_ds.
  */
 typedef struct PendingDS {
-    char          zone[256];  /* Child zone this DS covers, e.g. "example.com" */
+    char          zone[DNAME_TEXT_MAX];  /* Child zone this DS covers, e.g. "example.com" */
     DsRdata       ds;         /* DS RDATA including the digest blob             */
     struct PendingDS *next;
 } PendingDS;

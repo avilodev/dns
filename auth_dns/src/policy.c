@@ -1,5 +1,7 @@
 #include "policy.h"
 #include "types.h"      /* QTYPE_A / QTYPE_AAAA / RCODE_* */
+#include "utils.h"      /* path_fopen */
+#include "dns_name.h"   /* dname_parent, DNAME_TEXT_MAX */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,7 +16,7 @@
 /* Hash-table size: the blocklist can hold large public lists (chained). */
 #define POLICY_BLOCK_BUCKETS 16384
 #define POLICY_SINK_TTL       60   /* seconds for sinkhole answers */
-#define MAX_NAME             255
+#define MAX_NAME             (DNAME_TEXT_MAX - 1)
 
 /* ==========================================================================
  * Helpers
@@ -93,12 +95,8 @@ static void blockset_add(BlockSet* s, const char* name)
 /* True if `lname` (lowercased) or any of its parent suffixes is in the set. */
 static int blockset_match_subtree(const BlockSet* s, const char* lname)
 {
-    const char* p = lname;
-    while (p && *p) {
+    for (const char* p = lname; p && *p; p = dname_parent(p))   /* escape-aware */
         if (blockset_contains(s, p)) return 1;
-        const char* dot = strchr(p, '.');
-        p = dot ? dot + 1 : NULL;
-    }
     return 0;
 }
 
@@ -185,9 +183,15 @@ int policy_load(const char* config_path)
     if (!nb) return -1;
 
     if (config_path) {
-        FILE* f = fopen(config_path, "r");
+        FILE* f = path_fopen(config_path);
         if (!f) {
-            fprintf(stderr, "policy: cannot open '%s'\n", config_path);
+            /* Keep the blocklist already in service: swapping in an empty set
+             * here silently disabled filtering whenever a reload could not
+             * read the file (e.g. after the privilege drop). */
+            fprintf(stderr, "policy: cannot open '%s'; keeping current blocklist\n",
+                    config_path);
+            blockset_free(nb);
+            return -1;
         } else {
             char line[2048];
             int in_block = 0;   /* are we inside the [blocklist] section? */

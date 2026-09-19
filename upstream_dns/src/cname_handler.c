@@ -1,4 +1,6 @@
 #include "cname_handler.h"
+#include "dns_name.h"
+#include <ctype.h>
 
 /*
  * Check if domain is already in CNAME chain (loop detection)
@@ -16,93 +18,69 @@ bool check_cname_loop(CnameChain* chain, const char* domain)
 }
 
 /*
- * Write DNS name with compression support
- * Searches for existing labels in buffer and creates compression pointers when possible
+ * Does the name stored at buf[off] (following compression pointers, reading
+ * only buf[0..len)) equal the uncompressed wire name `want`, ignoring ASCII
+ * case?  Comparing wire labels — never text — keeps a label that contains a
+ * dot from matching two labels.
  */
-static int write_dns_name_compressed(const char* name, unsigned char* buffer, 
+static bool wire_name_equals(const unsigned char* buf, size_t len, size_t off,
+                             const uint8_t* want)
+{
+    size_t cur = off;
+    int w = 0, hops = 0;
+    while (cur < len) {
+        uint8_t l = buf[cur];
+        if ((l & 0xC0) == 0xC0) {
+            if (cur + 1 >= len || ++hops > 64) return false;
+            cur = ((size_t)(l & 0x3F) << 8) | buf[cur + 1];
+            continue;
+        }
+        if (l > 63 || l != want[w]) return false;
+        if (l == 0) return true;
+        if (cur + 1 + l > len) return false;
+        for (int k = 1; k <= l; k++)
+            if (tolower(buf[cur + k]) != tolower(want[w + k])) return false;
+        cur += 1 + l;
+        w += 1 + l;
+    }
+    return false;
+}
+
+/*
+ * Write `name` at buffer[pos], replacing its longest suffix that already
+ * appears in buffer[HEADER_LEN .. search_end) with a compression pointer
+ * (RFC 1035 §4.1.4).  Returns bytes written or -1.
+ */
+static int write_dns_name_compressed(const char* name, unsigned char* buffer,
                                      size_t buffer_size, size_t pos,
                                      unsigned char* full_buffer, size_t search_end)
 {
-    if (!name || !buffer || pos >= buffer_size) {
-        return -1;
+    (void)full_buffer;   /* == buffer: pointers refer into the message itself */
+    if (!name || !buffer || pos >= buffer_size) return -1;
+
+    uint8_t wire[256];
+    int wlen = dname_to_wire(name, wire, sizeof(wire));
+    if (wlen < 0) return -1;
+
+    /* Bounded scan: every offset is tried as a candidate, so an unbounded
+     * search is quadratic on large (TCP-sized) answers.  The useful targets —
+     * question and early owners — sit near the start. */
+    size_t limit = search_end < pos ? search_end : pos;
+    if (limit > 2048) limit = 2048;
+
+    for (int off = 0; wire[off] != 0; off += 1 + wire[off]) {
+        for (size_t i = HEADER_LEN; i < limit; i++) {
+            if (!wire_name_equals(buffer, pos, i, wire + off)) continue;
+            if (pos + (size_t)off + 2 > buffer_size) return -1;
+            memcpy(buffer + pos, wire, (size_t)off);        /* leading labels */
+            buffer[pos + off]     = (unsigned char)(0xC0 | (i >> 8));
+            buffer[pos + off + 1] = (unsigned char)(i & 0xFF);
+            return off + 2;
+        }
     }
-    
-    size_t start_pos = pos;
-    char name_copy[256];
-    strncpy(name_copy, name, sizeof(name_copy) - 1);
-    name_copy[sizeof(name_copy) - 1] = '\0';
-    
-    char* saveptr = NULL;
-    char* label = strtok_r(name_copy, ".", &saveptr);
-    
-    // Build the remaining domain for each label
-    char remaining[256];
-    strncpy(remaining, name, sizeof(remaining) - 1);
-    remaining[sizeof(remaining) - 1] = '\0';
-    
-    while (label) {
-        size_t label_len = strlen(label);
-        
-        // Try to find this suffix in the buffer (look for compression opportunity)
-        // Only search up to search_end to avoid false matches
-        bool compressed = false;
-        if (search_end > HEADER_LEN) {
-            for (size_t i = HEADER_LEN; i < search_end && i < pos; i++) {
-                // Check if there's a domain name at this position that matches our remaining domain
-                char* existing = parse_dns_name_from_wire(full_buffer, buffer_size, i);
-                if (existing && strcasecmp(existing, remaining) == 0) {
-                    // Found a match! Use compression pointer
-                    if (pos + 2 > buffer_size) {
-                        free(existing);
-                        return -1;
-                    }
-                    
-                    uint16_t offset = (uint16_t)i;
-                    if (offset < 0x4000) {  // Max 14-bit offset (0x0000–0x3FFF)
-                        buffer[pos++] = 0xC0 | ((offset >> 8) & 0x3F);
-                        buffer[pos++] = offset & 0xFF;
-                        compressed = true;
-                        free(existing);
-                        break;
-                    }
-                }
-                free(existing);
-            }
-        }
-        
-        if (compressed) {
-            break;  // Rest of name is compressed
-        }
-        
-        // No compression - write label normally
-        if (label_len > 63 || pos + label_len + 1 >= buffer_size) {
-            return -1;
-        }
-        
-        buffer[pos++] = (unsigned char)label_len;
-        memcpy(buffer + pos, label, label_len);
-        pos += label_len;
-        
-        // Move to next label in remaining domain
-        char* dot = strchr(remaining, '.');
-        if (dot) {
-            memmove(remaining, dot + 1, strlen(dot));
-        } else {
-            remaining[0] = '\0';
-        }
-        
-        label = strtok_r(NULL, ".", &saveptr);
-    }
-    
-    // If didn't use compression for the whole name, add null terminator
-    if (pos == start_pos || buffer[pos - 2] < 0xC0) {
-        if (pos >= buffer_size) {
-            return -1;
-        }
-        buffer[pos++] = 0;
-    }
-    
-    return pos - start_pos;
+    if (pos + (size_t)wlen > buffer_size) return -1;
+    memcpy(buffer + pos, wire, (size_t)wlen);
+    return wlen;
 }
 
 /*
@@ -157,8 +135,11 @@ struct Packet* reconstruct_cname_response(
         reconstructed->full_domain = strdup(original_query->full_domain);
     }
     
-    // Allocate buffer for complete response
-    size_t buffer_size = MAXLINE;
+    // Allocate buffer for complete response.  Size it from the final answer
+    // (a TCP answer may exceed MAXLINE) plus room for name decompression and
+    // the CNAME chain; UDP size limits are applied later by the transport.
+    size_t buffer_size = (size_t)final_answer->recv_len * 2 + 2048;
+    if (buffer_size < MAXLINE) buffer_size = MAXLINE;
     reconstructed->request = calloc(1, buffer_size);
     if (!reconstructed->request) {
         free(reconstructed->full_domain);
@@ -231,6 +212,10 @@ struct Packet* reconstruct_cname_response(
 
     int question_end_pos = (int)pos;  /* used to truncate TC=1 responses */
 
+    // Header counts are rewritten at the end from what was actually emitted,
+    // so an RR skipped below can never leave ANCOUNT/NSCOUNT overstated.
+    int written_an = 0, written_ns = 0;
+
     // Answer with CNAME compression
     for (int i = 0; i < chain_data->count; i++) {
         if (!chain_data->entries[i].name || !chain_data->entries[i].target) {
@@ -268,7 +253,6 @@ struct Packet* reconstruct_cname_response(
         
         // TTL
         uint32_t ttl = chain_data->entries[i].ttl;
-        if (ttl == 0) ttl = 300;
         uint32_t ttl_net = htonl(ttl);
         memcpy(buffer + pos, &ttl_net, 4);
         pos += 4;
@@ -293,6 +277,7 @@ struct Packet* reconstruct_cname_response(
         uint16_t rdlength = pos - rdata_start;
         uint16_t rdlength_net = htons(rdlength);
         memcpy(buffer + rdlength_pos, &rdlength_net, 2);
+        written_an++;
     }
     
     if (final_answer->ancount > 0 && final_answer->request) {
@@ -328,10 +313,10 @@ struct Packet* reconstruct_cname_response(
             }
             
             // Read TYPE, CLASS, TTL, RDLENGTH
-            uint16_t rr_type = ntohs(*(uint16_t*)(final_buffer + final_pos));
-            uint16_t rr_class = ntohs(*(uint16_t*)(final_buffer + final_pos + 2));
-            uint32_t rr_ttl = ntohl(*(uint32_t*)(final_buffer + final_pos + 4));
-            uint16_t rdlength = ntohs(*(uint16_t*)(final_buffer + final_pos + 8));
+            uint16_t rr_type = rd16(final_buffer + final_pos);
+            uint16_t rr_class = rd16(final_buffer + final_pos + 2);
+            uint32_t rr_ttl = rd32(final_buffer + final_pos + 4);
+            uint16_t rdlength = rd16(final_buffer + final_pos + 8);
             final_pos += 10;
             
             if (final_pos + rdlength > final_answer->recv_len) {
@@ -422,6 +407,7 @@ struct Packet* reconstruct_cname_response(
             memcpy(buffer + rdata_len_pos, &rdlength_net, 2);
             
             final_pos += rdlength;
+            written_an++;
         }
     }
 
@@ -440,7 +426,7 @@ struct Packet* reconstruct_cname_response(
         for (int i = 0; i < final_answer->ancount && final_pos < final_answer->recv_len; i++) {
             skip_dns_name(final_buffer, final_answer->recv_len, &final_pos);
             if (final_pos + 10 > final_answer->recv_len) break;
-            uint16_t rdlength = ntohs(*(uint16_t*)(final_buffer + final_pos + 8));
+            uint16_t rdlength = rd16(final_buffer + final_pos + 8);
             final_pos += 10 + rdlength;
         }
         
@@ -462,10 +448,10 @@ struct Packet* reconstruct_cname_response(
                 break;
             }
             
-            uint16_t rr_type = ntohs(*(uint16_t*)(final_buffer + final_pos));
-            uint16_t rr_class = ntohs(*(uint16_t*)(final_buffer + final_pos + 2));
-            uint32_t rr_ttl = ntohl(*(uint32_t*)(final_buffer + final_pos + 4));
-            uint16_t rdlength = ntohs(*(uint16_t*)(final_buffer + final_pos + 8));
+            uint16_t rr_type = rd16(final_buffer + final_pos);
+            uint16_t rr_class = rd16(final_buffer + final_pos + 2);
+            uint32_t rr_ttl = rd32(final_buffer + final_pos + 4);
+            uint16_t rdlength = rd16(final_buffer + final_pos + 8);
             final_pos += 10;
             
             if (final_pos + rdlength > final_answer->recv_len) {
@@ -561,28 +547,25 @@ struct Packet* reconstruct_cname_response(
             memcpy(buffer + rdata_len_pos, &rdlength_net, 2);
             
             final_pos += rdlength;
+            written_ns++;
         }
     }
+
+    total_answers = (uint16_t)written_an;
+    nscount = (uint16_t)written_ns;
+    buffer[6] = (uint8_t)(total_answers >> 8); buffer[7] = (uint8_t)(total_answers & 0xFF);
+    buffer[8] = (uint8_t)(nscount >> 8);       buffer[9] = (uint8_t)(nscount & 0xFF);
 
     reconstructed->recv_len = pos;
     reconstructed->ancount = total_answers;
     reconstructed->nscount = nscount;
 
-    // If the reconstructed response exceeds the non-EDNS UDP limit, truncate
-    // to the question section only and set TC=1 so the client retries over TCP
-    // (RFC 1035 §4.1.1).  The full data must NOT be sent with TC=1.
-    if ((int)pos > 512) {
-        pos = question_end_pos;
-        reconstructed->recv_len = pos;
-        reconstructed->ancount = 0;
-        reconstructed->nscount = 0;
-        reconstructed->tc = 1;
-        buffer[2] |= 0x02;          /* TC bit */
-        buffer[6] = 0; buffer[7] = 0;   /* ANCOUNT = 0 */
-        buffer[8] = 0; buffer[9] = 0;   /* NSCOUNT = 0 */
-        buffer[10] = 0; buffer[11] = 0; /* ARCOUNT = 0 */
-    }
-    
+    /* No truncation here: this function does not know the client's transport.
+     * UDP replies are trimmed (TC=1) per the client's EDNS size by
+     * finalize_udp_truncation(); TCP clients get the full answer.  (A 512-byte
+     * cut here used to be cached and made large CNAME answers unresolvable.) */
+    (void)question_end_pos;
+
     // Free final_answer
     free_packet(final_answer);
     

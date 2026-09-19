@@ -19,6 +19,7 @@
 #include "auth_answer.h"
 #include "auth_records.h"
 #include "auth_lookup.h"
+#include "dns_name.h"
 
 #include <time.h>
 #include <ctype.h>
@@ -52,11 +53,11 @@ static void write_hdr(char *buf, uint16_t flags,
                       uint16_t qdcount, uint16_t ancount,
                       uint16_t nscount, uint16_t arcount)
 {
-    *(uint16_t*)(buf + 2)  = htons(flags);
-    *(uint16_t*)(buf + 4)  = htons(qdcount);
-    *(uint16_t*)(buf + 6)  = htons(ancount);
-    *(uint16_t*)(buf + 8)  = htons(nscount);
-    *(uint16_t*)(buf + 10) = htons(arcount);
+    wr16(buf + 2, flags);
+    wr16(buf + 4, qdcount);
+    wr16(buf + 6, ancount);
+    wr16(buf + 8, nscount);
+    wr16(buf + 10, arcount);
 }
 
 /* Standard AA+RA response flags (NOERROR). */
@@ -138,10 +139,10 @@ void canon_rr_append(unsigned char *out, size_t *out_pos, size_t out_cap,
     if (*out_pos + need > out_cap) return;
 
     memcpy(out + *out_pos, own_wire, own_len);        *out_pos += (size_t)own_len;
-    *(uint16_t*)(out + *out_pos) = htons(type);       *out_pos += 2;
-    *(uint16_t*)(out + *out_pos) = htons(1 /* IN */); *out_pos += 2;
-    *(uint32_t*)(out + *out_pos) = htonl(ttl);        *out_pos += 4;
-    *(uint16_t*)(out + *out_pos) = htons((uint16_t)rdlen); *out_pos += 2;
+    wr16(out + *out_pos, type);       *out_pos += 2;
+    wr16(out + *out_pos, 1 /* IN */); *out_pos += 2;
+    wr32(out + *out_pos, ttl);        *out_pos += 4;
+    wr16(out + *out_pos, (uint16_t)rdlen); *out_pos += 2;
     memcpy(out + *out_pos, rdata, rdlen);             *out_pos += rdlen;
 }
 
@@ -185,17 +186,17 @@ int append_rrsig(char *buf, int *pos,
      *   + signer_name(var)                                           */
     unsigned char rrsig_hdr[320];
     int hdr_pos = 0;
-    *(uint16_t*)(rrsig_hdr + hdr_pos) = htons(type_covered);      hdr_pos += 2;
+    wr16(rrsig_hdr + hdr_pos, type_covered);      hdr_pos += 2;
     rrsig_hdr[hdr_pos++] = zsk->algorithm;
     /* RFC 4034 §3.1.3: for wildcard RRsets, labels = label count of owner
      * minus one (the '*' label is not counted in the RRSIG labels field). */
     int lcount = count_labels(owner_name);
     if (is_wildcard && lcount > 0) lcount--;
     rrsig_hdr[hdr_pos++] = (uint8_t)lcount;
-    *(uint32_t*)(rrsig_hdr + hdr_pos) = htonl(ttl);               hdr_pos += 4;
-    *(uint32_t*)(rrsig_hdr + hdr_pos) = htonl(expiration);        hdr_pos += 4;
-    *(uint32_t*)(rrsig_hdr + hdr_pos) = htonl(inception);         hdr_pos += 4;
-    *(uint16_t*)(rrsig_hdr + hdr_pos) = htons(zsk->key_tag);      hdr_pos += 2;
+    wr32(rrsig_hdr + hdr_pos, ttl);               hdr_pos += 4;
+    wr32(rrsig_hdr + hdr_pos, expiration);        hdr_pos += 4;
+    wr32(rrsig_hdr + hdr_pos, inception);         hdr_pos += 4;
+    wr16(rrsig_hdr + hdr_pos, zsk->key_tag);      hdr_pos += 2;
     memcpy(rrsig_hdr + hdr_pos, signer_wire, signer_wire_len);    hdr_pos += signer_wire_len;
 
     /* signed_data = RRSIG_hdr || canonical_rrset  (RFC 4034 §6.2) */
@@ -219,12 +220,12 @@ int append_rrsig(char *buf, int *pos,
     if (explicit_rr_owner) {
         write_dns_labels(explicit_rr_owner, buf, pos, MAXLINE);
     } else {
-        *(uint16_t*)(buf + *pos) = htons(DNS_NAME_PTR);             *pos += 2;
+        wr16(buf + *pos, DNS_NAME_PTR);             *pos += 2;
     }
-    *(uint16_t*)(buf + *pos) = htons(QTYPE_RRSIG);                *pos += 2;
-    *(uint16_t*)(buf + *pos) = htons(1 /* IN */);                 *pos += 2;
-    *(uint32_t*)(buf + *pos) = htonl(ttl);                        *pos += 4;
-    *(uint16_t*)(buf + *pos) = htons((uint16_t)rrsig_rdlen);      *pos += 2;
+    wr16(buf + *pos, QTYPE_RRSIG);                *pos += 2;
+    wr16(buf + *pos, 1 /* IN */);                 *pos += 2;
+    wr32(buf + *pos, ttl);                        *pos += 4;
+    wr16(buf + *pos, (uint16_t)rrsig_rdlen);      *pos += 2;
     memcpy(buf + *pos, rrsig_hdr, hdr_pos);                       *pos += hdr_pos;
     memcpy(buf + *pos, sig, sig_len);                              *pos += (int)sig_len;
     free(sig);
@@ -275,15 +276,15 @@ int emit_signed_rrset(struct Packet *r, int *pos, const char *owner,
     int written = 0;
     for (int i = 0; i < n; i++) {
         if (*pos + 2 + 2 + 2 + 4 + 2 + (int)blobs[i].len > MAXLINE) break;
-        *(uint16_t*)(r->request + *pos) = htons(DNS_NAME_PTR);   *pos += 2;
-        *(uint16_t*)(r->request + *pos) = htons(type);           *pos += 2;
-        *(uint16_t*)(r->request + *pos) = htons(1 /* IN */);     *pos += 2;
-        *(uint32_t*)(r->request + *pos) = htonl(ttl);            *pos += 4;
-        *(uint16_t*)(r->request + *pos) = htons(blobs[i].len);   *pos += 2;
+        wr16(r->request + *pos, DNS_NAME_PTR);   *pos += 2;
+        wr16(r->request + *pos, type);           *pos += 2;
+        wr16(r->request + *pos, 1 /* IN */);     *pos += 2;
+        wr32(r->request + *pos, ttl);            *pos += 4;
+        wr16(r->request + *pos, blobs[i].len);   *pos += 2;
         memcpy(r->request + *pos, blobs[i].data, blobs[i].len);  *pos += blobs[i].len;
         written++;
     }
-    *(uint16_t*)(r->request + 6) = htons((uint16_t)written);
+    wr16(r->request + 6, (uint16_t)written);
 
     if (do_bit && written > 0 && key) {
         unsigned char canon[16384];
@@ -294,7 +295,7 @@ int emit_signed_rrset(struct Packet *r, int *pos, const char *owner,
         if (canon_pos > 0 &&
             append_rrsig(r->request, pos, owner, type, ttl,
                          canon, canon_pos, key, false, NULL))
-            *(uint16_t*)(r->request + 6) = htons((uint16_t)(written + 1));
+            wr16(r->request + 6, (uint16_t)(written + 1));
     }
     return written;
 }
@@ -309,49 +310,39 @@ int emit_signed_rrset(struct Packet *r, int *pos, const char *owner,
  */
 static bool is_in_zone(const char *name, const char *zone)
 {
-    if (!name || !zone) return false;
-    if (strcmp(name, zone) == 0) return true;
-    size_t nlen = strlen(name), zlen = strlen(zone);
-    return nlen > zlen &&
-           name[nlen - zlen - 1] == '.' &&
-           strcmp(name + nlen - zlen, zone) == 0;
+    return name && zone && dname_is_subdomain(name, zone);
 }
 
 /*
  * dns_canon_cmp — canonical DNS name order (RFC 4034 §6.1).
- * Labels compared right-to-left, case-insensitive.
+ * Names are compared as wire labels from the rightmost label leftwards; each
+ * label is compared as a lowercased octet string, and a shorter label (or name)
+ * that is a prefix of the other sorts first.  Working on wire labels keeps an
+ * escaped dot inside a label from being treated as a separator.
  * Returns <0 if a < b, 0 if equal, >0 if a > b.
  */
 static int dns_canon_cmp(const char *a, const char *b)
 {
-    /* Split each name into label pointers by scanning for dots. */
-    char abuf[256], bbuf[256];
-    strncpy(abuf, a, 255); abuf[255] = '\0';
-    strncpy(bbuf, b, 255); bbuf[255] = '\0';
+    uint8_t wa[256], wb[256];
+    int la = dname_to_wire(a, wa, sizeof(wa));
+    int lb = dname_to_wire(b, wb, sizeof(wb));
+    if (la < 0 || lb < 0) return strcmp(a, b);        /* malformed: stable fallback */
 
-    const char *la[128];  int na = 0;
-    const char *lb[128];  int nb = 0;
+    /* Offsets of each label, so we can walk them right to left. */
+    int oa[128], ob[128], na = 0, nb = 0;
+    for (int i = 0; wa[i]; i += 1 + wa[i]) oa[na++] = i;
+    for (int i = 0; wb[i]; i += 1 + wb[i]) ob[nb++] = i;
 
-    /* Split abuf in-place: turn dots into NULs, record label starts. */
-    la[na++] = abuf;
-    for (char *p = abuf; *p; p++) {
-        if (*p == '.' && *(p+1) != '\0') { *p = '\0'; la[na++] = p + 1; }
+    for (int ia = na - 1, ib = nb - 1; ia >= 0 && ib >= 0; ia--, ib--) {
+        const uint8_t *x = wa + oa[ia], *y = wb + ob[ib];
+        int lx = x[0], ly = y[0], m = lx < ly ? lx : ly;
+        for (int k = 1; k <= m; k++) {
+            int cx = tolower(x[k]), cy = tolower(y[k]);
+            if (cx != cy) return cx - cy;
+        }
+        if (lx != ly) return lx - ly;
     }
-    lb[nb++] = bbuf;
-    for (char *p = bbuf; *p; p++) {
-        if (*p == '.' && *(p+1) != '\0') { *p = '\0'; lb[nb++] = p + 1; }
-    }
-
-    /* Compare from rightmost label. */
-    int ia = na - 1, ib = nb - 1;
-    while (ia >= 0 && ib >= 0) {
-        int c = strcasecmp(la[ia], lb[ib]);
-        if (c != 0) return c;
-        ia--; ib--;
-    }
-    /* All compared labels matched; shorter name sorts first. */
-    if (ia < 0 && ib < 0) return 0;
-    return (ia < 0) ? -1 : 1;
+    return na - nb;                                   /* ancestor sorts first */
 }
 
 /*
@@ -509,15 +500,15 @@ static void append_nsec_authority(char *buf, int *pos,
 
     /* Write NSEC RR: owner (full wire labels) + type + class + ttl + rdlen + rdata */
     write_dns_labels(owner_name, buf, pos, MAXLINE);
-    *(uint16_t*)(buf + *pos) = htons(QTYPE_NSEC);            *pos += 2;
-    *(uint16_t*)(buf + *pos) = htons(1 /* IN */);             *pos += 2;
-    *(uint32_t*)(buf + *pos) = htonl(ttl);                   *pos += 4;
-    *(uint16_t*)(buf + *pos) = htons((uint16_t)rdata_len);   *pos += 2;
+    wr16(buf + *pos, QTYPE_NSEC);            *pos += 2;
+    wr16(buf + *pos, 1 /* IN */);             *pos += 2;
+    wr32(buf + *pos, ttl);                   *pos += 4;
+    wr16(buf + *pos, (uint16_t)rdata_len);   *pos += 2;
     memcpy(buf + *pos, rdata, rdata_len);                    *pos += rdata_len;
 
     /* Increment NSCOUNT */
-    uint16_t nscount = ntohs(*(uint16_t*)(buf + 8));
-    *(uint16_t*)(buf + 8) = htons(nscount + 1);
+    uint16_t nscount = rd16(buf + 8);
+    wr16(buf + 8, nscount + 1);
 
     /* Append RRSIG(NSEC) when DO=1 */
     if (req->do_bit && g_zone_keys) {
@@ -529,8 +520,8 @@ static void append_nsec_authority(char *buf, int *pos,
                             owner_name, QTYPE_NSEC, ttl, rdata, rdata_len);
             if (append_rrsig(buf, pos, owner_name, QTYPE_NSEC, ttl,
                               canon, canon_pos, zsk, false, owner_name)) {
-                nscount = ntohs(*(uint16_t*)(buf + 8));
-                *(uint16_t*)(buf + 8) = htons(nscount + 1);
+                nscount = rd16(buf + 8);
+                wr16(buf + 8, nscount + 1);
             }
         }
     }
@@ -563,12 +554,14 @@ struct Packet *check_internal(struct Packet *req)
      * (NXDOMAIN, RFC 1034/2308), or a name we are not authoritative for at all
      * (forward upstream). */
     if (!has_entry) {
-        const struct AuthDomain *wc = find_wildcard(owner);
+        /* An empty non-terminal exists, so it is NODATA and never
+         * wildcard-synthesized (RFC 4592 §2.2.2). */
+        bool ent = is_empty_non_terminal(owner);
+        const struct AuthDomain *wc = ent ? NULL : find_wildcard(owner);
         if (!wc) {
             if (soa) {
                 /* Inside a zone we own but with no exact record: NODATA only
                  * for an empty non-terminal, otherwise NXDOMAIN. */
-                bool ent = is_empty_non_terminal(owner);
                 struct Packet *r = ent ? build_nodata_response(req, soa)
                                        : build_nxdomain_response(req, soa);
                 if (r && req->do_bit && soa) {
@@ -603,11 +596,11 @@ struct Packet *check_internal(struct Packet *req)
                 int wpos;
                 r = begin_response(req, &wpos, 1);
                 if (r) {
-                    *(uint16_t*)(r->request + wpos) = htons(DNS_NAME_PTR);  wpos += 2;
-                    *(uint16_t*)(r->request + wpos) = htons(QTYPE_A); wpos += 2;
-                    *(uint16_t*)(r->request + wpos) = htons(1);       wpos += 2;
-                    *(uint32_t*)(r->request + wpos) = htonl(wttl);    wpos += 4;
-                    *(uint16_t*)(r->request + wpos) = htons(4);       wpos += 2;
+                    wr16(r->request + wpos, DNS_NAME_PTR);  wpos += 2;
+                    wr16(r->request + wpos, QTYPE_A); wpos += 2;
+                    wr16(r->request + wpos, 1);       wpos += 2;
+                    wr32(r->request + wpos, wttl);    wpos += 4;
+                    wr16(r->request + wpos, 4);       wpos += 2;
                     memcpy(r->request + wpos, &ia.s_addr, 4);         wpos += 4;
                     r->recv_len = wpos;
                 }
@@ -618,11 +611,11 @@ struct Packet *check_internal(struct Packet *req)
                 int wpos;
                 r = begin_response(req, &wpos, 1);
                 if (r) {
-                    *(uint16_t*)(r->request + wpos) = htons(DNS_NAME_PTR);     wpos += 2;
-                    *(uint16_t*)(r->request + wpos) = htons(QTYPE_AAAA); wpos += 2;
-                    *(uint16_t*)(r->request + wpos) = htons(1);          wpos += 2;
-                    *(uint32_t*)(r->request + wpos) = htonl(wttl);       wpos += 4;
-                    *(uint16_t*)(r->request + wpos) = htons(16);         wpos += 2;
+                    wr16(r->request + wpos, DNS_NAME_PTR);     wpos += 2;
+                    wr16(r->request + wpos, QTYPE_AAAA); wpos += 2;
+                    wr16(r->request + wpos, 1);          wpos += 2;
+                    wr32(r->request + wpos, wttl);       wpos += 4;
+                    wr16(r->request + wpos, 16);         wpos += 2;
                     memcpy(r->request + wpos, &ia6, 16);                 wpos += 16;
                     r->recv_len = wpos;
                 }
@@ -706,25 +699,13 @@ struct Packet *check_internal(struct Packet *req)
         if (!r) r = build_nodata_response(req, soa);
         break;
 
-    case QTYPE_SOA: {
-        /* Try exact-name SOA first, then fall back to zone SOA. */
-        const char *soa_owner = owner;
-        const struct AuthDomain *soa_d = NULL;
-        for (int i = 0; i < auth_domain_count; i++) {
-            if (auth_domains[i].has_soa &&
-                strcmp(auth_domains[i].domain, owner) == 0) {
-                soa_d = &auth_domains[i];
-                break;
-            }
-        }
-        if (!soa_d && soa) {
-            soa_d = soa;
-            soa_owner = soa->domain;
-        }
-        if (soa_d) r = build_soa_response(req, soa_owner);
-        if (!r)   r = build_nodata_response(req, soa);
+    case QTYPE_SOA:
+        /* Only a zone apex owns an SOA.  Below the apex the answer is NODATA
+         * with the zone SOA in the authority section (RFC 2308 §2.2) — not
+         * the apex SOA relabelled with the query name. */
+        r = build_soa_response(req, owner);
+        if (!r) r = build_nodata_response(req, soa);
         break;
-    }
 
     case QTYPE_DNSKEY:
         r = build_dnskey_response(req, owner);
@@ -750,9 +731,9 @@ struct Packet *check_internal(struct Packet *req)
     /* For NODATA responses when DO=1: append NSEC proof of non-existence
      * (RFC 4034 §3.1.3).  Detect NODATA by RCODE=NOERROR + ANCOUNT=0. */
     if (r && req->do_bit && soa) {
-        uint16_t flags   = ntohs(*(uint16_t*)(r->request + 2));
+        uint16_t flags   = rd16(r->request + 2);
         uint16_t rcode   = flags & 0x000Fu;
-        uint16_t ancount = ntohs(*(uint16_t*)(r->request + 6));
+        uint16_t ancount = rd16(r->request + 6);
         if (rcode == 0 && ancount == 0) {
             int pos = (int)r->recv_len;
             char nsec_owner[256], nsec_next[256];

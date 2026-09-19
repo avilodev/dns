@@ -1,44 +1,17 @@
 #include "dns_synth.h"
+#include "dns_name.h"
 
 #include <string.h>
 
-/* Protocol constants — kept local so this module depends on nothing else. */
+/* Protocol constants — kept local; the only dependency is the name codec. */
 #define DNS_HEADER_LEN 12
 #define DNS_TYPE_CNAME  5
 
-/*
- * Encode a presentation-form name ("mail.example.com") into DNS wire labels.
- * Returns the number of bytes written (including the terminating zero), or -1.
- * Self-contained so dns_synth has no cross-module dependency.
- */
+/* Encode a presentation-form name into wire labels via the shared codec.
+ * Returns the number of bytes written (including the root label), or -1. */
 static int synth_encode_name(const char* name, unsigned char* out, size_t cap)
 {
-    if (!name || !out) return -1;
-    size_t w = 0;
-
-    /* Root / empty name. */
-    if (name[0] == '\0' || (name[0] == '.' && name[1] == '\0')) {
-        if (cap < 1) return -1;
-        out[w++] = 0;
-        return (int)w;
-    }
-
-    const char* p = name;
-    while (*p) {
-        if (*p == '.') { p++; continue; }          /* skip dots / empty labels */
-        const char* end = p;
-        while (*end && *end != '.') end++;
-        size_t len = (size_t)(end - p);
-        if (len > 63) return -1;
-        if (w + 1 + len + 1 > cap) return -1;       /* len byte + label + terminator */
-        out[w++] = (unsigned char)len;
-        memcpy(out + w, p, len);
-        w += len;
-        p = end;
-    }
-    if (w + 1 > cap) return -1;
-    out[w++] = 0;
-    return (int)w;
+    return dname_to_wire(name, out, (int)cap);
 }
 
 /*

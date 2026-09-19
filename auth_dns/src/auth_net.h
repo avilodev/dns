@@ -17,6 +17,11 @@ void send_servfail_udp(int sock, const struct sockaddr* addr, socklen_t addr_len
 void send_refused_udp(int sock, const struct sockaddr* addr, socklen_t addr_len,
                       const char* buf, ssize_t buf_len);
 void send_refused_tcp(int fd, const char* buf, ssize_t buf_len);
+int  build_error_reply(const unsigned char* req, ssize_t req_len, int rcode,
+                       unsigned char* out, int out_cap);
+void send_error_udp(int sock, const struct sockaddr* addr, socklen_t addr_len,
+                    const char* buf, ssize_t buf_len, int rcode);
+void send_error_tcp(int fd, const char* buf, ssize_t buf_len, int rcode);
 void tcp_write_msg(int fd, const unsigned char* msg, uint16_t len);
 
 #endif /* AUTH_NET_H */

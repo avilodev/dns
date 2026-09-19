@@ -125,52 +125,92 @@ int create_tcp_socket_v6(int port) {
     return sock;
 }
 
-/* --- Shared query resolution logic --------------------------------------- */
+/* --- Error replies ------------------------------------------------------- */
 
-/* Send a raw SERVFAIL back over UDP without parsing the request. */
+/*
+ * Build an error reply (header + echoed question) for a raw query.
+ *
+ * The question is echoed whenever the query carries exactly one well-formed
+ * question: stub resolvers such as glibc discard replies whose question does
+ * not match what they asked (only FORMERR is exempt) and then wait out their
+ * full timeout.  Opcode and RD are echoed, RA is set.  Returns the reply length
+ * (12 when no question could be echoed), or 0 on bad input.
+ */
+int build_error_reply(const unsigned char* req, ssize_t req_len, int rcode,
+                      unsigned char* out, int out_cap)
+{
+    if (!req || req_len < 2 || !out || out_cap < HEADER_LEN) return 0;
+    memset(out, 0, HEADER_LEN);
+    out[0] = req[0];
+    out[1] = req[1];
+    out[2] = (unsigned char)(0x80 | (req_len > 2 ? (req[2] & 0x79) : 0)); /* QR, opcode, RD */
+    out[3] = (unsigned char)(0x80 | (rcode & 0x0F));                      /* RA, RCODE    */
+
+    if (req_len < HEADER_LEN + 5 || req[4] != 0 || req[5] != 1) return HEADER_LEN;
+    int q = HEADER_LEN;
+    while (q < req_len) {
+        uint8_t l = req[q];
+        if (l == 0) { q++; break; }
+        if (l > 63) return HEADER_LEN;            /* compression / bad label */
+        q += 1 + l;
+    }
+    if (q > req_len || q + 4 > req_len || req[q - 1] != 0) return HEADER_LEN;
+    int qlen = q + 4 - HEADER_LEN;
+    if (HEADER_LEN + qlen > out_cap) return HEADER_LEN;
+    memcpy(out + HEADER_LEN, req + HEADER_LEN, (size_t)qlen);
+    out[5] = 1;                                   /* QDCOUNT = 1 */
+    return HEADER_LEN + qlen;
+}
+
+void send_error_udp(int sock, const struct sockaddr* addr, socklen_t addr_len,
+                    const char* buf, ssize_t buf_len, int rcode)
+{
+    if (!addr || !buf) return;
+    unsigned char resp[HEADER_LEN + 260] = {0};
+    int n = build_error_reply((const unsigned char*)buf, buf_len, rcode, resp, sizeof(resp));
+    if (n > 0) sendto(sock, resp, (size_t)n, 0, addr, addr_len);
+}
+
+void send_error_tcp(int fd, const char* buf, ssize_t buf_len, int rcode)
+{
+    unsigned char resp[HEADER_LEN + 260] = {0};
+    int n = build_error_reply((const unsigned char*)buf, buf_len, rcode, resp, sizeof(resp));
+    if (n > 0) tcp_write_msg(fd, resp, (uint16_t)n);
+}
+
+/* Send a SERVFAIL back over UDP. */
 void send_servfail_udp(int sock, const struct sockaddr* addr, socklen_t addr_len,
                                const char* buf, ssize_t buf_len) {
-    if (!addr || !buf || buf_len < 2) return;
-    unsigned char resp[12] = {0};
-    resp[0] = (unsigned char)buf[0];  // TX ID high byte
-    resp[1] = (unsigned char)buf[1];  // TX ID low byte
-    resp[2] = 0x80;                   // QR=1
-    resp[3] = 0x80 | RCODE_SERVER_FAILURE;
-    sendto(sock, resp, sizeof(resp), 0, addr, addr_len);
+    send_error_udp(sock, addr, addr_len, buf, buf_len, RCODE_SERVER_FAILURE);
 }
 
 /*
- * Send a minimal REFUSED reply (RFC 1035 RCODE 5) — used to reject recursion
- * from sources outside the allow-list (known_issues 4.3).
+ * Send a REFUSED reply (RFC 1035 RCODE 5) — used to reject recursion from
+ * sources outside the allow-list (known_issues 4.3).  No larger than the
+ * query, so it cannot be used for amplification.
  */
 void send_refused_udp(int sock, const struct sockaddr* addr, socklen_t addr_len,
                              const char* buf, ssize_t buf_len) {
-    if (!addr || !buf || buf_len < 3) return;
-    unsigned char resp[12] = {0};
-    resp[0] = (unsigned char)buf[0];
-    resp[1] = (unsigned char)buf[1];
-    resp[2] = 0x80 | ((unsigned char)buf[2] & 0x79);  // QR=1, echo OPCODE+RD
-    resp[3] = 0x80 | RCODE_REFUSED;                   // RA=1, RCODE=REFUSED
-    sendto(sock, resp, sizeof(resp), 0, addr, addr_len);
+    send_error_udp(sock, addr, addr_len, buf, buf_len, RCODE_REFUSED);
 }
 
 /* Send a length-prefixed REFUSED reply over a TCP connection. */
 void send_refused_tcp(int fd, const char* buf, ssize_t buf_len) {
-    if (buf_len < 3) return;
-    uint16_t len_net = htons(12);
-    unsigned char resp[12] = {0};
-    resp[0] = (unsigned char)buf[0];
-    resp[1] = (unsigned char)buf[1];
-    resp[2] = 0x80 | ((unsigned char)buf[2] & 0x79);
-    resp[3] = 0x80 | RCODE_REFUSED;
-    if (write(fd, &len_net, 2) != 2) return;
-    if (write(fd, resp, 12)   != 12) return;
+    send_error_tcp(fd, buf, buf_len, RCODE_REFUSED);
 }
 
 /* Best-effort length-prefixed write of a small fixed DNS message over TCP.
  * Return values are checked so the build stays clean under _FORTIFY_SOURCE. */
 void tcp_write_msg(int fd, const unsigned char* msg, uint16_t len) {
-    uint16_t len_net = htons(len);
-    if (write(fd, &len_net, 2) != 2) return;
-    if (write(fd, msg, len) != (ssize_t)len) return;
+    unsigned char out[2 + HEADER_LEN + 260];
+    if (len > sizeof(out) - 2) return;
+    out[0] = (unsigned char)(len >> 8);
+    out[1] = (unsigned char)(len & 0xFF);
+    memcpy(out + 2, msg, len);
+    size_t off = 0, total = (size_t)len + 2;
+    while (off < total) {
+        ssize_t w = write(fd, out + off, total - off);
+        if (w <= 0) return;
+        off += (size_t)w;
+    }
 }

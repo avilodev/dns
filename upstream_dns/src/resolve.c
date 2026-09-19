@@ -1,4 +1,6 @@
 #include "resolve.h"
+#include "config.h"
+#include "dns_name.h"
 #include "ns_resolution_context.h"
 #include "ns_resolver.h"
 #include "cache.h"
@@ -12,7 +14,6 @@
 #include <pthread.h>
 
 
-extern Hints* g_hints[13];
 extern NSCache* g_ns_cache;
 extern AnswerCache* g_answer_cache;
 extern TrustAnchor* g_trust_anchors;
@@ -38,23 +39,22 @@ static void bootstrap_root_keys(DnssecChainCtx *chain)
 {
     if (!chain || !g_trust_anchors) return;
 
-    int idx = get_random_server();
-    if (idx < 0 || idx >= 13 || !g_hints[idx] ||
-        !g_hints[idx]->ipv4_record || !g_hints[idx]->ipv4_record->ip)
-        return;
+    char *root_ip = hints_random_root_ip();
+    if (!root_ip) return;
 
     struct Packet root_q = {0};
     root_q.full_domain = strdup(".");
-    if (!root_q.full_domain) return;
+    if (!root_q.full_domain) { free(root_ip); return; }
     root_q.q_type  = QTYPE_DNSKEY;
     root_q.q_class = 1;   /* IN */
     root_q.qdcount = 1;
 
     struct Packet *qfmt = format_resolver(&root_q);
     free(root_q.full_domain);
-    if (!qfmt) return;
+    if (!qfmt) { free(root_ip); return; }
 
-    struct Packet *resp = query_server(g_hints[idx]->ipv4_record->ip, qfmt);
+    struct Packet *resp = query_server(root_ip, qfmt);
+    free(root_ip);
     free_packet(qfmt);
     if (!resp) return;
 
@@ -79,6 +79,11 @@ static void bootstrap_root_keys(DnssecChainCtx *chain)
  */
 static bool cacheable_answer(struct Packet *response, bool want_dnssec)
 {
+    /* Never cache a truncated (TC=1) answer: it is incomplete by definition,
+     * and a cached empty TC reply makes the name unresolvable for its TTL. */
+    if (!response || !response->request || response->recv_len < 4 ||
+        (((unsigned char)response->request[2]) & 0x02))
+        return false;
     if (!want_dnssec) return true;
     if (response && response->ad) return true;   /* validated — AD set */
     return !response_is_signed(response);         /* unsigned: ok; signed: no */
@@ -136,6 +141,35 @@ struct Packet* send_resolver_with_ns_context(struct Packet* query,
     free_cname_chain(&cname_chain);
     dnssec_chain_free(&dnssec_chain);
     return result;
+}
+
+/*
+ * Pick the next usable nameserver from the most recent referral's candidate
+ * list (glue IP first, else resolve the NS name).  Returns a malloc'd IP, or
+ * NULL once the list is exhausted.  Used whenever one delegation peer fails —
+ * no reply, an error RCODE, a lame/upward referral, or a malformed answer —
+ * so a single broken nameserver never fails a zone whose siblings work.
+ */
+static char* next_ns_candidate(NSCandidateList* list, int* idx,
+                               NSResolutionContext* ns_context)
+{
+    while (list && *idx < list->count) {
+        int i = (*idx)++;
+        char* ns_name = list->candidates[i].ns_name;
+        char* glue_ip = list->candidates[i].ns_ip;
+        if (glue_ip) return strdup(glue_ip);
+        if (ns_context && already_resolving_ns(ns_context, ns_name)) {
+            fprintf(stderr, "    NS resolution loop detected\n");
+            continue;
+        }
+        char* ip = ns_context ? resolve_ns_name_internal(ns_name, QTYPE_A, ns_context)
+                              : resolve_ns_name(ns_name, QTYPE_A);
+        if (ip) {
+            fprintf(stderr, "  → Trying fallback NS candidate: %s\n", ip);
+            return ip;
+        }
+    }
+    return NULL;
 }
 
 /* Internal resolver: handles CNAME following, NS referral walking, and caching. */
@@ -198,56 +232,46 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
     // Find starting nameserver
     char* current_server_ip = NULL;
     bool started_from_cache = false;
-    char* tld = get_tld_from_domain(query->full_domain);
 
     /* The zone the server we are about to query is authoritative for.  Used by
      * the referral bailiwick check (4.1): every accepted delegation must move
      * strictly DOWN the tree from this zone.  "" represents the root.  When we
      * start from a cached NS we begin mid-tree, so seed it with the zone whose
-     * apex matched the cache (the full name, or the TLD). */
+     * apex matched the cache. */
     char* current_zone = NULL;
 
-    /* When validating DNSSEC, the NS cache MUST be bypassed: starting from a
+    /* Start from the deepest cached zone that encloses the name: walk the
+     * name's suffixes from longest to shortest (www.example.com, example.com,
+     * com) and take the first NS-cache hit.  A DS RRset lives in the PARENT
+     * zone, so a DS query must not start at the name's own zone.
+     *
+     * When validating DNSSEC, the NS cache MUST be bypassed: starting from a
      * cached nameserver skips the root->TLD->zone delegation walk, and that
      * walk is exactly what carries the DS records needed to build the
-     * chain-of-trust.  A cached-start resolution can never validate (the chain
-     * never gets past the root), so for DO=1/CD=0 queries we always walk from
-     * the root hints.  Non-DNSSEC queries keep the NS-cache fast path. */
-    if (!want_dnssec && g_ns_cache) {
-        current_server_ip = ns_cache_get(g_ns_cache, query->full_domain);
-        if (current_server_ip) {
-            started_from_cache = true;
-            current_zone = strdup(query->full_domain);
-        }
-    }
-
-    if (!want_dnssec && !current_server_ip && g_ns_cache && tld) {
-        current_server_ip = ns_cache_get(g_ns_cache, tld);
-        if (current_server_ip) {
-            started_from_cache = true;
-            current_zone = strdup(tld);
+     * chain-of-trust.  Non-DNSSEC queries keep the NS-cache fast path. */
+    if (!want_dnssec && g_ns_cache && strcmp(query->full_domain, ".") != 0) {
+        const char* suffix = query->full_domain;
+        if (query->q_type == QTYPE_DS)
+            suffix = dname_parent(suffix);
+        while (suffix && *suffix && !current_server_ip) {
+            current_server_ip = ns_cache_get(g_ns_cache, suffix);
+            if (current_server_ip) {
+                started_from_cache = true;
+                current_zone = strdup(suffix);
+                break;
+            }
+            suffix = dname_parent(suffix);   /* escape-aware label step */
         }
     }
 
     if (!current_server_ip) {
-        int server_idx = get_random_server();
-        if (server_idx < 0 || server_idx >= 13 || !g_hints[server_idx] ||
-            !g_hints[server_idx]->ipv4_record || !g_hints[server_idx]->ipv4_record->ip) {
-            free(tld);
+        current_server_ip = hints_random_root_ip();
+        if (!current_server_ip) {
             free(current_zone);
             fprintf(stderr, "Failed to get root server\n");
             return NULL;
         }
-
-        current_server_ip = strdup(g_hints[server_idx]->ipv4_record->ip);
-        if (!current_server_ip) {
-            free(tld);
-            free(current_zone);
-            return NULL;
-        }
     }
-
-    free(tld);
 
     /* Default to the root zone when we did not start from a cached NS. */
     if (!current_zone) current_zone = strdup("");
@@ -307,8 +331,16 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
             return NULL;
         }
 
+        /* Loop detection keys on (server, zone), not the server alone: one
+         * nameserver IP legitimately serves several zones on the way down
+         * (parent and child hosted together), which is not a loop.  Asking the
+         * same server about the same zone twice is. */
+        char visit_key[INET6_ADDRSTRLEN + 260];
+        snprintf(visit_key, sizeof(visit_key), "%s|%s", current_server_ip,
+                 current_zone ? current_zone : "");
+
         // Check for server loop
-        if (already_queried(&visited, current_server_ip)) {
+        if (already_queried(&visited, visit_key)) {
             fprintf(stderr, "Referral loop detected\n");
             free(current_server_ip);
             free_server_history(&visited);
@@ -318,7 +350,7 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
 
         // Add to visited servers
         if (visited.count < MAX_SERVERS_VISITED) {
-            visited.servers[visited.count] = strdup(current_server_ip);
+            visited.servers[visited.count] = strdup(visit_key);
             if (visited.servers[visited.count]) {
                 visited.count++;
             }
@@ -339,30 +371,7 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
             current_server_ip = NULL;
 
             // Try the next candidate from the most recent referral before giving up.
-            while (pending_ns_list && pending_ns_idx < pending_ns_list->count) {
-                int i = pending_ns_idx++;
-                char* ns_name = pending_ns_list->candidates[i].ns_name;
-                char* glue_ip  = pending_ns_list->candidates[i].ns_ip;
-                char* fallback_ip = NULL;
-
-                if (glue_ip) {
-                    fallback_ip = strdup(glue_ip);
-                } else {
-                    if (ns_context && already_resolving_ns(ns_context, ns_name)) {
-                        fprintf(stderr, "    NS resolution loop detected\n");
-                        continue;
-                    }
-                    fallback_ip = ns_context
-                        ? resolve_ns_name_internal(ns_name, QTYPE_A, ns_context)
-                        : resolve_ns_name(ns_name, QTYPE_A);
-                }
-
-                if (fallback_ip) {
-                    fprintf(stderr, "  → Trying fallback NS candidate: %s\n", fallback_ip);
-                    current_server_ip = fallback_ip;
-                    break;
-                }
-            }
+            current_server_ip = next_ns_candidate(pending_ns_list, &pending_ns_idx, ns_context);
 
             if (!current_server_ip) {
                 // All candidates from the last referral are exhausted.
@@ -376,12 +385,7 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                     current_zone = strdup("");  /* restarting from the root */
                     started_from_cache = false;
                     iteration = 0;
-                    int ridx = get_random_server();
-                    if (ridx < 0 || ridx >= 13 || !g_hints[ridx] ||
-                        !g_hints[ridx]->ipv4_record || !g_hints[ridx]->ipv4_record->ip) {
-                        return NULL;
-                    }
-                    current_server_ip = strdup(g_hints[ridx]->ipv4_record->ip);
+                    current_server_ip = hints_random_root_ip();
                     if (!current_server_ip) return NULL;
                 } else {
                     free_server_history(&visited);
@@ -412,12 +416,7 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
             current_zone = strdup("");  /* restarting from the root */
             started_from_cache = false;
             iteration = 0;
-            int ridx = get_random_server();
-            if (ridx < 0 || ridx >= 13 || !g_hints[ridx] ||
-                !g_hints[ridx]->ipv4_record || !g_hints[ridx]->ipv4_record->ip) {
-                return NULL;
-            }
-            current_server_ip = strdup(g_hints[ridx]->ipv4_record->ip);
+            current_server_ip = hints_random_root_ip();
             if (!current_server_ip) return NULL;
             continue;
         }
@@ -445,7 +444,9 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
         // full answer (RFC 1035 §4.2.2).  For referral responses (ancount==0,
         // nscount>0) continue with partial glue data — a TCP fallback for a
         // referral is uncommon and would delay resolution unnecessarily.
-        if (response->tc && response->ancount > 0) {
+        bool is_referral = !response->aa && response->ancount == 0 &&
+                           response->nscount > 0;
+        if (response->tc && !is_referral) {
             fprintf(stderr, "Warning: Truncated UDP answer from %s for %s"
                     " — retrying over TCP\n",
                     current_server_ip,
@@ -473,9 +474,9 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
          * CNAME-passthrough return paths could leak an attacker-set AD bit.
          */
         if (response->request && response->recv_len >= 4) {
-            uint16_t hflags = ntohs(*(uint16_t*)(response->request + 2));
+            uint16_t hflags = rd16(response->request + 2);
             hflags &= ~(1u << 5);   /* AD bit */
-            *(uint16_t*)(response->request + 2) = htons(hflags);
+            wr16(response->request + 2, hflags);
         }
         response->ad = 0;
 
@@ -484,7 +485,6 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
             if (g_answer_cache && response->request && response->recv_len > 0 &&
                 cacheable_answer(response, want_dnssec)) {
                 uint32_t ttl = extract_min_ttl_from_response(response);
-                if (ttl == 0) ttl = 300;
                 answer_cache_put(g_answer_cache, query->full_domain, query->q_type,
                                response->request, response->recv_len, ttl);
             }
@@ -506,32 +506,7 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
             free_packet(response);
             response = NULL;
             free(current_server_ip);
-            current_server_ip = NULL;
-
-            while (pending_ns_list && pending_ns_idx < pending_ns_list->count) {
-                int i = pending_ns_idx++;
-                char* ns_name = pending_ns_list->candidates[i].ns_name;
-                char* glue_ip = pending_ns_list->candidates[i].ns_ip;
-                char* fallback_ip = NULL;
-
-                if (glue_ip) {
-                    fallback_ip = strdup(glue_ip);
-                } else {
-                    if (ns_context && already_resolving_ns(ns_context, ns_name)) {
-                        fprintf(stderr, "    NS resolution loop detected\n");
-                        continue;
-                    }
-                    fallback_ip = ns_context
-                        ? resolve_ns_name_internal(ns_name, QTYPE_A, ns_context)
-                        : resolve_ns_name(ns_name, QTYPE_A);
-                }
-
-                if (fallback_ip) {
-                    fprintf(stderr, "  → Trying fallback NS candidate: %s\n", fallback_ip);
-                    current_server_ip = fallback_ip;
-                    break;
-                }
-            }
+            current_server_ip = next_ns_candidate(pending_ns_list, &pending_ns_idx, ns_context);
 
             if (!current_server_ip) {
                 free_server_history(&visited);
@@ -548,7 +523,6 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                 if (g_answer_cache && response->request && response->recv_len > 0 &&
                 cacheable_answer(response, want_dnssec)) {
                     uint32_t ttl = extract_min_ttl_from_response(response);
-                    if (ttl == 0) ttl = 300;
                     answer_cache_put(g_answer_cache, query->full_domain, query->q_type,
                                    response->request, response->recv_len, ttl);
                 }
@@ -597,10 +571,8 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                 CnameChainData chain_data = {0};
                 chain_data.entries[0].name = strdup(query->full_domain);
                 chain_data.entries[0].target = strdup(cname_target);
+                /* The CNAME RR's real TTL (0 is legitimate: "do not cache"). */
                 chain_data.entries[0].ttl = extract_min_ttl_from_response(response);
-                if (chain_data.entries[0].ttl == 0) {
-                    chain_data.entries[0].ttl = 300;
-                }
                 chain_data.entries[0].rdata = NULL;
                 chain_data.entries[0].rdata_len = 0;
                 chain_data.count = 1;
@@ -688,7 +660,6 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                 if (g_answer_cache && complete && complete->request && complete->recv_len > 0 &&
                     cacheable_answer(complete, want_dnssec)) {
                     uint32_t ttl = extract_min_ttl_from_response(complete);
-                    if (ttl == 0) ttl = 300;
                     answer_cache_put(g_answer_cache, query->full_domain,
                                    query->q_type, complete->request,
                                    complete->recv_len, ttl);
@@ -726,9 +697,9 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                 }
                 /* dv==1: all RRSIGs verified — set AD bit (RFC 4035 §3.2.3) */
                 if (dv == 1 && response->request && response->recv_len >= 4) {
-                    uint16_t hflags = ntohs(*(uint16_t*)(response->request + 2));
+                    uint16_t hflags = rd16(response->request + 2);
                     hflags |= (1u << 5);  /* AD bit */
-                    *(uint16_t*)(response->request + 2) = htons(hflags);
+                    wr16(response->request + 2, hflags);
                     response->ad = 1;
                 }
             }
@@ -736,7 +707,6 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
             if (g_answer_cache && response->request && response->recv_len > 0 &&
                 cacheable_answer(response, want_dnssec)) {
                 uint32_t ttl = extract_min_ttl_from_response(response);
-                if (ttl == 0) ttl = 300;
                 answer_cache_put(g_answer_cache, query->full_domain, query->q_type,
                                response->request, response->recv_len, ttl);
             }
@@ -752,7 +722,6 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
             if (g_answer_cache && response->request && response->recv_len > 0 &&
                 cacheable_answer(response, want_dnssec)) {
                 uint32_t ttl = extract_min_ttl_from_response(response);
-                if (ttl == 0) ttl = 300;
                 answer_cache_put(g_answer_cache, query->full_domain, query->q_type,
                                response->request, response->recv_len, ttl);
             }
@@ -786,6 +755,9 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                            name_in_bailiwick(zone_apex, current_zone) &&
                            !name_in_bailiwick(current_zone, zone_apex);
             if (!apex_ok) {
+                /* Lame or upward referral (or an attempted out-of-bailiwick
+                 * one): distrust this server entirely, but try its siblings
+                 * from the previous referral before failing the lookup. */
                 fprintf(stderr,
                         "Rejecting out-of-bailiwick referral: apex='%s'"
                         " server-zone='%s' query='%s'\n",
@@ -793,11 +765,17 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
                         current_zone ? current_zone : "(root)",
                         query->full_domain);
                 free(zone_apex);
-                free(current_server_ip);
-                free_server_history(&visited);
                 free_packet(response);
-                RESOLVE_CLEANUP();
-                return NULL;
+                response = NULL;
+                free(current_server_ip);
+                current_server_ip = next_ns_candidate(pending_ns_list, &pending_ns_idx,
+                                                      ns_context);
+                if (!current_server_ip) {
+                    free_server_history(&visited);
+                    RESOLVE_CLEANUP();
+                    return NULL;
+                }
+                continue;
             }
 
             /* Glue is filtered to the answering server's zone (current_zone)
@@ -964,12 +942,19 @@ struct Packet* send_resolver_internal(struct Packet* query, int cname_depth,
             continue;
         }
 
-        fprintf(stderr, "Unexpected response format\n");
-        free(current_server_ip);
-        free_server_history(&visited);
+        /* NOERROR with no answer, no AA and no delegation: not a usable
+         * reply from this server.  Try a sibling before giving up. */
+        fprintf(stderr, "Unexpected response format from %s\n", current_server_ip);
         free_packet(response);
-        RESOLVE_CLEANUP();
-        return NULL;
+        response = NULL;
+        free(current_server_ip);
+        current_server_ip = next_ns_candidate(pending_ns_list, &pending_ns_idx, ns_context);
+        if (!current_server_ip) {
+            free_server_history(&visited);
+            RESOLVE_CLEANUP();
+            return NULL;
+        }
+        continue;
     }
 
     fprintf(stderr, "Maximum iterations (%d) reached\n", MAX_ITERATIONS);

@@ -40,8 +40,8 @@ void echo_question(char* buf, int* pos, const struct Packet* request)
         write_dns_labels(request->full_domain, buf, pos, MAXLINE);
     else
         buf[(*pos)++] = 0;
-    *(uint16_t*)(buf + *pos) = htons(request->q_type);   *pos += 2;
-    *(uint16_t*)(buf + *pos) = htons(request->q_class);  *pos += 2;
+    wr16(buf + *pos, request->q_type);   *pos += 2;
+    wr16(buf + *pos, request->q_class);  *pos += 2;
 }
 
 /*
@@ -58,26 +58,26 @@ static void append_soa_authority(char* buf, int* pos, const struct AuthDomain* s
     int rdata_len = 0;
     write_dns_labels(soa->soa_mname, rdata, &rdata_len, sizeof(rdata));
     write_dns_labels(soa->soa_rname, rdata, &rdata_len, sizeof(rdata));
-    *(uint32_t*)(rdata + rdata_len) = htonl(soa->soa_serial);   rdata_len += 4;
-    *(uint32_t*)(rdata + rdata_len) = htonl(soa->soa_refresh);  rdata_len += 4;
-    *(uint32_t*)(rdata + rdata_len) = htonl(soa->soa_retry);    rdata_len += 4;
-    *(uint32_t*)(rdata + rdata_len) = htonl(soa->soa_expire);   rdata_len += 4;
-    *(uint32_t*)(rdata + rdata_len) = htonl(soa->soa_minimum);  rdata_len += 4;
+    wr32(rdata + rdata_len, soa->soa_serial);   rdata_len += 4;
+    wr32(rdata + rdata_len, soa->soa_refresh);  rdata_len += 4;
+    wr32(rdata + rdata_len, soa->soa_retry);    rdata_len += 4;
+    wr32(rdata + rdata_len, soa->soa_expire);   rdata_len += 4;
+    wr32(rdata + rdata_len, soa->soa_minimum);  rdata_len += 4;
 
     // SOA RR TTL: min(soa_ttl, soa_minimum) per RFC 2308 §5
     uint32_t ttl = (soa->soa_ttl < soa->soa_minimum) ? soa->soa_ttl : soa->soa_minimum;
 
     // Owner name: zone apex in wire format
     write_dns_labels(soa->domain, buf, pos, MAXLINE);
-    *(uint16_t*)(buf + *pos) = htons(QTYPE_SOA);   *pos += 2;
-    *(uint16_t*)(buf + *pos) = htons(1);            *pos += 2;  // CLASS IN
-    *(uint32_t*)(buf + *pos) = htonl(ttl);          *pos += 4;
-    *(uint16_t*)(buf + *pos) = htons((uint16_t)rdata_len); *pos += 2;
+    wr16(buf + *pos, QTYPE_SOA);   *pos += 2;
+    wr16(buf + *pos, 1);            *pos += 2;  // CLASS IN
+    wr32(buf + *pos, ttl);          *pos += 4;
+    wr16(buf + *pos, (uint16_t)rdata_len); *pos += 2;
     memcpy(buf + *pos, rdata, rdata_len);
     *pos += rdata_len;
 
     // Update NSCOUNT at wire offset 8
-    *(uint16_t*)(buf + 8) = htons(1);
+    wr16(buf + 8, 1);
 }
 
 
@@ -183,17 +183,17 @@ struct Packet* build_nxdomain_response(struct Packet* request,
     flags |= (request->rd << 8);  // Copy recursion desired
     flags |= (1 << 7);            // Recursion Available
     flags |= RCODE_NAME_ERROR;    // RCODE: NXDOMAIN = 3
-    *(uint16_t*)(response->request + pos) = htons(flags);
+    wr16(response->request + pos, flags);
     pos += 2;
 
     // Set counts (NSCOUNT updated to 1 by append_soa_authority when soa != NULL)
-    *(uint16_t*)(response->request + pos) = htons(1);  // 1 question
+    wr16(response->request + pos, 1);  // 1 question
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);  // 0 answers
+    wr16(response->request + pos, 0);  // 0 answers
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);  // 0 authority (updated below)
+    wr16(response->request + pos, 0);  // 0 authority (updated below)
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);  // 0 additional
+    wr16(response->request + pos, 0);  // 0 additional
     pos += 2;
 
     // Echo the question verbatim (preserves QNAME case — 4.8)
@@ -243,17 +243,17 @@ struct Packet* build_nodata_response(struct Packet* request,
     flags |= (request->rd << 8);  // Copy recursion desired
     flags |= (1 << 7);            // RA: Recursion Available
     flags |= RCODE_NO_ERROR;      // RCODE: 0 (no error, but no data)
-    *(uint16_t*)(response->request + pos) = htons(flags);
+    wr16(response->request + pos, flags);
     pos += 2;
 
     // NSCOUNT updated to 1 by append_soa_authority when soa != NULL
-    *(uint16_t*)(response->request + pos) = htons(1);  // 1 question
+    wr16(response->request + pos, 1);  // 1 question
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);  // 0 answers
+    wr16(response->request + pos, 0);  // 0 answers
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);  // 0 authority (updated below)
+    wr16(response->request + pos, 0);  // 0 authority (updated below)
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);  // 0 additional
+    wr16(response->request + pos, 0);  // 0 additional
     pos += 2;
 
     // Echo the question verbatim (preserves QNAME case — 4.8)
@@ -297,16 +297,16 @@ struct Packet* build_servfail_response(struct Packet* request) {
     flags |= (request->rd << 8);      // Copy recursion desired
     flags |= (1 << 7);                // RA: Recursion Available
     flags |= RCODE_SERVER_FAILURE;    // RCODE: 2 (SERVFAIL)
-    *(uint16_t*)(response->request + pos) = htons(flags);
+    wr16(response->request + pos, flags);
     pos += 2;
 
-    *(uint16_t*)(response->request + pos) = htons(1);  // 1 question
+    wr16(response->request + pos, 1);  // 1 question
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);  // 0 answers
+    wr16(response->request + pos, 0);  // 0 answers
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);
+    wr16(response->request + pos, 0);
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);
+    wr16(response->request + pos, 0);
     pos += 2;
 
     // Echo the question verbatim (preserves QNAME case — 4.8)
@@ -344,16 +344,16 @@ struct Packet* build_badvers_response(struct Packet* request) {
     flags |= (1u << 15);              /* QR */
     flags |= ((unsigned)request->rd << 8); /* RD */
     flags |= (1u << 7);              /* RA */
-    *(uint16_t*)(response->request + pos) = htons(flags);
+    wr16(response->request + pos, flags);
     pos += 2;
 
-    *(uint16_t*)(response->request + pos) = htons(1);   /* QDCOUNT = 1 */
+    wr16(response->request + pos, 1);   /* QDCOUNT = 1 */
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);   /* ANCOUNT = 0 */
+    wr16(response->request + pos, 0);   /* ANCOUNT = 0 */
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(0);   /* NSCOUNT = 0 */
+    wr16(response->request + pos, 0);   /* NSCOUNT = 0 */
     pos += 2;
-    *(uint16_t*)(response->request + pos) = htons(1);   /* ARCOUNT = 1 (OPT) */
+    wr16(response->request + pos, 1);   /* ARCOUNT = 1 (OPT) */
     pos += 2;
 
     /* Question section — echo verbatim to preserve QNAME case (4.8) */
@@ -366,10 +366,10 @@ struct Packet* build_badvers_response(struct Packet* request) {
      *   bytes 2-3 = flags (DO bit etc.) */
     if (pos + 11 <= MAXLINE) {
         response->request[pos++] = 0x00;                              /* root name  */
-        *(uint16_t*)(response->request + pos) = htons(41);            pos += 2; /* OPT  */
-        *(uint16_t*)(response->request + pos) = htons(4096);          pos += 2; /* payload */
-        *(uint32_t*)(response->request + pos) = htonl(RCODE_BADVERS << 24); pos += 4; /* TTL */
-        *(uint16_t*)(response->request + pos) = htons(0);             pos += 2; /* RDLEN=0 */
+        wr16(response->request + pos, 41);            pos += 2; /* OPT  */
+        wr16(response->request + pos, 4096);          pos += 2; /* payload */
+        wr32(response->request + pos, RCODE_BADVERS << 24); pos += 4; /* TTL */
+        wr16(response->request + pos, 0);             pos += 2; /* RDLEN=0 */
     }
 
     response->recv_len = pos;
@@ -395,10 +395,10 @@ static int skip_wire_name(const unsigned char* buf, int len, int pos)
 static int message_has_opt(const unsigned char* buf, int len)
 {
     if (!buf || len < HEADER_LEN) return 0;
-    uint16_t qd = ntohs(*(const uint16_t*)(buf + 4));
-    uint16_t an = ntohs(*(const uint16_t*)(buf + 6));
-    uint16_t ns = ntohs(*(const uint16_t*)(buf + 8));
-    uint16_t ar = ntohs(*(const uint16_t*)(buf + 10));
+    uint16_t qd = rd16(buf + 4);
+    uint16_t an = rd16(buf + 6);
+    uint16_t ns = rd16(buf + 8);
+    uint16_t ar = rd16(buf + 10);
 
     int pos = HEADER_LEN;
     for (int i = 0; i < qd; i++) {
@@ -410,8 +410,8 @@ static int message_has_opt(const unsigned char* buf, int len)
     for (long i = 0; i < rr; i++) {
         pos = skip_wire_name(buf, len, pos);
         if (pos < 0 || pos + 10 > len) return 0;
-        uint16_t type  = ntohs(*(const uint16_t*)(buf + pos));
-        uint16_t rdlen = ntohs(*(const uint16_t*)(buf + pos + 8));
+        uint16_t type  = rd16(buf + pos);
+        uint16_t rdlen = rd16(buf + pos + 8);
         if (type == 41) return 1;                   /* OPT */
         pos += 10 + rdlen;
     }
@@ -438,15 +438,15 @@ void append_edns_opt(struct Packet *response, const struct Packet *request)
     int pos = (int)response->recv_len;
     if (pos + 11 > MAXLINE) return;
     response->request[pos++] = 0x00;                          /* root name  */
-    *(uint16_t*)(response->request + pos) = htons(41);        pos += 2; /* OPT  */
-    *(uint16_t*)(response->request + pos) = htons(4096);      pos += 2; /* payload */
+    wr16(response->request + pos, 41);        pos += 2; /* OPT  */
+    wr16(response->request + pos, 4096);      pos += 2; /* payload */
     /* TTL: [ext_rcode=0][version=0][flags] — mirror DO bit   */
     uint32_t opt_ttl = request->do_bit ? 0x00008000u : 0u;
-    *(uint32_t*)(response->request + pos) = htonl(opt_ttl);   pos += 4;
-    *(uint16_t*)(response->request + pos) = htons(0);         pos += 2; /* RDLEN=0 */
+    wr32(response->request + pos, opt_ttl);   pos += 4;
+    wr16(response->request + pos, 0);         pos += 2; /* RDLEN=0 */
     response->recv_len = pos;
-    uint16_t arcount = ntohs(*(uint16_t*)(response->request + 10));
-    *(uint16_t*)(response->request + 10) = htons(arcount + 1);
+    uint16_t arcount = rd16(response->request + 10);
+    wr16(response->request + 10, arcount + 1);
 }
 
 /* ==========================================================================
@@ -484,11 +484,11 @@ void finalize_udp_response(struct Packet *response, const struct Packet *request
         qend += 4; /* QTYPE (2) + QCLASS (2) */
 
         /* Set TC=1 (bit 9 of flags word, 0-indexed from MSB). */
-        uint16_t flags = ntohs(*(uint16_t*)(response->request + 2));
+        uint16_t flags = rd16(response->request + 2);
         flags |= (1u << 9);
-        *(uint16_t*)(response->request + 2) = htons(flags);
-        *(uint16_t*)(response->request + 6) = 0;   /* ANCOUNT = 0 */
-        *(uint16_t*)(response->request + 8) = 0;   /* NSCOUNT = 0 */
+        wr16(response->request + 2, flags);
+        wr16(response->request + 6, 0);   /* ANCOUNT = 0 */
+        wr16(response->request + 8, 0);   /* NSCOUNT = 0 */
 
         /* RFC 6891 §7: if client sent EDNS, we MUST include an OPT record in
          * every response, including truncated ones.  Re-write a minimal OPT
@@ -497,15 +497,15 @@ void finalize_udp_response(struct Packet *response, const struct Packet *request
         if (request->edns_present && qend + 11 <= MAXLINE) {
             char *p = response->request + qend;
             p[0] = 0x00;                                          /* root name  */
-            *(uint16_t*)(p + 1) = htons(41);                      /* OPT        */
-            *(uint16_t*)(p + 3) = htons(4096);                    /* payload    */
+            wr16(p + 1, 41);                      /* OPT        */
+            wr16(p + 3, 4096);                    /* payload    */
             uint32_t opt_ttl = request->do_bit ? 0x00008000u : 0u;
-            *(uint32_t*)(p + 5) = htonl(opt_ttl);                 /* TTL/flags  */
-            *(uint16_t*)(p + 9) = htons(0);                       /* RDLEN = 0  */
-            *(uint16_t*)(response->request + 10) = htons(1);      /* ARCOUNT = 1 */
+            wr32(p + 5, opt_ttl);                 /* TTL/flags  */
+            wr16(p + 9, 0);                       /* RDLEN = 0  */
+            wr16(response->request + 10, 1);      /* ARCOUNT = 1 */
             response->recv_len = qend + 11;
         } else {
-            *(uint16_t*)(response->request + 10) = 0;             /* ARCOUNT = 0 */
+            wr16(response->request + 10, 0);             /* ARCOUNT = 0 */
             response->recv_len = qend;
         }
     }

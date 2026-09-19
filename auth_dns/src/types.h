@@ -16,6 +16,19 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include "wire_io.h"   /* alignment-safe wire field access */
+
+/* True for the errno a timed-out or would-block socket call reports.  EAGAIN
+ * and EWOULDBLOCK are the same value on Linux but may differ elsewhere. */
+static inline bool errno_is_timeout(int e)
+{
+#if EAGAIN == EWOULDBLOCK
+    return e == EAGAIN;
+#else
+    return e == EAGAIN || e == EWOULDBLOCK;
+#endif
+}
+
 #define PORT 53
 
 #define MAXLINE 4096
@@ -107,11 +120,8 @@ struct Packet {
     uint16_t nscount;  // Authority count
     uint16_t arcount;  // Additional count
 
-    // Domain components
+    // Question name: presentation text from dns_name.h (escaped, lowercase)
     char* full_domain;
-    char* authoritative_domain;
-    char* domain;
-    char* top_level_domain;
 
      uint16_t q_type;   // Query type
     uint16_t q_class;  // Query class (1=IN)

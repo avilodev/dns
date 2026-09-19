@@ -1,10 +1,11 @@
 #include "dns_wire.h"
+#include "dns_name.h"
 
 /*
  * Skip over a DNS name in wire format
  * Handles both labels and compression pointers
  */
-void skip_dns_name(unsigned char* buffer, int buffer_len, int* pos)
+void skip_dns_name(const unsigned char* buffer, int buffer_len, int* pos)
 {
     if (!buffer || !pos || *pos >= buffer_len) return;
     
@@ -33,175 +34,34 @@ void skip_dns_name(unsigned char* buffer, int buffer_len, int* pos)
 }
 
 /*
- * Parse a DNS name from wire format into a readable string
- * Handles compression pointers with loop detection
+ * Parse a (possibly compressed) DNS name into presentation text (dns_name.h:
+ * escaped, case preserved, root = ".").  Returns a malloc'd string, or NULL
+ * on a malformed name.
  */
-char* parse_dns_name_from_wire(unsigned char* buffer, int buffer_len, int pos)
+char* parse_dns_name_from_wire(const unsigned char* buffer, int buffer_len, int pos)
 {
-    if (!buffer || pos >= buffer_len) return NULL;
-    
-    char name[256] = {0};
-    int name_len = 0;
-    int jumps = 0;
-    
-    while (pos < buffer_len && jumps < MAX_NAME_JUMPS) {
-        uint8_t len = buffer[pos];
-        
-        // End of name
-        if (len == 0) {
-            break;
-        }
-        
-        // Compression pointer
-        if ((len & 0xC0) == 0xC0) {
-            if (pos + 1 >= buffer_len) return NULL;
-            
-            uint16_t offset = ((len & 0x3F) << 8) | buffer[pos + 1];
-            if (offset >= buffer_len) return NULL;
-            
-            pos = offset;
-            jumps++;
-            continue;
-        }
-        
-        // Regular label
-        if (len > 63) return NULL;
-        
-        pos++;
-        if (pos + len > buffer_len) return NULL;
-        
-        // Add dot separator
-        if (name_len > 0 && name_len < 255) {
-            name[name_len++] = '.';
-        }
-        
-        // Check space
-        if (name_len + len >= 255) return NULL;
-        
-        // Copy label
-        memcpy(name + name_len, buffer + pos, len);
-        name_len += len;
-        pos += len;
-    }
-    
-    if (jumps >= MAX_NAME_JUMPS) {
-        fprintf(stderr, "  Warning: Too many compression pointer jumps\n");
+    char name[DNAME_TEXT_MAX];
+    if (!buffer || dname_from_wire(buffer, buffer_len, pos, false, name, sizeof(name)) < 0)
         return NULL;
-    }
-    
-    name[name_len] = '\0';
-    /* A zero-length name is the DNS root ".", a valid name — NOT an error.
-     * Returning NULL here previously broke parse_rrsig_rdata() for every
-     * root-signed RRSIG (signer name = "."), so the root DNSKEY signature
-     * could never be parsed and the DNSSEC chain-of-trust never bootstrapped.
-     * The root does not appear as a CNAME/NS/SOA name in the other callers,
-     * so returning "." is correct everywhere it is used. */
-    return strdup(name_len > 0 ? name : ".");
+    return strdup(name);
 }
 
 /*
- * Write DNS name in wire format to buffer
+ * Write a text name in uncompressed wire format at buffer[pos].
+ * Returns the number of bytes written, or -1 if it is malformed or won't fit.
  */
-int write_dns_name(const char* name, unsigned char* buffer, 
-                         size_t buffer_size, size_t pos)
+int write_dns_name(const char* name, unsigned char* buffer,
+                   size_t buffer_size, size_t pos)
 {
-    if (!name || !buffer) {
-        return -1;
-    }
-    
-    int start_pos = pos;
-    char name_copy[256];
-    strncpy(name_copy, name, sizeof(name_copy) - 1);
-    name_copy[sizeof(name_copy) - 1] = '\0';
-    
-    char* saveptr = NULL;
-    char* label = strtok_r(name_copy, ".", &saveptr);
-    
-    while (label) {
-        size_t label_len = strlen(label);
-        if (label_len > 63 || pos + label_len + 1 >= buffer_size) {
-            return -1;
-        }
-        
-        buffer[pos++] = (unsigned char)label_len;
-        memcpy(buffer + pos, label, label_len);
-        pos += label_len;
-        
-        label = strtok_r(NULL, ".", &saveptr);
-    }
-    
-    // Null terminator
-    if (pos >= buffer_size) {
-        return -1;
-    }
-    buffer[pos++] = 0;
-    
-    return pos - start_pos;
+    if (!name || !buffer || pos >= buffer_size) return -1;
+    return dname_to_wire(name, buffer + pos, (int)(buffer_size - pos));
 }
 
-// Encodes domain name into DNS wire format
+/* Encode a text name into wire format; returns bytes written or -1. */
 int encode_dns_name(const char* domain, unsigned char* buffer, size_t buf_size)
 {
-    if (!domain || !buffer || buf_size == 0) {
-        return -1;
-    }
-    
-    unsigned char* ptr = buffer;
-    const char* start = domain;
-    const char* end;
-    size_t remaining = buf_size;
-    
-    // Handle empty domain or root (.)
-    if (domain[0] == '\0' || (domain[0] == '.' && domain[1] == '\0')) {
-        if (remaining < 1) return -1;
-        *ptr++ = 0;
-        return 1;
-    }
-    
-    while (*start) {
-        // Skip leading dots
-        if (*start == '.') {
-            start++;
-            continue;
-        }
-        
-        // Find end of label
-        end = start;
-        while (*end && *end != '.') {
-            end++;
-        }
-        
-        size_t label_len = end - start;
-        
-        // Check label length (max 63)
-        if (label_len > 63) {
-            return -1;
-        }
-        
-        // Check buffer space (length byte + label)
-        if (remaining < label_len + 1) {
-            return -1;
-        }
-        
-        // Write length byte
-        *ptr++ = (unsigned char)label_len;
-        remaining--;
-        
-        // Write label
-        memcpy(ptr, start, label_len);
-        ptr += label_len;
-        remaining -= label_len;
-        
-        start = end;
-    }
-    
-    // Write terminating zero
-    if (remaining < 1) {
-        return -1;
-    }
-    *ptr++ = 0;
-
-    return ptr - buffer;
+    if (!domain || !buffer) return -1;
+    return dname_to_wire(domain, buffer, (int)buf_size);
 }
 
 /* -------------------------------------------------------------------------
@@ -256,14 +116,14 @@ int parse_rrsig_rdata(const unsigned char* buf, int buf_len,
 
     /* Signer's name at rdata_offset+18 (may be compressed) */
     int name_pos = rdata_offset + 18;
-    char* sname = parse_dns_name_from_wire((unsigned char*)buf, buf_len, name_pos);
+    char* sname = parse_dns_name_from_wire(buf, buf_len, name_pos);
     if (!sname) return -1;
     strncpy(out->signer_name, sname, sizeof(out->signer_name) - 1);
     out->signer_name[sizeof(out->signer_name) - 1] = '\0';
     free(sname);
 
     /* Advance past the wire-encoded signer name */
-    skip_dns_name((unsigned char*)buf, buf_len, &name_pos);
+    skip_dns_name(buf, buf_len, &name_pos);
     int sig_start = name_pos;
     int sig_len = end - sig_start;
     if (sig_len < 0) return -1;

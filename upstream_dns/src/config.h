@@ -24,6 +24,10 @@ int load_hints(const char* filename);
 int load_hints_builtin(void);
 void free_hints(void);
 
+/* Thread-safe hint accessors (the table is swapped on SIGHUP). */
+char* hints_random_root_ip(void);           /* strdup'd; NULL if none */
+int   hints_copy_names(char names[13][256]);  /* returns count */
+
 /*
  * Trust anchor (DNSSEC root key) loaded from root-trust-anchor.key.
  * Each entry represents one DNSKEY record (typically the root KSK).

@@ -33,7 +33,7 @@ static off_t g_log_bytes = 0;   /* bytes in the log since last truncate (g_log_m
  * in-place cap accounts for bytes already on disk.  Caller holds g_log_mutex.
  * Returns the fd, or -1 on failure. */
 static int log_open_locked(void) {
-    int fd = open(LOG_FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    int fd = path_open(LOG_FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
     if (fd < 0) return -1;
     /* If we still hold root and will drop to an unprivileged user, hand the log
      * to that user now.  Later reopens (SIGHUP/logrotate) run AFTER the drop, so
@@ -135,7 +135,10 @@ void log_query(const char* client_ip, uint16_t port,
      * and writes uninitialized stack memory to the log (and the trailing '\n'
      * gets lost, causing log entries to run together). */
     if (len > 0) {
-        if (len >= (int)sizeof(line)) len = (int)sizeof(line) - 1;
+        if (len >= (int)sizeof(line)) {
+            len = (int)sizeof(line) - 1;
+            line[len - 1] = '\n';   /* keep one entry per line when truncated */
+        }
         if (write(g_log_fd, line, len) < 0) {
             perror("Warning: Upstream log write failed");
         } else {
@@ -159,8 +162,13 @@ void log_close_upstream(void) {
 
 void log_reopen_upstream(void) {
     pthread_mutex_lock(&g_log_mutex);
-    if (g_log_fd >= 0) { close(g_log_fd); g_log_fd = -1; }
-    g_log_fd = log_open_locked();
-    if (g_log_fd < 0) perror("Warning: log_reopen: Failed to open upstream log file");
+    int fd = log_open_locked();
+    if (fd >= 0) {
+        if (g_log_fd >= 0) close(g_log_fd);
+        g_log_fd = fd;
+    } else {
+        /* Keep logging to the old fd rather than losing the log entirely. */
+        perror("Warning: log_reopen: Failed to open upstream log file; keeping current fd");
+    }
     pthread_mutex_unlock(&g_log_mutex);
 }
