@@ -119,7 +119,7 @@ struct Packet *build_mx_response(struct Packet *req, const char *owner)
     RrBlob blobs[16];
     for (int i = 0; i < rr_count; i++) {
         int len = 0;
-        *(uint16_t*)(blobs[i].data + len) = htons(mxes[i].prio); len += 2;
+        wr16(blobs[i].data + len, mxes[i].prio); len += 2;
         write_dns_labels(mxes[i].host, (char*)blobs[i].data, &len, sizeof(blobs[i].data));
         wire_name_lc(blobs[i].data + 2, len - 2);
         blobs[i].len = (uint16_t)len;
@@ -177,41 +177,23 @@ struct Packet *build_ns_response(struct Packet *req, const char *owner)
 /* ---- TXT record ---- */
 struct Packet *build_txt_response(struct Packet *req, const char *owner)
 {
-    char txt_vals[16][512];
+    /* TXT RDATA (one or more <=255-byte character-strings, RFC 1035 §3.3.14)
+     * is pre-encoded at load time; no embedded names, so canonical RDATA ==
+     * wire RDATA. */
+    RrBlob blobs[16];
     int rr_count = 0;
     uint32_t ttl = DEFAULT_RECORD_TTL;
 
     for (int i = 0; i < auth_domain_count && rr_count < 16; i++) {
         const struct AuthDomain *d = &auth_domains[i];
         if (!d->has_txt || strcmp(d->domain, owner) != 0) continue;
-        strncpy(txt_vals[rr_count], d->txt_data, 511);
-        txt_vals[rr_count][511] = '\0';
+        if (d->txt_wire_len == 0 || d->txt_wire_len > sizeof(blobs[0].data)) continue;
+        memcpy(blobs[rr_count].data, d->txt_wire, d->txt_wire_len);
+        blobs[rr_count].len = d->txt_wire_len;
         rr_count++;
         if (d->ttl) ttl = d->ttl;
     }
     if (rr_count == 0) return NULL;
-
-    /* TXT RDATA: one or more ≤255-byte character-strings (RFC 1035 §3.3.14);
-     * no embedded names, so canonical RDATA == wire RDATA. */
-    RrBlob blobs[16];
-    for (int i = 0; i < rr_count; i++) {
-        size_t tlen = strlen(txt_vals[i]);
-        int len = 0;
-        if (tlen == 0) {
-            blobs[i].data[len++] = 0;   /* one zero-length character-string */
-        } else {
-            size_t off = 0;
-            while (off < tlen && len < (int)sizeof(blobs[i].data) - 256) {
-                size_t chunk = tlen - off;
-                if (chunk > 255) chunk = 255;
-                blobs[i].data[len++] = (unsigned char)chunk;
-                memcpy(blobs[i].data + len, txt_vals[i] + off, chunk);
-                len += (int)chunk;
-                off += chunk;
-            }
-        }
-        blobs[i].len = (uint16_t)len;
-    }
 
     int pos;
     struct Packet *r = begin_response(req, &pos, (uint16_t)rr_count);
@@ -250,9 +232,9 @@ struct Packet *build_srv_response(struct Packet *req, const char *owner)
     RrBlob blobs[16];
     for (int i = 0; i < rr_count; i++) {
         int len = 0;
-        *(uint16_t*)(blobs[i].data + len) = htons(srvs[i].prio);   len += 2;
-        *(uint16_t*)(blobs[i].data + len) = htons(srvs[i].weight); len += 2;
-        *(uint16_t*)(blobs[i].data + len) = htons(srvs[i].port);   len += 2;
+        wr16(blobs[i].data + len, srvs[i].prio);   len += 2;
+        wr16(blobs[i].data + len, srvs[i].weight); len += 2;
+        wr16(blobs[i].data + len, srvs[i].port);   len += 2;
         write_dns_labels(srvs[i].target, (char*)blobs[i].data, &len, sizeof(blobs[i].data));
         wire_name_lc(blobs[i].data + 6, len - 6);
         blobs[i].len = (uint16_t)len;
@@ -294,7 +276,7 @@ struct Packet *build_https_response(struct Packet *req, const char *owner)
     RrBlob blobs[16];
     for (int i = 0; i < rr_count; i++) {
         int len = 0;
-        *(uint16_t*)(blobs[i].data + len) = htons(entries[i].prio); len += 2;
+        wr16(blobs[i].data + len, entries[i].prio); len += 2;
         if (strcmp(entries[i].target, ".") == 0) {
             blobs[i].data[len++] = 0;   /* root label: "." */
         } else {
@@ -341,11 +323,11 @@ struct Packet *build_cname_response(struct Packet *req, const char *owner)
     if (!r) return NULL;
 
     if (pos + 2+2+2+4+2+rdata_len > MAXLINE) { free_packet(r); return NULL; }
-    *(uint16_t*)(r->request + pos) = htons(DNS_NAME_PTR);             pos += 2;
-    *(uint16_t*)(r->request + pos) = htons(QTYPE_CNAME);        pos += 2;
-    *(uint16_t*)(r->request + pos) = htons(1);                  pos += 2;
-    *(uint32_t*)(r->request + pos) = htonl(ttl);                pos += 4;
-    *(uint16_t*)(r->request + pos) = htons((uint16_t)rdata_len); pos += 2;
+    wr16(r->request + pos, DNS_NAME_PTR);             pos += 2;
+    wr16(r->request + pos, QTYPE_CNAME);        pos += 2;
+    wr16(r->request + pos, 1);                  pos += 2;
+    wr32(r->request + pos, ttl);                pos += 4;
+    wr16(r->request + pos, (uint16_t)rdata_len); pos += 2;
     memcpy(r->request + pos, rdata, rdata_len);                  pos += rdata_len;
 
     if (req->do_bit) {
@@ -357,7 +339,7 @@ struct Packet *build_cname_response(struct Packet *req, const char *owner)
                             owner, QTYPE_CNAME, ttl, rdata, rdata_len);
             if (append_rrsig(r->request, &pos, owner, QTYPE_CNAME, ttl,
                               canon, canon_pos, zsk, false, NULL))
-                *(uint16_t*)(r->request + 6) = htons(2);
+                wr16(r->request + 6, 2);
         }
     }
 
@@ -391,22 +373,22 @@ struct Packet *build_soa_response(struct Packet *req, const char *owner)
     int rdata_len = mname_end;
     write_dns_labels(d->soa_rname, (char*)rdata, &rdata_len, sizeof(rdata));
     wire_name_lc(rdata + mname_end, rdata_len - mname_end);
-    *(uint32_t*)(rdata + rdata_len) = htonl(d->soa_serial);   rdata_len += 4;
-    *(uint32_t*)(rdata + rdata_len) = htonl(d->soa_refresh);  rdata_len += 4;
-    *(uint32_t*)(rdata + rdata_len) = htonl(d->soa_retry);    rdata_len += 4;
-    *(uint32_t*)(rdata + rdata_len) = htonl(d->soa_expire);   rdata_len += 4;
-    *(uint32_t*)(rdata + rdata_len) = htonl(d->soa_minimum);  rdata_len += 4;
+    wr32(rdata + rdata_len, d->soa_serial);   rdata_len += 4;
+    wr32(rdata + rdata_len, d->soa_refresh);  rdata_len += 4;
+    wr32(rdata + rdata_len, d->soa_retry);    rdata_len += 4;
+    wr32(rdata + rdata_len, d->soa_expire);   rdata_len += 4;
+    wr32(rdata + rdata_len, d->soa_minimum);  rdata_len += 4;
 
     int pos;
     struct Packet *r = begin_response(req, &pos, 1);
     if (!r) return NULL;
 
     if (pos + 2+2+2+4+2+rdata_len > MAXLINE) { free_packet(r); return NULL; }
-    *(uint16_t*)(r->request + pos) = htons(DNS_NAME_PTR);             pos += 2;
-    *(uint16_t*)(r->request + pos) = htons(QTYPE_SOA);          pos += 2;
-    *(uint16_t*)(r->request + pos) = htons(1);                  pos += 2;
-    *(uint32_t*)(r->request + pos) = htonl(ttl);                pos += 4;
-    *(uint16_t*)(r->request + pos) = htons((uint16_t)rdata_len); pos += 2;
+    wr16(r->request + pos, DNS_NAME_PTR);             pos += 2;
+    wr16(r->request + pos, QTYPE_SOA);          pos += 2;
+    wr16(r->request + pos, 1);                  pos += 2;
+    wr32(r->request + pos, ttl);                pos += 4;
+    wr16(r->request + pos, (uint16_t)rdata_len); pos += 2;
     memcpy(r->request + pos, rdata, rdata_len);                  pos += rdata_len;
 
     if (req->do_bit) {
@@ -418,7 +400,7 @@ struct Packet *build_soa_response(struct Packet *req, const char *owner)
                             owner, QTYPE_SOA, ttl, rdata, rdata_len);
             if (append_rrsig(r->request, &pos, owner, QTYPE_SOA, ttl,
                               canon, canon_pos, zsk, false, NULL))
-                *(uint16_t*)(r->request + 6) = htons(2);
+                wr16(r->request + 6, 2);
         }
     }
 
@@ -461,7 +443,7 @@ struct Packet *build_dnskey_response(struct Packet *req, const char *owner)
     RrBlob blobs[8];
     for (int i = 0; i < rr_count; i++) {
         int len = 0;
-        *(uint16_t*)(blobs[i].data + len) = htons(dkes[i].flags); len += 2;
+        wr16(blobs[i].data + len, dkes[i].flags); len += 2;
         blobs[i].data[len++] = 3;            /* protocol = 3 (DNSSEC) */
         blobs[i].data[len++] = dkes[i].alg;
         memcpy(blobs[i].data + len, dkes[i].pub, dkes[i].pub_len);
@@ -501,11 +483,11 @@ struct Packet *build_hinfo_response(struct Packet *req)
     if (!r) return NULL;
 
     if (pos + 2+2+2+4+2+rdata_len > MAXLINE) { free_packet(r); return NULL; }
-    *(uint16_t*)(r->request + pos) = htons(DNS_NAME_PTR);             pos += 2;
-    *(uint16_t*)(r->request + pos) = htons(13 /* HINFO */);     pos += 2;
-    *(uint16_t*)(r->request + pos) = htons(1);                  pos += 2;
-    *(uint32_t*)(r->request + pos) = htonl(ttl);                pos += 4;
-    *(uint16_t*)(r->request + pos) = htons((uint16_t)rdata_len); pos += 2;
+    wr16(r->request + pos, DNS_NAME_PTR);             pos += 2;
+    wr16(r->request + pos, 13 /* HINFO */);     pos += 2;
+    wr16(r->request + pos, 1);                  pos += 2;
+    wr32(r->request + pos, ttl);                pos += 4;
+    wr16(r->request + pos, (uint16_t)rdata_len); pos += 2;
     memcpy(r->request + pos, rdata, rdata_len);                  pos += rdata_len;
 
     r->recv_len = pos;

@@ -219,7 +219,7 @@ struct Packet* query_server_with_timeout(const char* server_ip, struct Packet* q
                                     (struct sockaddr*)&recv_addr, &recv_addr_len);
 
         if (received < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            if (!errno_is_timeout(errno)) {
                 perror("  recvfrom failed");
             }
             break;  // Timeout or hard error
@@ -391,7 +391,9 @@ struct Packet* query_server_tcp(const char* server_ip, struct Packet* query)
     ssize_t n = recv(sockfd, &rlen_net, 2, MSG_WAITALL);
     if (n != 2) { close(sockfd); return NULL; }
     uint16_t rlen = ntohs(rlen_net);
-    if (rlen < HEADER_LEN || rlen > MAXLINE) { close(sockfd); return NULL; }
+    /* The 16-bit prefix bounds a TCP answer at 65535 bytes; accept all of it —
+     * answers larger than a UDP buffer are exactly why we fell back to TCP. */
+    if (rlen < HEADER_LEN) { close(sockfd); return NULL; }
 
     char* rbuf = malloc(rlen);
     if (!rbuf) { close(sockfd); return NULL; }

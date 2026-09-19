@@ -54,9 +54,11 @@ struct AuthDomain {
     bool     has_ns;
     char     ns_name[256];
 
-    // TXT record (one string per entry; multiple entries = RRset)
+    // TXT record (one RR per entry; multiple entries = RRset)
     bool     has_txt;
-    char     txt_data[512];
+    char     txt_data[512];        // presentation form (for logs)
+    unsigned char txt_wire[512];   // RDATA: one or more <len><bytes> strings
+    uint16_t txt_wire_len;
 
     // SRV record (_service._proto.owner)
     bool     has_srv;

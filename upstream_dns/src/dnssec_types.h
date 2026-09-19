@@ -8,6 +8,7 @@
  * free_*_rdata() helper.
  */
 
+#include "dns_name.h"   /* DNAME_TEXT_MAX */
 #include <stdint.h>
 #include <stdlib.h>   /* free() used in inline free_*_rdata helpers below */
 
@@ -29,7 +30,7 @@ typedef struct {
     uint32_t sig_expiration;  /* Unix timestamp */
     uint32_t sig_inception;   /* Unix timestamp */
     uint16_t key_tag;
-    char     signer_name[256]; /* wire-decoded owner name of signing zone */
+    char     signer_name[DNAME_TEXT_MAX]; /* wire-decoded owner name of signing zone */
     uint8_t* signature;        /* DER signature blob — malloc'd */
     uint16_t sig_len;
 } RrsigRdata;

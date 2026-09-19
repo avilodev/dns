@@ -8,6 +8,8 @@
 #include <stdbool.h>
 
 #include "types.h"   /* MAX_INTERNAL_HOSTS, DEFAULT_RECORD_TTL */
+#include "utils.h"   /* path_fopen */
+#include "dns_name.h" /* dname_to_wire (name validation) */
 
 /* The authoritative record store. Defined here (loading owns it); the serving
  * path (check_internal in auth.c) reads it via the extern decls in auth.h.
@@ -24,6 +26,70 @@ static void strlower(char *s)
 {
     if (!s) return;
     for (; *s; s++) *s = (char)tolower((unsigned char)*s);
+}
+
+/*
+ * Parse TXT presentation data into RDATA (RFC 1035 §3.3.14, §5.1).
+ *
+ *   "v=spf1 mx -all"             -> one character-string
+ *   "v=DKIM1; k=rsa; " "p=MIIB"  -> two character-strings (DKIM style)
+ *   bare words                   -> the rest of the line as one string
+ *
+ * Inside quotes, \" and \\ escape a quote / backslash.  Any string longer than
+ * 255 bytes is split into consecutive 255-byte character-strings.  Returns 0 on
+ * success, -1 on an unterminated quote or overflow.
+ */
+static int append_charstrings(const char *txt, size_t n,
+                              unsigned char *out, size_t cap, uint16_t *len)
+{
+    do {
+        size_t chunk = n > 255 ? 255 : n;
+        if (*len + 1 + chunk > cap) return -1;
+        out[(*len)++] = (unsigned char)chunk;
+        memcpy(out + *len, txt, chunk);
+        *len += (uint16_t)chunk;
+        txt += chunk; n -= chunk;
+    } while (n > 0);
+    return 0;
+}
+
+static int parse_txt_rdata(const char *p, unsigned char *out, size_t cap,
+                           uint16_t *out_len)
+{
+    *out_len = 0;
+    if (*p != '"') {                               /* unquoted: whole rest of line */
+        return append_charstrings(p, strlen(p), out, cap, out_len);
+    }
+    while (*p) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+        if (*p != '"') return -1;                  /* junk between strings */
+        p++;
+        char buf[512];
+        size_t n = 0;
+        while (*p && *p != '"') {
+            if (*p == '\\' && (p[1] == '"' || p[1] == '\\')) p++;
+            if (n >= sizeof(buf)) return -1;
+            buf[n++] = *p++;
+        }
+        if (*p != '"') return -1;                  /* unterminated */
+        p++;
+        if (append_charstrings(buf, n, out, cap, out_len) != 0) return -1;
+    }
+    return *out_len ? 0 : -1;
+}
+
+/* Cut a '#' comment that starts a line or follows whitespace, ignoring any
+ * '#' inside a quoted TXT string ("\"" escapes a quote). */
+static void strip_inline_comment(char *line)
+{
+    bool quoted = false;
+    for (char *p = line; *p; p++) {
+        if (quoted && *p == '\\' && p[1]) { p++; continue; }
+        if (*p == '"') quoted = !quoted;
+        else if (*p == '#' && !quoted &&
+                 (p == line || isspace((unsigned char)p[-1]))) { *p = '\0'; return; }
+    }
 }
 
 /*
@@ -47,7 +113,7 @@ static void strlower(char *s)
  */
 static int _load_domains_from_file(const char *filename)
 {
-    FILE *fp = fopen(filename, "r");
+    FILE *fp = path_fopen(filename);
     if (!fp) {
         fprintf(stderr, "Error: Cannot open %s: %s\n",
                 filename, strerror(errno));
@@ -56,9 +122,11 @@ static int _load_domains_from_file(const char *filename)
 
     int  count               = 0;
     char line[1024];
-    char current_domain[256] = {0};  /* set by [domain] section headers */
+    char current_domain[256] = {0};  /* set by [domain] section headers (AuthDomain.domain size) */
 
     while (fgets(line, sizeof(line), fp)) {
+        strip_inline_comment(line);
+
         /* Strip trailing whitespace / newline. */
         int llen = (int)strlen(line);
         while (llen > 0 && (line[llen-1] == '\n' || line[llen-1] == '\r' ||
@@ -72,10 +140,22 @@ static int _load_domains_from_file(const char *filename)
             char *close = strchr(line, ']');
             if (close && close > line + 1) {
                 size_t dlen = (size_t)(close - line - 1);
-                if (dlen >= sizeof(current_domain))
-                    dlen = sizeof(current_domain) - 1;
+                uint8_t wire[256];
+                if (dlen >= sizeof(current_domain)) {
+                    fprintf(stderr, "Warning: section name too long, skipping: %.40s...\n",
+                            line + 1);
+                    current_domain[0] = '\0';          /* skip its records */
+                    continue;
+                }
                 memcpy(current_domain, line + 1, dlen);
                 current_domain[dlen] = '\0';
+                if (strcasecmp(current_domain, "blocklist") != 0 &&
+                    dname_to_wire(current_domain, wire, sizeof(wire)) < 0) {
+                    fprintf(stderr, "Warning: invalid name [%s], skipping its records\n",
+                            current_domain);
+                    current_domain[0] = '\0';
+                    continue;
+                }
                 strlower(current_domain);
             }
             continue;
@@ -182,17 +262,15 @@ static int _load_domains_from_file(const char *filename)
             const char *p = line;
             while (*p && !isspace((unsigned char)*p)) p++;
             while (*p &&  isspace((unsigned char)*p)) p++;
-            /* p now points to the text data (possibly quoted) */
-            if (*p == '"') p++;
-            char txt[512];
-            snprintf(txt, sizeof(txt), "%s", p);
-            int tlen = (int)strlen(txt);
-            if (tlen > 0 && txt[tlen - 1] == '"') txt[--tlen] = '\0';
+            if (parse_txt_rdata(p, d->txt_wire, sizeof(d->txt_wire),
+                                &d->txt_wire_len) != 0) {
+                fprintf(stderr, "Warning: Bad TXT line: %s\n", line);
+                continue;
+            }
             d->has_txt = true;
-            snprintf(d->txt_data, sizeof(d->txt_data), "%s", txt);
+            snprintf(d->txt_data, sizeof(d->txt_data), "%s", p);
             strcpy(d->ip, "0.0.0.0");
-            fprintf(stderr, "  Loaded: %-32s -> TXT \"%s\"\n",
-                    current_domain, txt);
+            fprintf(stderr, "  Loaded: %-32s -> TXT %s\n", current_domain, p);
             count++;
 
         /* --- SRV -------------------------------------------------------- */

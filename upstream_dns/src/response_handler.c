@@ -33,8 +33,8 @@ bool is_cname_only_answer(struct Packet* response, uint16_t original_qtype)
         
         if (pos + 10 > buffer_len) break;
         
-        uint16_t type = ntohs(*(uint16_t*)(buffer + pos));
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        uint16_t type = rd16(buffer + pos);
+        uint16_t rdlength = rd16(buffer + pos + 8);
         
         if (type == QTYPE_CNAME) {
             has_cname = true;
@@ -105,8 +105,8 @@ bool cname_answer_needs_rechase(struct Packet* response, uint16_t original_qtype
             break;
         }
 
-        uint16_t type = ntohs(*(uint16_t*)(buffer + pos));
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        uint16_t type = rd16(buffer + pos);
+        uint16_t rdlength = rd16(buffer + pos + 8);
 
         if (type == QTYPE_CNAME) {
             has_cname = true;
@@ -380,8 +380,8 @@ char* extract_cname_target(struct Packet* response)
         
         if (pos + 10 > buffer_len) break;
         
-        uint16_t type = ntohs(*(uint16_t*)(buffer + pos));
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        uint16_t type = rd16(buffer + pos);
+        uint16_t rdlength = rd16(buffer + pos + 8);
         
         // Found CNAME record
         if (type == QTYPE_CNAME && rdlength > 0) {
@@ -427,8 +427,8 @@ char* extract_ip_from_answer(struct Packet* response, uint16_t qtype)
         
         if (pos + 10 > buffer_len) break;
         
-        uint16_t type = ntohs(*(uint16_t*)(buffer + pos));
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        uint16_t type = rd16(buffer + pos);
+        uint16_t rdlength = rd16(buffer + pos + 8);
         
         // Found A record
         if (type == QTYPE_A && qtype == QTYPE_A && rdlength == 4 && 
@@ -492,7 +492,7 @@ char* extract_ns_server_ip(struct Packet* response, const char* ns_name)
     for (int i = 0; i < response->ancount && pos < buffer_len; i++) {
         skip_dns_name(buffer, buffer_len, &pos);
         if (pos + 10 > buffer_len) break;
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        uint16_t rdlength = rd16(buffer + pos + 8);
         pos += 10 + rdlength;
     }
 
@@ -500,7 +500,7 @@ char* extract_ns_server_ip(struct Packet* response, const char* ns_name)
     for (int i = 0; i < response->nscount && pos < buffer_len; i++) {
         skip_dns_name(buffer, buffer_len, &pos);
         if (pos + 10 > buffer_len) break;
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        uint16_t rdlength = rd16(buffer + pos + 8);
         pos += 10 + rdlength;
     }
 
@@ -515,8 +515,8 @@ char* extract_ns_server_ip(struct Packet* response, const char* ns_name)
             break;
         }
         
-        uint16_t type = ntohs(*(uint16_t*)(buffer + pos));
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        uint16_t type = rd16(buffer + pos);
+        uint16_t rdlength = rd16(buffer + pos + 8);
         
         // Check if this glue record is for our NS (if ns_name provided)
         bool name_matches = true;
@@ -575,7 +575,7 @@ char* extract_ns_name(struct Packet* response)
     for (int i = 0; i < response->ancount && pos < buffer_len; i++) {
         skip_dns_name(buffer, buffer_len, &pos);
         if (pos + 10 > buffer_len) break;
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        uint16_t rdlength = rd16(buffer + pos + 8);
         pos += 10 + rdlength;
     }
 
@@ -585,8 +585,8 @@ char* extract_ns_name(struct Packet* response)
         
         if (pos + 10 > buffer_len) break;
         
-        uint16_t type = ntohs(*(uint16_t*)(buffer + pos));
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        uint16_t type = rd16(buffer + pos);
+        uint16_t rdlength = rd16(buffer + pos + 8);
         
         // Found NS record
         if (type == QTYPE_NS && rdlength > 0) {
@@ -646,7 +646,7 @@ NSCandidateList* extract_all_ns_with_glue(struct Packet* response,
     for (int i = 0; i < response->ancount && pos < buffer_len; i++) {
         skip_dns_name(buffer, buffer_len, &pos);
         if (pos + 10 > buffer_len) break;
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        uint16_t rdlength = rd16(buffer + pos + 8);
         pos += 10 + rdlength;
     }
 
@@ -656,8 +656,8 @@ NSCandidateList* extract_all_ns_with_glue(struct Packet* response,
         
         if (pos + 10 > buffer_len) break;
         
-        uint16_t type = ntohs(*(uint16_t*)(buffer + pos));
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        uint16_t type = rd16(buffer + pos);
+        uint16_t rdlength = rd16(buffer + pos + 8);
         
         if (type == QTYPE_NS && rdlength > 0) {
             int rdata_pos = pos + 10;
@@ -687,8 +687,8 @@ NSCandidateList* extract_all_ns_with_glue(struct Packet* response,
                 break;
             }
             
-            uint16_t type = ntohs(*(uint16_t*)(buffer + pos));
-            uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+            uint16_t type = rd16(buffer + pos);
+            uint16_t rdlength = rd16(buffer + pos + 8);
             
             // Found matching A record.  Accept the glue only when its owner is
             // within the bailiwick of the zone the answering server serves (4.1)
@@ -697,7 +697,10 @@ NSCandidateList* extract_all_ns_with_glue(struct Packet* response,
             // NOT the delegated child: a TLD's nameservers commonly live in a
             // different TLD (e.g. com -> *.gtld-servers.net), and that glue is
             // legitimately in-bailiwick of the parent that provided it.
-            if (record_name && strcasecmp(record_name, list->candidates[i].ns_name) == 0 &&
+            /* First matching glue wins (an NS may carry several A records;
+             * overwriting ns_ip here used to leak the previous one). */
+            if (!list->candidates[i].ns_ip &&
+                record_name && strcasecmp(record_name, list->candidates[i].ns_name) == 0 &&
                 name_in_bailiwick(record_name, server_zone) &&
                 type == QTYPE_A && rdlength == 4 && pos + 10 + 4 <= buffer_len) {
 
@@ -759,7 +762,7 @@ char* extract_zone_apex(struct Packet* response)
     for (int i = 0; i < response->ancount && pos < buffer_len; i++) {
         skip_dns_name(buffer, buffer_len, &pos);
         if (pos + 10 > buffer_len) break;
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        uint16_t rdlength = rd16(buffer + pos + 8);
         pos += 10 + rdlength;
     }
 
@@ -772,8 +775,8 @@ char* extract_zone_apex(struct Packet* response)
         int owner_pos = pos;
         skip_dns_name(buffer, buffer_len, &pos);
         if (pos + 10 > buffer_len) break;
-        uint16_t type     = ntohs(*(uint16_t*)(buffer + pos));
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
+        uint16_t type     = rd16(buffer + pos);
+        uint16_t rdlength = rd16(buffer + pos + 8);
         if (type == QTYPE_NS) {
             return parse_dns_name_from_wire(buffer, buffer_len, owner_pos);
         }
@@ -782,7 +785,7 @@ char* extract_zone_apex(struct Packet* response)
     return NULL;
 }
 
-extern Hints* g_hints[13];
+#include "config.h"   /* hints_copy_names */
 
 struct Packet* build_root_hints_response(struct Packet* query)
 {
@@ -812,13 +815,9 @@ struct Packet* build_root_hints_response(struct Packet* query)
     buf[2] = 0x84;  // QR=1, AA=1, RD=0
     buf[3] = 0x00;  // RA=0, RCODE=0
     
-    // Set ANCOUNT to number of root servers
-    int root_count = 0;
-    for (int i = 0; i < 13; i++) {
-        if (g_hints[i] && g_hints[i]->name) {
-            root_count++;
-        }
-    }
+    // Set ANCOUNT to number of root servers (snapshot: hints swap on SIGHUP)
+    char root_names[13][256];
+    int root_count = hints_copy_names(root_names);
     buf[6] = (root_count >> 8) & 0xFF;
     buf[7] = root_count & 0xFF;
     /* This is an answer-only response; clear NS/AR counts inherited from the
@@ -835,9 +834,9 @@ struct Packet* build_root_hints_response(struct Packet* query)
     pos += 4;  // QTYPE + QCLASS
     
     // Add answer section with root NS records
-    for (int i = 0; i < 13; i++) {
-        if (!g_hints[i] || !g_hints[i]->name) continue;
-        
+    int written = 0;
+    for (int i = 0; i < root_count; i++) {
+
         // Write name (.) - compression pointer to question
         buf[pos++] = 0xC0;
         buf[pos++] = 0x0C;
@@ -857,14 +856,18 @@ struct Packet* build_root_hints_response(struct Packet* query)
         buf[pos++] = 0x00;
         
         // RDLENGTH: calculate
-        int name_len = encode_dns_name(g_hints[i]->name, buf + pos + 2, MAXLINE - pos - 2);
-        if (name_len < 0) continue;
-        
+        int name_len = encode_dns_name(root_names[i], buf + pos + 2, MAXLINE - pos - 2);
+        if (name_len < 0) { pos -= 10; continue; }   /* drop the half-written RR */
+
         buf[pos++] = (name_len >> 8) & 0xFF;
         buf[pos++] = name_len & 0xFF;
-        
+
         pos += name_len;
+        written++;
     }
+    root_count = written;
+    buf[6] = (root_count >> 8) & 0xFF;
+    buf[7] = root_count & 0xFF;
     
     response->recv_len = pos;
     response->id = query->id;

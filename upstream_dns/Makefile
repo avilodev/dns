@@ -39,7 +39,7 @@ SOURCES = main.c config.c thread_pool.c utils.c      \
 		  dns_wire.c dns_packet.c response_handler.c \
 		  cname_handler.c ns_resolver.c udp_client.c \
 		  ns_resolution_context.c dnssec.c dnssec_chain.c dnssec_wire.c dnssec_proof.c \
-		  access_control.c query_log.c udp_helpers.c workers.c
+		  access_control.c query_log.c udp_helpers.c workers.c dns_name.c
 
 # Full paths
 SRC_FILES = $(addprefix $(SRC_DIR)/, $(SOURCES))
@@ -87,7 +87,7 @@ asan: clean all
 # to surface memory/alignment/UB bugs. Standalone — no daemon or network.
 #   make fuzz && obj/fuzz_request -max_total_time=30
 FUZZ_DIR  = fuzz
-FUZZ_SRCS = $(SRC_DIR)/request.c $(SRC_DIR)/utils.c $(SRC_DIR)/dns_packet.c $(SRC_DIR)/dns_wire.c
+FUZZ_SRCS = $(SRC_DIR)/request.c $(SRC_DIR)/utils.c $(SRC_DIR)/dns_packet.c $(SRC_DIR)/dns_wire.c $(SRC_DIR)/dns_name.c
 fuzz: | directories
 	clang -g -O1 -Isrc -fno-strict-aliasing -fsanitize=fuzzer,address,undefined \
 	    $(FUZZ_DIR)/fuzz_request.c $(FUZZ_SRCS) -o $(OBJ_DIR)/fuzz_request

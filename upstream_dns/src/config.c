@@ -1,5 +1,8 @@
 #include "config.h"
 #include "dns_wire.h"
+#include "utils.h"
+#include <pthread.h>
+#include <fcntl.h>
 #include <openssl/evp.h>
 
 extern Config g_config;
@@ -272,6 +275,10 @@ int create_tcp_socket_v6(int port) {
 
 extern Hints* g_hints[13];
 
+/* g_hints is read by every worker and replaced on SIGHUP; all access goes
+ * through this lock (writers swap a fully built table, never mutate in place). */
+static pthread_rwlock_t g_hints_lock = PTHREAD_RWLOCK_INITIALIZER;
+
 /* Free a single root-hint Record (ip + type + struct). */
 static void free_hint_record(Record* r)
 {
@@ -281,116 +288,138 @@ static void free_hint_record(Record* r)
     free(r);
 }
 
+static void free_hint_table(Hints* t[13])
+{
+    for (int i = 0; i < 13; i++) {
+        if (!t[i]) continue;
+        free(t[i]->name);
+        free_hint_record(t[i]->ipv4_record);
+        free_hint_record(t[i]->ipv6_record);
+        free(t[i]);
+        t[i] = NULL;
+    }
+}
+
+static Record* new_hint_record(const char* ip, const char* type, int ttl)
+{
+    Record* rec = malloc(sizeof(Record));
+    if (!rec) return NULL;
+    rec->ip   = strdup(ip);
+    rec->type = strdup(type);
+    rec->ttl  = ttl;
+    if (!rec->ip || !rec->type) { free_hint_record(rec); return NULL; }
+    return rec;
+}
+
+/* Install a freshly built table.  The previous table is freed only after the
+ * write lock guarantees no reader still holds a pointer into it. */
+static void install_hint_table(Hints* t[13])
+{
+    Hints* old[13];
+    pthread_rwlock_wrlock(&g_hints_lock);
+    for (int i = 0; i < 13; i++) { old[i] = g_hints[i]; g_hints[i] = t[i]; }
+    pthread_rwlock_unlock(&g_hints_lock);
+    free_hint_table(old);
+}
+
+/*
+ * Load root hints from `filename`.  Parses into a private table and swaps it
+ * in only when at least one usable (IPv4) root server was read — a missing or
+ * unreadable file (e.g. a SIGHUP reload after the privilege drop) leaves the
+ * current hints in service instead of emptying them.  Returns the number of
+ * root servers loaded, or -1 (current hints untouched).
+ */
 int load_hints(const char* filename)
 {
-    FILE* fp = fopen(filename, "r");
+    int fd = path_open(filename, O_RDONLY, 0);
+    FILE* fp = (fd >= 0) ? fdopen(fd, "r") : NULL;
     if (!fp) {
+        if (fd >= 0) close(fd);
         perror("Failed to open hints file");
         return -1;
     }
 
+    Hints* t[13] = {0};
     char line[512];
     int hint_index = -1;
-    
-    // Initialize all hints to NULL
-    for (int i = 0; i < 13; i++) {
-        g_hints[i] = NULL;
-    }
+    bool oom = false;
 
-    while (fgets(line, sizeof(line), fp)) {
-        // Skip comments and empty lines
-        if (line[0] == ';' || line[0] == '\n' || line[0] == '\r') {
-            continue;
-        }
+    while (!oom && fgets(line, sizeof(line), fp)) {
+        if (line[0] == ';' || line[0] == '\n' || line[0] == '\r') continue;
 
         // Trim leading whitespace (cast to unsigned char: isspace() is UB for
         // negative values other than EOF, which a signed char can produce).
         char* start = line;
         while (*start && isspace((unsigned char)*start)) start++;
-        
         if (*start == '\0') continue;
 
-        // Parse the line
         char domain[256], record_type[16], value[256];
         int ttl;
-        
-        // Read the remaining line after domain and TTL to get type and value
-        int parsed = sscanf(start, "%255s %d %15s %255s", domain, &ttl, record_type, value);
-        
-        if (parsed < 4) continue;
+        if (sscanf(start, "%255s %d %15s %255s", domain, &ttl, record_type, value) < 4)
+            continue;
 
-        // Check if this is a root NS record (new root server)
         if (strcmp(domain, ".") == 0 && strcmp(record_type, "NS") == 0) {
-            hint_index++;
-            if (hint_index >= 13) break;
-            
-            // Allocate new Hints structure
-            g_hints[hint_index] = (Hints*)malloc(sizeof(Hints));
-            if (!g_hints[hint_index]) {
-                fclose(fp);
-                return -1;
-            }
-            
-            // Store the server name
-            g_hints[hint_index]->name = strdup(value);
-            g_hints[hint_index]->ipv4_record = NULL;
-            g_hints[hint_index]->ipv6_record = NULL;
-        }
-        // Check if this is an A record (IPv4)
-        else if (strcmp(record_type, "A") == 0 && hint_index >= 0) {
-            Record* rec = (Record*)malloc(sizeof(Record));
-            if (!rec) {
-                fclose(fp);
-                return -1;
-            }
-            rec->ip = strdup(value);
-            rec->type = strdup("A");
-            rec->ttl = ttl;
-            free_hint_record(g_hints[hint_index]->ipv4_record);  /* no leak on dup */
-            g_hints[hint_index]->ipv4_record = rec;
-        }
-        // Check if this is an AAAA record (IPv6)
-        else if (strcmp(record_type, "AAAA") == 0 && hint_index >= 0) {
-            Record* rec = (Record*)malloc(sizeof(Record));
-            if (!rec) {
-                fclose(fp);
-                return -1;
-            }
-            rec->ip = strdup(value);
-            rec->type = strdup("AAAA");
-            rec->ttl = ttl;
-            free_hint_record(g_hints[hint_index]->ipv6_record);  /* no leak on dup */
-            g_hints[hint_index]->ipv6_record = rec;
+            if (++hint_index >= 13) break;
+            t[hint_index] = calloc(1, sizeof(Hints));
+            if (!t[hint_index] || !(t[hint_index]->name = strdup(value))) { oom = true; break; }
+        } else if (hint_index >= 0 &&
+                   (strcmp(record_type, "A") == 0 || strcmp(record_type, "AAAA") == 0)) {
+            Record* rec = new_hint_record(value, record_type, ttl);
+            if (!rec) { oom = true; break; }
+            Record** slot = (record_type[1] == '\0') ? &t[hint_index]->ipv4_record
+                                                     : &t[hint_index]->ipv6_record;
+            free_hint_record(*slot);   /* no leak on dup */
+            *slot = rec;
         }
     }
-
     fclose(fp);
-    return hint_index + 1; // Return number of root servers loaded
+
+    int usable = 0;
+    for (int i = 0; i < 13; i++)
+        if (t[i] && t[i]->ipv4_record) usable++;
+    if (oom || usable == 0) {
+        free_hint_table(t);
+        fprintf(stderr, "Hints file %s yielded no usable root servers; keeping current hints\n",
+                filename);
+        return -1;
+    }
+    install_hint_table(t);
+    return hint_index >= 13 ? 13 : hint_index + 1;
 }
 
 // Helper function to free the hints data
 void free_hints(void)
 {
-    for (int i = 0; i < 13; i++) {
-        if (g_hints[i]) {
-            free(g_hints[i]->name);
+    Hints* none[13] = {0};
+    install_hint_table(none);
+}
 
-            if (g_hints[i]->ipv4_record) {
-                free(g_hints[i]->ipv4_record->ip);
-                free(g_hints[i]->ipv4_record->type);
-                free(g_hints[i]->ipv4_record);
-            }
-
-            if (g_hints[i]->ipv6_record) {
-                free(g_hints[i]->ipv6_record->ip);
-                free(g_hints[i]->ipv6_record->type);
-                free(g_hints[i]->ipv6_record);
-            }
-
-            free(g_hints[i]);
-            g_hints[i] = NULL;
-        }
+/* strdup() the IPv4 address of a random root server, skipping empty slots.
+ * Returns NULL only when no root hints are loaded at all. */
+char* hints_random_root_ip(void)
+{
+    char* ip = NULL;
+    int start = get_random_server();
+    pthread_rwlock_rdlock(&g_hints_lock);
+    for (int k = 0; k < 13 && !ip; k++) {
+        const Hints* h = g_hints[(start + k) % 13];
+        if (h && h->ipv4_record && h->ipv4_record->ip)
+            ip = strdup(h->ipv4_record->ip);
     }
+    pthread_rwlock_unlock(&g_hints_lock);
+    return ip;
+}
+
+/* Copy the root server names into names[] (up to 13); returns how many. */
+int hints_copy_names(char names[13][256])
+{
+    int n = 0;
+    pthread_rwlock_rdlock(&g_hints_lock);
+    for (int i = 0; i < 13; i++)
+        if (g_hints[i] && g_hints[i]->name)
+            snprintf(names[n++], 256, "%s", g_hints[i]->name);
+    pthread_rwlock_unlock(&g_hints_lock);
+    return n;
 }
 
 /* -------------------------------------------------------------------------
@@ -415,20 +444,16 @@ int load_hints_builtin(void)
         { "m.root-servers.net.", "202.12.27.33"   },
     };
 
+    Hints* t[13] = {0};
     for (int i = 0; i < 13; i++) {
-        g_hints[i] = malloc(sizeof(Hints));
-        if (!g_hints[i]) return -1;
-
-        g_hints[i]->name = strdup(roots[i].name);
-        g_hints[i]->ipv6_record = NULL;
-
-        Record* rec = malloc(sizeof(Record));
-        if (!rec) return -1;
-        rec->ip   = strdup(roots[i].ip);
-        rec->type = strdup("A");
-        rec->ttl  = 518400;
-        g_hints[i]->ipv4_record = rec;
+        t[i] = calloc(1, sizeof(Hints));
+        if (!t[i] || !(t[i]->name = strdup(roots[i].name)) ||
+            !(t[i]->ipv4_record = new_hint_record(roots[i].ip, "A", 518400))) {
+            free_hint_table(t);
+            return -1;
+        }
     }
+    install_hint_table(t);
     return 13;
 }
 

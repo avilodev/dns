@@ -1,4 +1,5 @@
 #include "auth_process.h"
+#include "types.h"   /* PID_FILE_PATH fallback */
 
 #include <stdio.h>
 #include <stdlib.h>

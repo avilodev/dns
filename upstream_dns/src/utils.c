@@ -1,8 +1,56 @@
 #include "utils.h"
+#include "dns_name.h"
 #include <sys/random.h>
-#include <strings.h>   /* strncasecmp */
+#include <fcntl.h>
+#include <pthread.h>
 
-int get_random_id()
+/* ---- Pinned paths (see utils.h) ---------------------------------------- */
+
+#define MAX_PINS 8
+static struct { char* path; char* base; int dirfd; } g_pins[MAX_PINS];
+static int g_pin_count = 0;
+static pthread_mutex_t g_pin_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void path_pin(const char* path)
+{
+    if (!path || !*path) return;
+    pthread_mutex_lock(&g_pin_lock);
+    for (int i = 0; i < g_pin_count; i++)
+        if (strcmp(g_pins[i].path, path) == 0) { pthread_mutex_unlock(&g_pin_lock); return; }
+    if (g_pin_count < MAX_PINS) {
+        const char* slash = strrchr(path, '/');
+        char dir[1024];
+        if (!slash)            snprintf(dir, sizeof(dir), ".");
+        else if (slash == path) snprintf(dir, sizeof(dir), "/");
+        else                   snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
+        int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd >= 0) {
+            g_pins[g_pin_count].path  = strdup(path);
+            g_pins[g_pin_count].base  = strdup(slash ? slash + 1 : path);
+            g_pins[g_pin_count].dirfd = fd;
+            if (g_pins[g_pin_count].path && g_pins[g_pin_count].base) g_pin_count++;
+            else { free(g_pins[g_pin_count].path); free(g_pins[g_pin_count].base); close(fd); }
+        }
+    }
+    pthread_mutex_unlock(&g_pin_lock);
+}
+
+int path_open(const char* path, int flags, int mode)
+{
+    if (!path) return -1;
+    pthread_mutex_lock(&g_pin_lock);
+    for (int i = 0; i < g_pin_count; i++) {
+        if (strcmp(g_pins[i].path, path) == 0) {
+            int fd = openat(g_pins[i].dirfd, g_pins[i].base, flags | O_CLOEXEC, mode);
+            pthread_mutex_unlock(&g_pin_lock);
+            return fd;
+        }
+    }
+    pthread_mutex_unlock(&g_pin_lock);
+    return open(path, flags | O_CLOEXEC, mode);
+}
+
+int get_random_id(void)
 {
     uint16_t id;
     if (getrandom(&id, sizeof(id), 0) == sizeof(id)) {
@@ -12,7 +60,7 @@ int get_random_id()
     return rand() & 0xFFFF;
 }
 
-int get_random_server()
+int get_random_server(void)
 {
     uint8_t r;
     if (getrandom(&r, sizeof(r), 0) == sizeof(r)) {
@@ -68,27 +116,6 @@ const char* qtype_to_string(uint16_t qtype)
  */
 bool name_in_bailiwick(const char* name, const char* zone)
 {
-    if (!name || !zone) return false;
-
-    size_t nlen = strlen(name);
-    size_t zlen = strlen(zone);
-
-    /* Ignore a single trailing dot so "example.com." == "example.com",
-     * but keep the lone root dot ("."). */
-    if (nlen > 1 && name[nlen - 1] == '.') nlen--;
-    if (zlen > 1 && zone[zlen - 1] == '.') zlen--;
-
-    /* The root zone ("" or ".") contains every name. */
-    if (zlen == 0 || (zlen == 1 && zone[0] == '.')) return true;
-
-    /* A name shorter than the zone cannot be at or below it. */
-    if (nlen < zlen) return false;
-
-    /* Exact match. */
-    if (nlen == zlen) return strncasecmp(name, zone, zlen) == 0;
-
-    /* Proper subdomain: the zone must align on a label boundary, so the byte
-     * in `name` immediately preceding the zone suffix must be a dot. */
-    if (name[nlen - zlen - 1] != '.') return false;
-    return strncasecmp(name + (nlen - zlen), zone, zlen) == 0;
+    /* Label-aligned, case-insensitive and escape-aware (dns_name.c). */
+    return dname_is_subdomain(name, zone);
 }

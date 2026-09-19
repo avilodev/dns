@@ -13,10 +13,10 @@ static void patch_response_ttls(unsigned char* buf, int len, uint32_t max_ttl)
 {
     if (!buf || len < HEADER_LEN || max_ttl == 0) return;
 
-    uint16_t qdcount = ntohs(*(uint16_t*)(buf + 4));
-    uint16_t ancount = ntohs(*(uint16_t*)(buf + 6));
-    uint16_t nscount = ntohs(*(uint16_t*)(buf + 8));
-    uint16_t arcount = ntohs(*(uint16_t*)(buf + 10));
+    uint16_t qdcount = rd16(buf + 4);
+    uint16_t ancount = rd16(buf + 6);
+    uint16_t nscount = rd16(buf + 8);
+    uint16_t arcount = rd16(buf + 10);
     int pos = HEADER_LEN;
 
     /* Skip question section */
@@ -30,16 +30,16 @@ static void patch_response_ttls(unsigned char* buf, int len, uint32_t max_ttl)
         skip_dns_name(buf, len, &pos);
         if (pos + 10 > len) break;
 
-        uint16_t rr_type = ntohs(*(uint16_t*)(buf + pos));
+        uint16_t rr_type = rd16(buf + pos);
         if (rr_type != 41) { /* skip OPT pseudo-RR */
-            uint32_t rr_ttl = ntohl(*(uint32_t*)(buf + pos + 4));
+            uint32_t rr_ttl = rd32(buf + pos + 4);
             if (rr_ttl > max_ttl) {
                 uint32_t clamped = htonl(max_ttl);
                 memcpy(buf + pos + 4, &clamped, 4);
             }
         }
 
-        uint16_t rdlen = ntohs(*(uint16_t*)(buf + pos + 8));
+        uint16_t rdlen = rd16(buf + pos + 8);
         pos += 10 + rdlen;
     }
 }
@@ -358,8 +358,8 @@ int answer_cache_put(AnswerCache* cache, const char* domain, uint16_t qtype,
                      const char* response_data, ssize_t response_len, uint32_t ttl) {
     if (!cache || !domain || !response_data || response_len <= 0) return -1;
     
-    // Enforce TTL limits
-    if (ttl < MIN_CACHE_TTL) ttl = MIN_CACHE_TTL;
+    // TTL 0 means "do not cache" (RFC 1035 §3.2.1); honour short TTLs as-is.
+    if (ttl == 0) return 0;
     if (ttl > MAX_CACHE_TTL) ttl = MAX_CACHE_TTL;
     
     unsigned long hash = hash_domain_type(domain, qtype);
@@ -532,23 +532,23 @@ void answer_cache_cleanup_expired(AnswerCache* cache) {
 bool wire_is_signed(const unsigned char* buf, int len) {
     if (!buf || len < HEADER_LEN) return false;
 
-    uint16_t qdcount = ntohs(*(const uint16_t*)(buf + 4));
-    uint16_t ancount = ntohs(*(const uint16_t*)(buf + 6));
-    uint16_t nscount = ntohs(*(const uint16_t*)(buf + 8));
-    uint16_t arcount = ntohs(*(const uint16_t*)(buf + 10));
+    uint16_t qdcount = rd16(buf + 4);
+    uint16_t ancount = rd16(buf + 6);
+    uint16_t nscount = rd16(buf + 8);
+    uint16_t arcount = rd16(buf + 10);
     int pos = HEADER_LEN;
 
     for (int i = 0; i < qdcount && pos < len; i++) {
-        skip_dns_name((unsigned char*)buf, len, &pos);
+        skip_dns_name(buf, len, &pos);
         pos += 4; /* QTYPE + QCLASS */
     }
 
     int total_rrs = (int)ancount + nscount + arcount;
     for (int i = 0; i < total_rrs && pos < len; i++) {
-        skip_dns_name((unsigned char*)buf, len, &pos);
+        skip_dns_name(buf, len, &pos);
         if (pos + 10 > len) break;
-        uint16_t type  = ntohs(*(const uint16_t*)(buf + pos));
-        uint16_t rdlen = ntohs(*(const uint16_t*)(buf + pos + 8));
+        uint16_t type  = rd16(buf + pos);
+        uint16_t rdlen = rd16(buf + pos + 8);
         if (type == QTYPE_RRSIG) return true;
         pos += 10 + rdlen;
     }
@@ -561,83 +561,70 @@ bool response_is_signed(struct Packet* response) {
                           (int)response->recv_len);
 }
 
+/*
+ * How long a response may be cached, in seconds (0 = do not cache).
+ *
+ *   positive answer : the smallest TTL in the answer section
+ *   NXDOMAIN/NODATA : min(SOA TTL, SOA MINIMUM) from the authority section
+ *                     (RFC 2308 §5); a negative answer without an SOA is not
+ *                     cached at all (RFC 2308 §5, "SHOULD NOT be cached")
+ *
+ * The result is capped at MAX_CACHE_TTL.  There is deliberately no floor: a
+ * record's owner chose its TTL, and TTL 0 means "do not cache" (RFC 1035 §3.2.1).
+ */
 uint32_t extract_min_ttl_from_response(struct Packet* response) {
-    if (!response || !response->request || response->recv_len < HEADER_LEN) {
-        return DEFAULT_NS_TTL;
-    }
-    
+    if (!response || !response->request || response->recv_len < HEADER_LEN)
+        return 0;
+
     unsigned char* buffer = (unsigned char*)response->request;
+    int buffer_len = (int)response->recv_len;
     int pos = HEADER_LEN;
-    int buffer_len = response->recv_len;
-    uint32_t min_ttl = DEFAULT_NS_TTL;
-    bool found_ttl = false;
-    
-    // Skip question section
-    for (int i = 0; i < response->qdcount && pos < buffer_len; i++) {
+    uint16_t qd = rd16(buffer + 4);
+    uint16_t an = rd16(buffer + 6);
+    uint16_t ns = rd16(buffer + 8);
+
+    for (int i = 0; i < qd && pos < buffer_len; i++) {
         skip_dns_name(buffer, buffer_len, &pos);
         pos += 4;  // QTYPE + QCLASS
     }
-    
-    // Check answer section for TTLs
-    for (int i = 0; i < response->ancount && pos < buffer_len; i++) {
+
+    bool found = false;
+    uint32_t min_ttl = 0;
+    for (int i = 0; i < an && pos < buffer_len; i++) {
         skip_dns_name(buffer, buffer_len, &pos);
-        
         if (pos + 10 > buffer_len) break;
-        
-        uint32_t ttl = ntohl(*(uint32_t*)(buffer + pos + 4));
-        uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
-        
-        if (!found_ttl || ttl < min_ttl) {
-            min_ttl = ttl;
-            found_ttl = true;
-        }
-        
+        uint32_t ttl = rd32(buffer + pos + 4);
+        uint16_t rdlength = rd16(buffer + pos + 8);
+        if (!found || ttl < min_ttl) { min_ttl = ttl; found = true; }
         pos += 10 + rdlength;
     }
-    
-    // For NXDOMAIN, check authority section for SOA minimum TTL
-    if (response->rcode == RCODE_NAME_ERROR && response->nscount > 0) {
-        for (int i = 0; i < response->nscount && pos < buffer_len; i++) {
+
+    if (!found) {
+        /* Negative answer: the SOA in the authority section sets the TTL. */
+        for (int i = 0; i < ns && pos < buffer_len; i++) {
             skip_dns_name(buffer, buffer_len, &pos);
-            
             if (pos + 10 > buffer_len) break;
-            
-            uint16_t type = ntohs(*(uint16_t*)(buffer + pos));
-            uint32_t ttl = ntohl(*(uint32_t*)(buffer + pos + 4));
-            uint16_t rdlength = ntohs(*(uint16_t*)(buffer + pos + 8));
-            
-            // Found authoritative NXDOMAIN (SOA)
-            if (type == QTYPE_SOA && rdlength > 20) {
+            uint16_t type     = rd16(buffer + pos);
+            uint32_t ttl      = rd32(buffer + pos + 4);
+            uint16_t rdlength = rd16(buffer + pos + 8);
+            if (type == QTYPE_SOA && pos + 10 + rdlength <= buffer_len) {
                 int rdata_pos = pos + 10;
-                
-                // Skip primary nameserver
-                skip_dns_name(buffer, buffer_len, &rdata_pos);
-                
-                // Skip RNAME
-                skip_dns_name(buffer, buffer_len, &rdata_pos);
-                
-                // Skip serial, refresh, retry, expire (4 uint32_t = 16 bytes)
-                rdata_pos += 16;
-                
-                // Read MINIMUM (the negative caching TTL)
-                if (rdata_pos + 4 <= buffer_len) {
-                    uint32_t soa_minimum = ntohl(*(uint32_t*)(buffer + rdata_pos));
-                    
-                    // Use the smaller of SOA TTL or SOA minimum
-                    uint32_t negative_ttl = (ttl < soa_minimum) ? ttl : soa_minimum;
-                    return negative_ttl;
+                skip_dns_name(buffer, buffer_len, &rdata_pos);   /* MNAME */
+                skip_dns_name(buffer, buffer_len, &rdata_pos);   /* RNAME */
+                rdata_pos += 16;                         /* serial..expire */
+                if (rdata_pos + 4 <= pos + 10 + rdlength) {
+                    uint32_t soa_minimum = rd32(buffer + rdata_pos);
+                    min_ttl = (ttl < soa_minimum) ? ttl : soa_minimum;
+                    found = true;
                 }
+                break;
             }
-            
             pos += 10 + rdlength;
         }
     }
-    
-    // Enforce reasonable limits
-    if (min_ttl < 60) min_ttl = MIN_CACHE_TTL;
-    if (min_ttl > 86400) min_ttl = MAX_CACHE_TTL;
-    
-    return found_ttl ? min_ttl : DEFAULT_NS_TTL;
+
+    if (!found) return 0;
+    return (min_ttl > MAX_CACHE_TTL) ? MAX_CACHE_TTL : min_ttl;
 }
 
 /*
@@ -663,7 +650,7 @@ uint32_t extract_referral_ns_ttl(struct Packet* response) {
     for (int i = 0; i < (int)response->ancount && pos < blen; i++) {
         skip_dns_name(buf, blen, &pos);
         if (pos + 10 > blen) break;
-        uint16_t rdlen = ntohs(*(uint16_t*)(buf + pos + 8));
+        uint16_t rdlen = rd16(buf + pos + 8);
         pos += 10 + rdlen;
     }
 
@@ -671,9 +658,9 @@ uint32_t extract_referral_ns_ttl(struct Packet* response) {
     for (int i = 0; i < (int)response->nscount && pos < blen; i++) {
         skip_dns_name(buf, blen, &pos);
         if (pos + 10 > blen) break;
-        uint16_t type  = ntohs(*(uint16_t*)(buf + pos));
-        uint32_t ttl   = ntohl(*(uint32_t*)(buf + pos + 4));
-        uint16_t rdlen = ntohs(*(uint16_t*)(buf + pos + 8));
+        uint16_t type  = rd16(buf + pos);
+        uint32_t ttl   = rd32(buf + pos + 4);
+        uint16_t rdlen = rd16(buf + pos + 8);
         if (type == QTYPE_NS) {
             if (ttl < MIN_CACHE_TTL) ttl = MIN_CACHE_TTL;
             if (ttl > MAX_CACHE_TTL) ttl = MAX_CACHE_TTL;

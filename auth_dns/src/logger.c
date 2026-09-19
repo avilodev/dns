@@ -1,4 +1,5 @@
 #include "logger.h"
+#include "utils.h"   /* path_open */
 #include <pthread.h>
 #include <pwd.h>
 
@@ -12,7 +13,7 @@ static int log_fd = -1;
  * (SIGHUP / logrotate) succeed instead of failing EACCES on a 0644 log it does
  * not own.  Returns the fd, or -1 on failure. */
 static int open_log_fd(void) {
-    int fd = open(LOG_FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    int fd = path_open(LOG_FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
     if (fd < 0) return -1;
     if (geteuid() == 0 && g_config.drop_user && *g_config.drop_user) {
         char u[128];
@@ -139,7 +140,10 @@ int log_entry(const char* client_ip, uint16_t port, uint16_t qtype,
      * and writes uninitialized stack memory to the log (and the trailing '\n'
      * gets lost, causing log entries to run together). */
     if (len > 0) {
-        if (len >= (int)sizeof(log_line)) len = (int)sizeof(log_line) - 1;
+        if (len >= (int)sizeof(log_line)) {
+            len = (int)sizeof(log_line) - 1;
+            log_line[len - 1] = '\n';   /* keep one entry per line when truncated */
+        }
         if (write(log_fd, log_line, len) < 0)
             perror("Warning: Log write failed");
     }
@@ -167,8 +171,13 @@ void log_close(void) {
  */
 void log_reopen(void) {
     pthread_mutex_lock(&log_mutex);
-    if (log_fd >= 0) { close(log_fd); log_fd = -1; }
-    log_fd = open_log_fd();
-    if (log_fd < 0) perror("Warning: log_reopen: Failed to open log file");
+    int fd = open_log_fd();
+    if (fd >= 0) {
+        if (log_fd >= 0) close(log_fd);
+        log_fd = fd;
+    } else {
+        /* Keep logging to the old fd rather than losing the log entirely. */
+        perror("Warning: log_reopen: Failed to open log file; keeping current fd");
+    }
     pthread_mutex_unlock(&log_mutex);
 }

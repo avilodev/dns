@@ -52,36 +52,24 @@ void* process_query(void* arg) {
 
     const struct sockaddr* caddr = (const struct sockaddr*)&ctx->client_addr;
 
+    /* A QR=1 datagram is a response, not a query: never answer it (answering
+     * responses invites reflection loops between two servers). */
+    if (ctx->recv_len >= 3 && (ctx->buffer[2] & 0x80)) { free(ctx); return NULL; }
+
     struct Packet* pkt = parse_request_headers(ctx->buffer, ctx->recv_len);
     if (!pkt) {
         fprintf(stderr, "Failed to parse request from %s\n", client_ip_buf);
-        send_servfail(ctx->dns_sock, caddr, ctx->client_addr_len,
-                      (unsigned char*)ctx->buffer, ctx->recv_len);
+        send_error_rcode(ctx->dns_sock, caddr, ctx->client_addr_len,
+                         (unsigned char*)ctx->buffer, ctx->recv_len, RCODE_FORMAT_ERROR);
         free(ctx);
         return NULL;
     }
 
-    // Non-standard opcode: send NOTIMP and drop
-    if (pkt->rcode == RCODE_NOTIMP) {
-        unsigned char notimp[12] = {0};
-        notimp[0] = (unsigned char)ctx->buffer[0];
-        notimp[1] = (unsigned char)ctx->buffer[1];
-        notimp[2] = 0x80;                   // QR=1
-        notimp[3] = 0x80 | RCODE_NOTIMP;   // RA=1, RCODE=4
-        sendto(ctx->dns_sock, notimp, sizeof(notimp), 0, caddr, ctx->client_addr_len);
-        free_packet(pkt);
-        free(ctx);
-        return NULL;
-    }
-
-    // Pre-set parser errors (e.g. FORMERR for invalid QCLASS, RFC 1035)
+    // Non-standard opcode (NOTIMP) and pre-set parser errors (e.g. FORMERR for
+    // an invalid QCLASS): reply with that RCODE, echoing the question.
     if (pkt->rcode != 0) {
-        unsigned char err[12] = {0};
-        err[0] = (unsigned char)ctx->buffer[0];
-        err[1] = (unsigned char)ctx->buffer[1];
-        err[2] = 0x80;                          // QR=1
-        err[3] = 0x80 | (pkt->rcode & 0xF);    // RA=1, RCODE
-        sendto(ctx->dns_sock, err, sizeof(err), 0, caddr, ctx->client_addr_len);
+        send_error_rcode(ctx->dns_sock, caddr, ctx->client_addr_len,
+                         (unsigned char*)ctx->buffer, ctx->recv_len, pkt->rcode);
         free_packet(pkt); free(ctx);
         return NULL;
     }
@@ -181,7 +169,7 @@ void* process_query(void* arg) {
     // Log and send response
     {
         uint8_t ans_rcode = (ret->recv_len >= HEADER_LEN && ret->request)
-            ? (uint8_t)(ntohs(*(uint16_t*)(ret->request + 2)) & 0xF) : 0;
+            ? (uint8_t)(rd16(ret->request + 2) & 0xF) : 0;
         log_query(client_ip_buf, client_port_val, pkt->q_type,
                   pkt->full_domain, ans_rcode, NULL);
     }
@@ -207,10 +195,13 @@ void* process_tcp_query(void* arg) {
     struct TCPQueryContext* ctx = (struct TCPQueryContext*)arg;
     int fd = ctx->client_fd;
 
-    // Guard against slow clients
-    struct timeval tv = { .tv_sec = SOCKET_TIMEOUT, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    /* Guard against slow and idle clients: each connection holds a TCP worker,
+     * so one that sits silent is closed within TCP_IDLE_TIMEOUT (RFC 7766
+     * §6.2.3).  Real clients send their query immediately. */
+    struct timeval rtv = { .tv_sec = TCP_IDLE_TIMEOUT, .tv_usec = 0 };
+    struct timeval wtv = { .tv_sec = SOCKET_TIMEOUT,   .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &wtv, sizeof(wtv));
 
     // SO_KEEPALIVE: detect dead half-open connections (RFC 7766 §6.2.3)
     int ka = 1;
@@ -237,64 +228,28 @@ void* process_tcp_query(void* arg) {
         n = recv(fd, buffer, msg_len, MSG_WAITALL);
         if (n != msg_len) { free(buffer); break; }
 
+        if (buffer[2] & 0x80) { free(buffer); continue; }   /* a response — ignore */
+
         struct Packet* pkt = parse_request_headers(buffer, msg_len);
         if (!pkt) {
-            // Cannot parse: send SERVFAIL using raw TX ID from buffer, keep connection
-            uint16_t sf_len_net = htons(12);
-            unsigned char sf[12] = {0};
-            sf[0] = (unsigned char)buffer[0];
-            sf[1] = (unsigned char)buffer[1];
-            sf[2] = 0x80;
-            sf[3] = 0x80 | RCODE_SERVER_FAILURE;
-            if (write(fd, &sf_len_net, 2) == 2 && write(fd, sf, 12) == 12) {}
+            send_error_tcp(fd, (unsigned char*)buffer, msg_len, RCODE_FORMAT_ERROR);
             free(buffer); continue;
         }
 
-        // Non-standard opcode: send NOTIMP, then continue pipelining
-        if (pkt->rcode == RCODE_NOTIMP) {
-            uint16_t notimp_len_net = htons(12);
-            unsigned char notimp[12] = {0};
-            notimp[0] = (unsigned char)buffer[0];
-            notimp[1] = (unsigned char)buffer[1];
-            notimp[2] = 0x80;                   // QR=1
-            notimp[3] = 0x80 | RCODE_NOTIMP;   // RA=1, RCODE=4
-            if (write(fd, &notimp_len_net, 2) == 2 && write(fd, notimp, 12) == 12) {}
-            free_packet(pkt); free(buffer);
-            continue;
-        }
-
-        // Pre-set parser errors (e.g. FORMERR for invalid QCLASS)
+        // NOTIMP / FORMERR set by the parser: reply, then continue pipelining
         if (pkt->rcode != 0) {
-            uint16_t err_len_net = htons(12);
-            unsigned char err[12] = {0};
-            err[0] = (unsigned char)buffer[0];
-            err[1] = (unsigned char)buffer[1];
-            err[2] = 0x80;
-            err[3] = 0x80 | (pkt->rcode & 0xF);
-            if (write(fd, &err_len_net, 2) == 2 && write(fd, err, 12) == 12) {}
+            send_error_tcp(fd, (unsigned char*)buffer, msg_len, pkt->rcode);
             free_packet(pkt); free(buffer); continue;
         }
 
         if (!pkt->full_domain) {
-            uint16_t sf_len_net = htons(12);
-            unsigned char sf[12] = {0};
-            sf[0] = (unsigned char)buffer[0];
-            sf[1] = (unsigned char)buffer[1];
-            sf[2] = 0x80;
-            sf[3] = 0x80 | RCODE_SERVER_FAILURE;
-            if (write(fd, &sf_len_net, 2) == 2 && write(fd, sf, 12) == 12) {}
+            send_error_tcp(fd, (unsigned char*)buffer, msg_len, RCODE_SERVER_FAILURE);
             free_packet(pkt); free(buffer); continue;
         }
 
         struct Packet* answer = format_resolver(pkt);
         if (!answer) {
-            uint16_t sf_len_net = htons(12);
-            unsigned char sf[12] = {0};
-            sf[0] = (pkt->id >> 8) & 0xFF;
-            sf[1] = pkt->id & 0xFF;
-            sf[2] = 0x80;
-            sf[3] = 0x80 | RCODE_SERVER_FAILURE;
-            if (write(fd, &sf_len_net, 2) == 2 && write(fd, sf, 12) == 12) {}
+            send_error_tcp(fd, (unsigned char*)buffer, msg_len, RCODE_SERVER_FAILURE);
             free_packet(pkt); free(buffer); continue;
         }
 
@@ -308,13 +263,7 @@ void* process_tcp_query(void* arg) {
             log_query(ctx->client_ip, ctx->client_port, pkt->q_type,
                       pkt->full_domain, RCODE_SERVER_FAILURE, NULL);
             // Send SERVFAIL to client so it gets an answer rather than timing out
-            uint16_t sf_len_net = htons(12);
-            unsigned char sf[12] = {0};
-            sf[0] = (pkt->id >> 8) & 0xFF;
-            sf[1] = pkt->id & 0xFF;
-            sf[2] = 0x80;
-            sf[3] = 0x80 | RCODE_SERVER_FAILURE;
-            if (write(fd, &sf_len_net, 2) == 2 && write(fd, sf, 12) == 12) {}
+            send_error_tcp(fd, (unsigned char*)buffer, msg_len, RCODE_SERVER_FAILURE);
             free_packet(pkt); free_packet(answer); free(buffer);
             continue;
         }
@@ -331,11 +280,13 @@ void* process_tcp_query(void* arg) {
         // Strip DNSSEC machinery for a non-DO client (RFC 4035 §3.2.1).
         if (!pkt->do_bit)
             strip_dnssec_for_non_do(&ret->request, &ret->recv_len, pkt->q_type);
-        // Note: do NOT set TC bit for TCP responses — TCP has no 512-byte limit
+        // No TC over TCP (no 512-byte limit), but an EDNS client must still get
+        // an OPT RR back (RFC 6891 §7) — rebuilt CNAME answers carry none.
+        if (pkt->edns_present) ensure_edns_opt(&ret->request, &ret->recv_len, pkt->do_bit);
 
         {
             uint8_t ans_rcode = (ret->recv_len >= HEADER_LEN && ret->request)
-                ? (uint8_t)(ntohs(*(uint16_t*)(ret->request + 2)) & 0xF) : 0;
+                ? (uint8_t)(rd16(ret->request + 2) & 0xF) : 0;
             log_query(ctx->client_ip, ctx->client_port, pkt->q_type,
                       pkt->full_domain, ans_rcode, NULL);
         }

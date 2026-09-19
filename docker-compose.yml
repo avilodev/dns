@@ -61,7 +61,7 @@ services:
     # forwarding). Avoid `. NS` — it's forwarded to upstream, which SERVFAILs on
     # root-zone queries, falsely marking auth unhealthy.
     healthcheck:
-      test: ["CMD", "kdig", "+timeout=2", "+retry=0", "@127.0.0.1", "-p", "53", "avilo.com", "SOA"]
+      test: ["CMD", "kdig", "+timeout=2", "+retry=0", "@127.0.0.1", "-p", "53", "priv", "SOA"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -17,10 +17,28 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include "wire_io.h"   /* alignment-safe wire field access */
+
+/* True for the errno a timed-out or would-block socket call reports.  EAGAIN
+ * and EWOULDBLOCK are the same value on Linux but may differ elsewhere. */
+static inline bool errno_is_timeout(int e)
+{
+#if EAGAIN == EWOULDBLOCK
+    return e == EAGAIN;
+#else
+    return e == EAGAIN || e == EWOULDBLOCK;
+#endif
+}
+
 #define MAXLINE 4096
 #define HEADER_LEN 12
 #define SOCKET_TIMEOUT 5
 #define DNS_PORT 53
+
+/* EDNS UDP payload size we advertise, both to authoritative servers and to our
+ * clients: 1232 avoids IP fragmentation on virtually every path (DNS Flag Day
+ * 2020); larger answers fall back to TCP. */
+#define EDNS_UDP_PAYLOAD 1232
 
 /* Recursion time budget (see udp_client.c / resolve.c).
  *
@@ -37,6 +55,9 @@
  * the resolver always returns a real answer inside auth's window. */
 #define RECURSION_BUDGET_SEC 4
 #define PER_HOP_TIMEOUT_SEC  2
+
+/* Idle time a TCP client may hold a worker before (and between) queries. */
+#define TCP_IDLE_TIMEOUT 2
 
 // DNS Query Types
 #define QTYPE_A          1
@@ -118,11 +139,8 @@ struct Packet {
     uint16_t nscount;  // Authority count
     uint16_t arcount;  // Additional count
 
-    // Domain components
+    // Question name: presentation text from dns_name.h (escaped, root = ".")
     char* full_domain;
-    char* authoritative_domain;
-    char* domain;
-    char* top_level_domain;
 
     uint16_t q_type;   // Query type
     uint16_t q_class;  // Query class (1=IN)

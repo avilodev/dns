@@ -36,7 +36,7 @@ BIN_DIR = bin
 # Source files (just the names)
 SOURCES = main.c auth.c logger.c request.c resolve.c \
           response.c utils.c thread_pool.c dnssec.c \
-          access_control.c policy.c dns_synth.c auth_net.c auth_process.c auth_zonefile.c auth_records.c auth_lookup.c
+          access_control.c policy.c dns_synth.c auth_net.c auth_process.c auth_zonefile.c auth_records.c auth_lookup.c auth_chase.c dns_name.c
 
 # Full paths
 SRC_FILES = $(addprefix $(SRC_DIR)/, $(SOURCES))
@@ -84,7 +84,7 @@ asan: clean all
 # to surface memory/alignment/UB bugs. Standalone — no daemon or network.
 #   make fuzz && obj/fuzz_request -max_total_time=30
 FUZZ_DIR  = fuzz
-FUZZ_SRCS = $(SRC_DIR)/request.c $(SRC_DIR)/utils.c
+FUZZ_SRCS = $(SRC_DIR)/request.c $(SRC_DIR)/utils.c $(SRC_DIR)/dns_name.c
 fuzz: | directories
 	clang -g -O1 -Isrc -fno-strict-aliasing -fsanitize=fuzzer,address,undefined \
 	    $(FUZZ_DIR)/fuzz_request.c $(FUZZ_SRCS) -o $(OBJ_DIR)/fuzz_request

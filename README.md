@@ -20,7 +20,7 @@ auth_dns (port 53)
                               root hints -> TLD -> zone -> answer
 ```
 
-**auth_dns** is what your network points at. It serves authoritative records for your zones (avilo.com, avilo.priv, adoliva.com, etc.) and forwards anything it doesn't own to the upstream resolver.
+**auth_dns** is what your network points at. It serves authoritative records for your local names (the `.priv` zone: `pi5.priv`, `pi3.priv`) and forwards anything it doesn't own to the upstream resolver.
 
 **upstream_dns** is a full recursive/iterative resolver. It doesn't forward to Google or Cloudflare — it starts from the DNS root and walks the delegation chain itself, following NS referrals until it reaches the authoritative server for the queried domain.
 
@@ -218,43 +218,40 @@ Authoritative records and the blocklist share one file, `auth_dns/misc/config.tx
 records go in `[domain]` sections, blocked names in the `[blocklist]` section.
 Lines starting with `#` are comments.
 
-```
-# Record types:
-#   A:        domain ip_address
-#   AAAA:     domain ipv6_address
-#   NXDOMAIN: domain NXDOMAIN
-#   MX:       domain MX priority hostname
-#   NS:       domain NS nameserver-hostname
-#   CNAME:    domain CNAME canonical-name
-#   TXT:      domain TXT "text data"
-#   SRV:      domain SRV priority weight port target
-#   SOA:      domain SOA primary-ns admin-email serial refresh retry expire minimum
-```
-
-**Bare A/AAAA records** (no type keyword) default to A:
+Each `[name]` section header sets the owner; the lines under it are that
+name's records:
 
 ```
-avilo.com 192.168.1.2
-avilo.com 2001:db8::1
+[example.priv]                      # zone apex
+SOA    ns1.example.priv  hostmaster.example.priv  2026091801  3600  900  604800  300
+NS     ns1.example.priv
+A      192.168.1.10
+AAAA   fd00::10
+MX     10  mail.example.priv
+TXT    "v=spf1 mx -all"
+TXT    "v=DKIM1; k=rsa; " "p=MIIB..."   # several strings in one TXT record
+HTTPS  1  .
+
+[www.example.priv]
+CNAME  example.priv                 # answers include the target's records
+
+[_imaps._tcp.example.priv]
+SRV    10  1  993  mail.example.priv
+
+[*.dev.example.priv]                # wildcard (A/AAAA), any depth
+A      192.168.1.20
+
+[blocklist]
+ads.example.com                     # blocks the name and all its subdomains
+0.0.0.0 tracker.example.net         # hosts-file lines work too
 ```
 
-**Full zone example:**
-
-```
-avilo.com SOA ns1.avilo.com hostmaster.avilo.com 2026022802 3600 900 604800 300
-avilo.com NS ns1.avilo.com
-avilo.com NS ns2.avilo.com
-avilo.com 192.168.1.2
-avilo.com MX 10 mail.avilo.com
-avilo.com TXT "v=spf1 mx -all"
-www.avilo.com CNAME avilo.com
-mail.avilo.com 192.168.1.4
-ns1.avilo.com 192.168.1.2
-_imaps._tcp.avilo.com SRV 10 1 993 mail.avilo.com
-
-# Block a domain
-ads.google.com NXDOMAIN
-```
+A name inside a zone that has an SOA but no records of its own gets NXDOMAIN
+(or NODATA if it has children); names outside every zone are forwarded to the
+upstream resolver. Private reverse lookups (RFC 1918, loopback, link-local,
+ULA) are answered locally per RFC 6303 unless you define the PTR records.
+Names may use RFC 1035 escapes (`\.` for a dot inside a label, `\DDD` for
+any byte). Reload with `kill -HUP $(cat /run/auth_dns.pid)`.
 
 **SOA fields:** `serial refresh retry expire minimum` — all in seconds except serial (use YYYYMMDDNN format). Negative caching TTL comes from `minimum`.
 

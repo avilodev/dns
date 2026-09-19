@@ -2,6 +2,7 @@
 #include "auth_answer.h"   /* find_zsk_for_owner / find_ksk_for_zone decls */
 #include "auth.h"          /* auth_domains[], auth_domain_count */
 #include "dnssec.h"        /* ZoneKey, g_zone_keys */
+#include "dns_name.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -16,11 +17,7 @@ extern ZoneKey *g_zone_keys;   /* defined in auth.c */
 /* Count dot-separated labels: "a.b.c" → 3, "example.com" → 2 */
 int count_labels(const char *name)
 {
-    if (!name || *name == '\0') return 0;
-    int n = 1;
-    for (const char *p = name; *p; p++)
-        if (*p == '.') n++;
-    return n;
+    return dname_label_count(name);   /* escape-aware */
 }
 
 /*
@@ -38,12 +35,7 @@ const struct AuthDomain *find_zone_soa(const char *owner)
         if (!auth_domains[i].has_soa) continue;
         const char *zone = auth_domains[i].domain;
         size_t zlen = strlen(zone);
-        size_t olen = strlen(owner);
-        bool match = (strcmp(owner, zone) == 0) ||
-                     (olen > zlen &&
-                      owner[olen - zlen - 1] == '.' &&
-                      strcmp(owner + olen - zlen, zone) == 0);
-        if (match && zlen > best_len) {
+        if (dname_is_subdomain(owner, zone) && zlen > best_len) {
             best = &auth_domains[i];
             best_len = zlen;
         }
@@ -51,21 +43,37 @@ const struct AuthDomain *find_zone_soa(const char *owner)
     return best;
 }
 
+/* True if any record (or wildcard) is owned by exactly `name`. */
+static bool name_has_records(const char *name)
+{
+    for (int i = 0; i < auth_domain_count; i++)
+        if (strcmp(auth_domains[i].domain, name) == 0) return true;
+    return false;
+}
+
 /*
- * find_wildcard — check if a wildcard record covers owner.
- * "www.avilo.com" → looks for "*.avilo.com" entry.
+ * find_wildcard — RFC 4592 wildcard lookup for a name with no records.
+ *
+ * Walk up from the parent of `owner` to find the closest encloser (the
+ * nearest ancestor that exists — owns records or is an empty non-terminal).
+ * Only "*.<closest encloser>" may synthesize an answer, so a wildcard covers
+ * names any number of labels below it ("a.b.avilo.com" matches
+ * "*.avilo.com"), but never across an existing node in between.
  */
 const struct AuthDomain *find_wildcard(const char *owner)
 {
     if (!owner) return NULL;
-    const char *dot = strchr(owner, '.');
-    if (!dot) return NULL;
-    char wc[264];
-    snprintf(wc, sizeof(wc), "*%s", dot);   /* "*.parent.zone" */
-    for (int i = 0; i < auth_domain_count; i++) {
-        if (auth_domains[i].is_wildcard &&
-            strcmp(auth_domains[i].domain, wc) == 0)
-            return &auth_domains[i];
+    for (const char *parent = dname_parent(owner); parent; parent = dname_parent(parent)) {
+        char wc[DNAME_TEXT_MAX + 2];
+        snprintf(wc, sizeof(wc), "*.%s", parent);
+        for (int i = 0; i < auth_domain_count; i++) {
+            if (auth_domains[i].is_wildcard &&
+                strcmp(auth_domains[i].domain, wc) == 0)
+                return &auth_domains[i];
+        }
+        /* `parent` exists: it is the closest encloser, and it has no wildcard. */
+        if (name_has_records(parent) || is_empty_non_terminal(parent))
+            return NULL;
     }
     return NULL;
 }
@@ -79,14 +87,10 @@ const struct AuthDomain *find_wildcard(const char *owner)
 bool is_empty_non_terminal(const char *owner)
 {
     if (!owner || !*owner) return false;
-    size_t olen = strlen(owner);
     for (int i = 0; i < auth_domain_count; i++) {
         const char *d = auth_domains[i].domain;
-        size_t dlen = strlen(d);
-        if (dlen > olen + 1 &&
-            d[dlen - olen - 1] == '.' &&
-            strcmp(d + dlen - olen, owner) == 0)
-            return true;
+        if (strcmp(d, owner) != 0 && dname_is_subdomain(d, owner))
+            return true;                       /* strict descendant exists */
     }
     return false;
 }
@@ -100,12 +104,7 @@ const ZoneKey *find_zsk_for_owner(const char *owner)
     for (const ZoneKey *k = g_zone_keys; k; k = k->next) {
         if (k->flags != 256) continue;   /* ZSK flag = 256 */
         size_t zlen = strlen(k->zone);
-        size_t olen = strlen(owner);
-        bool match = (strcmp(owner, k->zone) == 0) ||
-                     (olen > zlen &&
-                      owner[olen - zlen - 1] == '.' &&
-                      strcmp(owner + olen - zlen, k->zone) == 0);
-        if (match && zlen > best_len) {
+        if (dname_is_subdomain(owner, k->zone) && zlen > best_len) {
             best = k;
             best_len = zlen;
         }

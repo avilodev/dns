@@ -207,7 +207,7 @@ static void flush_key(const char *path, const char *config_dir,
     {
         unsigned char rdata[600];
         size_t rdata_pos = 0;
-        *(uint16_t*)(rdata + rdata_pos) = htons(flags);   rdata_pos += 2;
+        wr16(rdata + rdata_pos, flags);   rdata_pos += 2;
         rdata[rdata_pos++] = 3;           /* protocol = 3 */
         rdata[rdata_pos++] = algorithm;
         int pub_len = dnssec_pubkey_rdata(zk, rdata + rdata_pos,

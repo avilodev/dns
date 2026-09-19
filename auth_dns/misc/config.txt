@@ -2,66 +2,17 @@
 # Reload after editing:  kill -HUP $(cat /run/auth_dns.pid)
 
 # --- Authoritative zones ---
-# [domain] header, then one record per line:
-#   A / AAAA / NS / MX <prio> <host> / CNAME / TXT "..." / SRV <p> <w> <port> <tgt>
+# [name] header, then one record per line:
+#   A / AAAA / NS / MX <prio> <host> / CNAME / TXT "..." ["..."] / SRV <p> <w> <port> <tgt>
+#   HTTPS <prio> <target>
 #   SOA <mname> <rname> <serial> <refresh> <retry> <expire> <minimum>
-# Wildcards: use [*.zone] (A/AAAA only).
+# Wildcards: use [*.zone] (A/AAAA only).  Names may use RFC 1035 escapes (\. \DDD).
 
-[avilo.com]
-SOA    ns1.avilo.com  hostmaster.avilo.com  2026022802  3600  900  604800  300
-NS     ns1.avilo.com
-NS     ns2.avilo.com
-A      192.168.1.2
-AAAA   2001:db8::1
-MX     10  mail.avilo.com
-TXT    "v=spf1 mx -all"
-
-[www.avilo.com]
-CNAME  avilo.com
-
-[mail.avilo.com]
-A      192.168.1.4
-
-[ns1.avilo.com]
-A      192.168.1.2
-
-[ns2.avilo.com]
-A      192.168.1.2
-
-[_imaps._tcp.avilo.com]
-SRV    10  1  993  mail.avilo.com
-
-[avilo.priv]
-SOA    ns1.avilo.priv  hostmaster.avilo.priv  2026022802  3600  900  604800  300
-NS     ns1.avilo.priv
-NS     ns2.avilo.priv
-A      192.168.1.2
-MX     10  mail.avilo.priv
-
-[mail.avilo.priv]
-A      192.168.1.3
-
-[ns1.avilo.priv]
-A      192.168.1.2
-
-[ns2.avilo.priv]
-A      192.168.1.2
-
-[adoliva.com]
-SOA    ns1.adoliva.com  hostmaster.adoliva.com  2026030701  3600  900  604800  300
-NS     ns1.adoliva.com
-NS     ns2.adoliva.com
-A      192.168.1.2
-MX     10  mail.adoliva.com
-
-[mail.adoliva.com]
-A      192.168.1.3
-
-[ns1.adoliva.com]
-A      192.168.1.2
-
-[ns2.adoliva.com]
-A      192.168.1.2
+# The whole .priv TLD is served here: any .priv name not listed below gets a
+# local NXDOMAIN instead of being sent to the internet (.priv is not a real TLD).
+[priv]
+SOA    pi5.priv  hostmaster.pi5.priv  2026091801  3600  900  604800  300
+NS     pi5.priv
 
 [pi5.priv]
 A      192.168.1.2
