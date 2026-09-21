@@ -92,12 +92,13 @@ static void blockset_add(BlockSet* s, const char* name)
     s->count++;
 }
 
-/* True if `lname` (lowercased) or any of its parent suffixes is in the set. */
-static int blockset_match_subtree(const BlockSet* s, const char* lname)
+/* The blocked suffix covering `lname` (lowercased) — the name itself or the
+ * nearest listed ancestor — or NULL when nothing in the set covers it. */
+static const char* blockset_match_subtree(const BlockSet* s, const char* lname)
 {
     for (const char* p = lname; p && *p; p = dname_parent(p))   /* escape-aware */
-        if (blockset_contains(s, p)) return 1;
-    return 0;
+        if (blockset_contains(s, p)) return p;
+    return NULL;
 }
 
 /* ==========================================================================
@@ -217,11 +218,13 @@ int policy_load(const char* config_path)
     return (int)nb->count;
 }
 
-PolicyAction policy_lookup(const char* qname, uint16_t qtype, SynthAnswer* out)
+PolicyAction policy_lookup(const char* qname, uint16_t qtype, SynthAnswer* out,
+                           char* zone_out, size_t zone_cap)
 {
     SynthAnswer tmp;
     if (!out) out = &tmp;
     memset(out, 0, sizeof(*out));
+    if (zone_out && zone_cap) zone_out[0] = '\0';
     if (!qname || !*qname) return POLICY_PASS;
 
     char lname[MAX_NAME + 1];
@@ -229,7 +232,10 @@ PolicyAction policy_lookup(const char* qname, uint16_t qtype, SynthAnswer* out)
 
     pthread_rwlock_rdlock(&g_lock);
 
-    if (g_block && blockset_match_subtree(g_block, lname)) {
+    const char* matched = g_block ? blockset_match_subtree(g_block, lname) : NULL;
+    if (matched) {
+        /* The listed suffix is the apex of the zone we are refusing for. */
+        if (zone_out && zone_cap) snprintf(zone_out, zone_cap, "%s", matched);
         if (g_block_rcode == RCODE_NO_ERROR) {        /* sinkhole mode */
             if (qtype == QTYPE_A && g_sink_v4_ok) {
                 out->qtype = QTYPE_A; out->addrlen = 4;

@@ -2,6 +2,7 @@
 #include <sys/random.h>
 #include <ctype.h>
 #include <string.h>
+#include <time.h>
 
 extern Config g_config;
 
@@ -142,11 +143,9 @@ static struct Packet* query_upstream_tcp(struct Packet* pkt) {
         close(sock);
         return NULL;
     }
-    /* TCP answers can be up to 65535 bytes — size the buffer to the prefix,
-     * but never below MAXLINE: callers (append_edns_opt) append to a response
-     * in place and assume the MAXLINE capacity every other response buffer
-     * has.  An exact-size buffer here was overrun by the EDNS OPT append. */
-    response->request = malloc(rlen > MAXLINE ? rlen : MAXLINE);
+    /* Every response buffer has DNS_MSG_MAX capacity: callers
+     * (append_edns_opt, merge_chased_answer) append to it in place. */
+    response->request = malloc(DNS_MSG_MAX);
     if (!response->request) {
         perror("Error: Failed to allocate response buffer");
         free(response);
@@ -255,7 +254,7 @@ static struct Packet* query_upstream_udp(struct Packet* pkt) {
         return NULL;
     }
 
-    response->request = malloc(MAXLINE);
+    response->request = malloc(DNS_MSG_MAX);
     if (!response->request) {
         perror("Error: Failed to allocate response buffer");
         free(response);
@@ -269,8 +268,30 @@ static struct Packet* query_upstream_udp(struct Packet* pkt) {
     // until we get a valid response or the timeout fires.
     uint16_t recv_id;
 
+    /* One overall deadline: stray packets must not re-arm the full timeout. */
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += SOCKET_TIMEOUT;
+
     for (;;) {
-        response->recv_len = recv(sock, response->request, MAXLINE, 0);
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long rem_us = (deadline.tv_sec - now.tv_sec) * 1000000L +
+                      (deadline.tv_nsec - now.tv_nsec) / 1000L;
+        if (rem_us <= 0) {
+            fprintf(stderr, "Error: Upstream DNS query timed out\n");
+            close(sock);
+            free_packet(response);
+            return NULL;
+        }
+        struct timeval tv = { .tv_sec = rem_us / 1000000L, .tv_usec = rem_us % 1000000L };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        /* Read into the full buffer, not MAXLINE: a datagram larger than the
+         * read size is silently cut short by the kernel, and the mangled
+         * remains still pass the TX-ID and question checks below and get
+         * forwarded to the client as a valid answer. */
+        response->recv_len = recv(sock, response->request, DNS_MSG_MAX, 0);
 
         if (response->recv_len < 0) {
             if (errno_is_timeout(errno)) {

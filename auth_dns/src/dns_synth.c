@@ -47,9 +47,9 @@ ssize_t dns_synth_response(const unsigned char* query, ssize_t qlen,
 
     /* Header flags (RFC 1035 §4.1.1):
      *   byte 2: QR=1, opcode + RD preserved, AA=0, TC=0  -> 0x80 | (q[2] & 0x79)
-     *   byte 3: RA=1, Z/AD/CD=0, RCODE=rcode             -> 0x80 | (rcode & 0x0F) */
+     *   byte 3: RA=1, CD echoed, Z/AD=0, RCODE=rcode */
     out[2] = (unsigned char)(0x80 | (query[2] & 0x79));
-    out[3] = (unsigned char)(0x80 | (rcode & 0x0F));
+    out[3] = (unsigned char)(0x80 | (query[3] & 0x10) | (rcode & 0x0F)); /* +CD echo */
 
     /* QDCOUNT=1, ANCOUNT=nanswers, NSCOUNT=0, ARCOUNT=0 (drop any query OPT). */
     out[4] = 0x00; out[5] = 0x01;

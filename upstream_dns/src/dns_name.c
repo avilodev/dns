@@ -146,10 +146,3 @@ bool dname_is_subdomain(const char *name, const char *zone)
     if (nlen == zlen) return true;
     return is_separator(name, nlen - zlen - 1);
 }
-
-int dname_label_count(const char *name)
-{
-    int n = 0;
-    for (const char *p = name; p && !is_root(p); p = dname_parent(p)) n++;
-    return n;
-}

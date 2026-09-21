@@ -1,4 +1,5 @@
 #include "dnssec.h"
+#include "utils.h"   /* path_pin / path_fopen */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -178,7 +179,10 @@ static void flush_key(const char *path, const char *config_dir,
         path = resolved;
     }
 
-    FILE *fp = fopen(path, "r");
+    /* Pin on the first (still-privileged) load so SIGHUP reloads after the
+     * privilege drop can reopen the key through the directory fd. */
+    path_pin(path);
+    FILE *fp = path_fopen(path);
     if (!fp) {
         fprintf(stderr, "DNSSEC: cannot open key file %s: ", path);
         perror("");
@@ -236,7 +240,8 @@ ZoneKey *load_zone_keys(const char *config_dir)
     char conf_path[512];
     snprintf(conf_path, sizeof(conf_path), "%s/dnssec.conf", config_dir);
 
-    FILE *fp = fopen(conf_path, "r");
+    path_pin(conf_path);
+    FILE *fp = path_fopen(conf_path);
     if (!fp) {
         fprintf(stderr, "DNSSEC: no dnssec.conf in %s"
                 " — online signing disabled\n", config_dir);

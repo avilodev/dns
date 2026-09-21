@@ -22,7 +22,7 @@ HARDEN_CFLAGS  = -fno-strict-aliasing -fstack-protector-strong \
                  -fPIE -Wformat -Wformat-security
 HARDEN_LDFLAGS = -pie
 
-CFLAGS = -Wall -Wextra -O2 -g -Isrc -MMD -MP $(HARDEN_CFLAGS) \
+CFLAGS = -Wall -Wextra -O2 -g -Iinclude -MMD -MP $(HARDEN_CFLAGS) \
          -DSERVER_PATH='"$(SERVER_PATH)"' \
          -DLOG_FILE_PATH='"$(LOG_FILE_PATH)"' \
          -DPID_FILE_PATH='"$(PID_FILE_PATH)"'
@@ -34,12 +34,11 @@ OBJ_DIR = obj
 BIN_DIR = bin
 
 # Source files (just the names)
-SOURCES = main.c config.c thread_pool.c utils.c      \
-          request.c resolve.c cache.c                \
-		  dns_wire.c dns_packet.c response_handler.c \
-		  cname_handler.c ns_resolver.c udp_client.c \
-		  ns_resolution_context.c dnssec.c dnssec_chain.c dnssec_wire.c dnssec_proof.c \
-		  access_control.c query_log.c udp_helpers.c workers.c dns_name.c
+SOURCES = main.c config.c thread_pool.c utils.c workers.c client_reply.c \
+          query_log.c access_control.c infra.c \
+          request.c dns_name.c dns_wire.c dns_packet.c \
+          resolve.c ns_resolver.c udp_client.c response_handler.c cname_handler.c cache.c \
+          dnssec.c dnssec_chain.c dnssec_wire.c dnssec_proof.c
 
 # Full paths
 SRC_FILES = $(addprefix $(SRC_DIR)/, $(SOURCES))
@@ -89,7 +88,7 @@ asan: clean all
 FUZZ_DIR  = fuzz
 FUZZ_SRCS = $(SRC_DIR)/request.c $(SRC_DIR)/utils.c $(SRC_DIR)/dns_packet.c $(SRC_DIR)/dns_wire.c $(SRC_DIR)/dns_name.c
 fuzz: | directories
-	clang -g -O1 -Isrc -fno-strict-aliasing -fsanitize=fuzzer,address,undefined \
+	clang -g -O1 -Iinclude -fno-strict-aliasing -fsanitize=fuzzer,address,undefined \
 	    $(FUZZ_DIR)/fuzz_request.c $(FUZZ_SRCS) -o $(OBJ_DIR)/fuzz_request
 	@echo "Fuzzer built: $(OBJ_DIR)/fuzz_request"
 

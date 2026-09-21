@@ -43,7 +43,7 @@ static struct Packet *alloc_response(void)
 {
     struct Packet *r = calloc(1, sizeof(struct Packet));
     if (!r) { perror("auth: calloc packet"); return NULL; }
-    r->request = calloc(1, MAXLINE);
+    r->request = calloc(1, DNS_MSG_MAX);
     if (!r->request) { perror("auth: calloc buf"); free(r); return NULL; }
     return r;
 }
@@ -66,7 +66,8 @@ static uint16_t aa_flags(const struct Packet *req)
     return (uint16_t)((1u << 15) |           /* QR = response    */
                       (1u << 10) |           /* AA = authoritative */
                       ((unsigned)req->rd << 8) | /* copy RD       */
-                      (1u << 7));             /* RA = available   */
+                      (1u << 7) |             /* RA = available   */
+                      ((unsigned)req->cd << 4));  /* copy CD (RFC 4035 §3.2.2) */
 }
 
 /* Write the echoed question (QNAME + QTYPE + QCLASS), preserving the client's
@@ -212,15 +213,26 @@ int append_rrsig(char *buf, int *pos,
     free(signed_data);
     if (rc != 0 || !sig) return 0;
 
-    size_t rrsig_rdlen = (size_t)hdr_pos + sig_len;
-    int need = 2 + 2 + 2 + 4 + 2 + (int)rrsig_rdlen;
-    if (*pos + need > MAXLINE) { free(sig); return 0; }
-
-    /* Owner name: use compression ptr for answer section, or full labels for authority. */
+    /* Owner name: a compression pointer for the answer section, full labels
+     * for the authority section.  Encode it BEFORE the space check so `need`
+     * covers its real length — assuming the 2-byte pointer here let a 255-byte
+     * explicit owner push the fixed fields and signature past the end of the
+     * DNS_MSG_MAX buffer. */
+    uint8_t owner_wire[256];
+    int owner_len = 2;                              /* DNS_NAME_PTR */
     if (explicit_rr_owner) {
-        write_dns_labels(explicit_rr_owner, buf, pos, MAXLINE);
+        owner_len = dname_to_wire(explicit_rr_owner, owner_wire, sizeof(owner_wire));
+        if (owner_len < 0) { free(sig); return 0; }
+    }
+
+    size_t rrsig_rdlen = (size_t)hdr_pos + sig_len;
+    int need = owner_len + 2 + 2 + 4 + 2 + (int)rrsig_rdlen;
+    if (*pos + need > DNS_MSG_MAX) { free(sig); return 0; }
+
+    if (explicit_rr_owner) {
+        memcpy(buf + *pos, owner_wire, (size_t)owner_len);   *pos += owner_len;
     } else {
-        wr16(buf + *pos, DNS_NAME_PTR);             *pos += 2;
+        wr16(buf + *pos, DNS_NAME_PTR);                      *pos += 2;
     }
     wr16(buf + *pos, QTYPE_RRSIG);                *pos += 2;
     wr16(buf + *pos, 1 /* IN */);                 *pos += 2;
@@ -275,7 +287,7 @@ int emit_signed_rrset(struct Packet *r, int *pos, const char *owner,
 
     int written = 0;
     for (int i = 0; i < n; i++) {
-        if (*pos + 2 + 2 + 2 + 4 + 2 + (int)blobs[i].len > MAXLINE) break;
+        if (*pos + 2 + 2 + 2 + 4 + 2 + (int)blobs[i].len > DNS_MSG_MAX) break;
         wr16(r->request + *pos, DNS_NAME_PTR);   *pos += 2;
         wr16(r->request + *pos, type);           *pos += 2;
         wr16(r->request + *pos, 1 /* IN */);     *pos += 2;
@@ -287,15 +299,22 @@ int emit_signed_rrset(struct Packet *r, int *pos, const char *owner,
     wr16(r->request + 6, (uint16_t)written);
 
     if (do_bit && written > 0 && key) {
-        unsigned char canon[16384];
+        /* Sized to the RRset (owner <= 256 wire bytes + 10 fixed per RR), so
+         * a large RRset is never signed over a silently truncated image. */
+        size_t cap = 0;
+        for (int i = 0; i < written; i++) cap += 256 + 10 + blobs[i].len;
+        unsigned char *canon = malloc(cap);
         size_t canon_pos = 0;
-        for (int i = 0; i < written; i++)
-            canon_rr_append(canon, &canon_pos, sizeof(canon),
-                            owner, type, ttl, blobs[i].data, blobs[i].len);
-        if (canon_pos > 0 &&
-            append_rrsig(r->request, pos, owner, type, ttl,
-                         canon, canon_pos, key, false, NULL))
-            wr16(r->request + 6, (uint16_t)(written + 1));
+        if (canon) {
+            for (int i = 0; i < written; i++)
+                canon_rr_append(canon, &canon_pos, cap,
+                                owner, type, ttl, blobs[i].data, blobs[i].len);
+            if (canon_pos > 0 &&
+                append_rrsig(r->request, pos, owner, type, ttl,
+                             canon, canon_pos, key, false, NULL))
+                wr16(r->request + 6, (uint16_t)(written + 1));
+            free(canon);
+        }
     }
     return written;
 }
@@ -368,24 +387,20 @@ static int build_nsec_type_bitmap(const char *owner,
     unsigned char bm[32] = {0};
     int max_type = -1;
 
-    for (int i = 0; i < auth_domain_count; i++) {
-        const struct AuthDomain *d = &auth_domains[i];
-        if (strcmp(d->domain, owner) != 0) continue;
+    /* Every type the store can hold, tested through the one predicate the
+     * response builders use — an inline copy of the A-record test here had
+     * drifted (it omitted has_https) and could advertise a type we do not
+     * actually serve. */
+    static const uint16_t kTypes[] = {
+        QTYPE_A, QTYPE_NS, QTYPE_SOA, QTYPE_MX, QTYPE_TXT,
+        QTYPE_AAAA, QTYPE_SRV, QTYPE_HTTPS, QTYPE_CNAME,
+    };
 
-        if (d->has_soa)    nsec_set_type(bm, &max_type, QTYPE_SOA);
-        if (d->has_ns)     nsec_set_type(bm, &max_type, QTYPE_NS);
-        if (d->has_mx)     nsec_set_type(bm, &max_type, QTYPE_MX);
-        if (d->has_txt)    nsec_set_type(bm, &max_type, QTYPE_TXT);
-        if (d->has_cname)  nsec_set_type(bm, &max_type, QTYPE_CNAME);
-        if (d->has_srv)    nsec_set_type(bm, &max_type, QTYPE_SRV);
-        if (d->has_https)  nsec_set_type(bm, &max_type, QTYPE_HTTPS);
-        if (d->has_ipv6)   nsec_set_type(bm, &max_type, QTYPE_AAAA);
-        /* A record: ip set, no typed flags */
-        if (!d->has_mx && !d->has_ipv6 && !d->has_cname && !d->has_ns &&
-            !d->has_txt && !d->has_srv && !d->has_soa &&
-            d->ip[0] != '\0' && strcmp(d->ip, "0.0.0.0") != 0)
-            nsec_set_type(bm, &max_type, QTYPE_A);
-    }
+    int st, cnt = auth_records_for(owner, &st);
+    for (int i = st; i < st + cnt; i++)
+        for (size_t t = 0; t < sizeof(kTypes) / sizeof(kTypes[0]); t++)
+            if (rec_has_type(&auth_domains[i], kTypes[t]))
+                nsec_set_type(bm, &max_type, kTypes[t]);
 
     if (max_type < 0) return 0;  /* nothing found at this name */
 
@@ -404,74 +419,67 @@ static int build_nsec_type_bitmap(const char *owner,
 }
 
 /*
+ * Smallest in-zone name strictly after `after`, wrapping to the zone's first
+ * name when `after` is its last (the NSEC chain is circular, RFC 4034 §4.1.1).
+ */
+static const char *nsec_successor(const char *zone, const char *after)
+{
+    const char *best = NULL, *first = NULL;
+    for (int i = 0; i < auth_domain_count; i++) {
+        const char *n = auth_domains[i].domain;
+        if (!is_in_zone(n, zone)) continue;
+        if (!first || dns_canon_cmp(n, first) < 0) first = n;
+        if (dns_canon_cmp(n, after) > 0 && (!best || dns_canon_cmp(n, best) < 0)) best = n;
+    }
+    return best ? best : first;
+}
+
+/*
  * nsec_find_covering — find the NSEC owner and next-name for a denial response.
  *
- * is_nxdomain = true:  qname doesn't exist; find predecessor → next existing name.
- * is_nxdomain = false: qname exists but no data of queried type (NODATA);
- *                      owner = qname, next = next name in canonical order.
+ * is_nxdomain = true:  qname doesn't exist; owner = its predecessor in
+ *                      canonical order (wrapping when qname sorts first).
+ * is_nxdomain = false: qname exists but has no data of the queried type
+ *                      (NODATA); owner = qname itself.
+ * next = the name following the owner, wrapping at the end of the zone.
  *
  * zone: SOA domain (e.g. "avilo.com")
- * Returns 1 on success, 0 if NSEC data not available.
+ * Returns 1 on success, 0 if NSEC data is not available.
+ *
+ * The pair we need is just "the name before" and "the one after", so two
+ * linear scans suffice.  Collecting and sorting the zone into a fixed
+ * char[256][256] instead cost 64 KB of stack per denial, was O(n^2) twice
+ * over, and — worse — silently emitted a WRONG chain for any zone with more
+ * than 256 names, because the array simply stopped filling.
  */
 static int nsec_find_covering(const char *zone, const char *qname,
                                bool is_nxdomain,
                                char owner_out[256], char next_out[256])
 {
-    /* Collect unique names in this zone. */
-    char names[256][256];
-    int  name_count = 0;
+    const char *pred = NULL, *last = NULL;
+    bool have_qname = false;
 
-    for (int i = 0; i < auth_domain_count && name_count < 256; i++) {
+    for (int i = 0; i < auth_domain_count; i++) {
         const char *n = auth_domains[i].domain;
         if (!is_in_zone(n, zone)) continue;
-
-        bool dup = false;
-        for (int j = 0; j < name_count && !dup; j++)
-            if (strcmp(names[j], n) == 0) dup = true;
-        if (!dup) {
-            memcpy(names[name_count], n, 256);
-            name_count++;
-        }
+        if (!last || dns_canon_cmp(n, last) > 0) last = n;
+        if (dns_canon_cmp(n, qname) < 0 && (!pred || dns_canon_cmp(n, pred) > 0)) pred = n;
+        if (!have_qname && strcmp(n, qname) == 0) have_qname = true;
     }
+    if (!last) return 0;                        /* no names in this zone */
 
-    if (name_count == 0) return 0;
-
-    /* Insertion-sort by canonical order (zones are tiny). */
-    for (int i = 1; i < name_count; i++) {
-        char tmp[256];
-        memcpy(tmp, names[i], 256);
-        int j = i - 1;
-        while (j >= 0 && dns_canon_cmp(names[j], tmp) > 0) {
-            memcpy(names[j + 1], names[j], 256);
-            j--;
-        }
-        memcpy(names[j + 1], tmp, 256);
-    }
-
+    const char *owner;
     if (is_nxdomain) {
-        /*
-         * Find the last name < qname (predecessor).
-         * If qname < all names, predecessor wraps to the last name in the zone.
-         */
-        int pred_idx = name_count - 1;  /* default: wrap-around */
-        for (int i = 0; i < name_count; i++) {
-            if (dns_canon_cmp(names[i], qname) >= 0) break;
-            pred_idx = i;
-        }
-        int next_idx = (pred_idx + 1) % name_count;
-        memcpy(owner_out, names[pred_idx], 256);
-        memcpy(next_out,  names[next_idx],  256);
+        owner = pred ? pred : last;             /* qname sorts first: wrap */
     } else {
-        /* NODATA: owner is qname itself. */
-        int owner_idx = -1;
-        for (int i = 0; i < name_count; i++) {
-            if (strcmp(names[i], qname) == 0) { owner_idx = i; break; }
-        }
-        if (owner_idx < 0) return 0;
-        int next_idx = (owner_idx + 1) % name_count;
-        memcpy(owner_out, names[owner_idx], 256);
-        memcpy(next_out,  names[next_idx],  256);
+        if (!have_qname) return 0;              /* NODATA needs the name itself */
+        owner = qname;
     }
+
+    const char *next = nsec_successor(zone, owner);
+    if (!next) return 0;
+    snprintf(owner_out, 256, "%s", owner);
+    snprintf(next_out,  256, "%s", next);
     return 1;
 }
 
@@ -496,10 +504,10 @@ static void append_nsec_authority(char *buf, int *pos,
 
     uint32_t ttl = DEFAULT_RECORD_TTL;
     int need = 300 + rdata_len;
-    if (*pos + need > MAXLINE) return;
+    if (*pos + need > DNS_MSG_MAX) return;
 
     /* Write NSEC RR: owner (full wire labels) + type + class + ttl + rdlen + rdata */
-    write_dns_labels(owner_name, buf, pos, MAXLINE);
+    write_dns_labels(owner_name, buf, pos, DNS_MSG_MAX);
     wr16(buf + *pos, QTYPE_NSEC);            *pos += 2;
     wr16(buf + *pos, 1 /* IN */);             *pos += 2;
     wr32(buf + *pos, ttl);                   *pos += 4;
@@ -531,127 +539,21 @@ static void append_nsec_authority(char *buf, int *pos,
  * check_internal — main dispatch, called once per query
  * ========================================================================= */
 
-struct Packet *check_internal(struct Packet *req)
+/*
+ * Answer `req` from the records owned by `owner` (the query name itself, or
+ * the "*.<closest encloser>" wildcard whose records are synthesized for it —
+ * every builder writes the answer owner as a pointer to the question name).
+ * Caller holds the rdlock.
+ */
+static struct Packet *answer_from_owner(struct Packet *req, const char *owner,
+                                        const struct AuthDomain *soa)
 {
-    if (!req || !req->full_domain) return NULL;
-
-    const char *owner = req->full_domain;
-
-    pthread_rwlock_rdlock(&g_auth_domains_lock);
-
-    /* Determine if we are authoritative for this owner.
-     * We are if: (a) any record in auth_domains has this exact name, OR
-     *            (b) a SOA entry covers this name as a zone suffix.      */
-    bool has_entry = false;
-    for (int i = 0; i < auth_domain_count && !has_entry; i++) {
-        if (strcmp(auth_domains[i].domain, owner) == 0)
-            has_entry = true;
-    }
-    const struct AuthDomain *soa = find_zone_soa(owner);
-
-    /* No exact record for this name.  It is one of: a wildcard match, an empty
-     * non-terminal (NODATA), a genuinely non-existent name inside a zone we own
-     * (NXDOMAIN, RFC 1034/2308), or a name we are not authoritative for at all
-     * (forward upstream). */
-    if (!has_entry) {
-        /* An empty non-terminal exists, so it is NODATA and never
-         * wildcard-synthesized (RFC 4592 §2.2.2). */
-        bool ent = is_empty_non_terminal(owner);
-        const struct AuthDomain *wc = ent ? NULL : find_wildcard(owner);
-        if (!wc) {
-            if (soa) {
-                /* Inside a zone we own but with no exact record: NODATA only
-                 * for an empty non-terminal, otherwise NXDOMAIN. */
-                struct Packet *r = ent ? build_nodata_response(req, soa)
-                                       : build_nxdomain_response(req, soa);
-                if (r && req->do_bit && soa) {
-                    int pos = (int)r->recv_len;
-                    char nsec_owner[256], nsec_next[256];
-                    if (nsec_find_covering(soa->domain, owner, !ent,
-                                           nsec_owner, nsec_next)) {
-                        unsigned char type_bm[64];
-                        int bm_len = build_nsec_type_bitmap(nsec_owner,
-                                                            type_bm, sizeof(type_bm));
-                        if (bm_len > 0)
-                            append_nsec_authority(r->request, &pos, nsec_owner,
-                                                  nsec_next, type_bm, bm_len, req);
-                        r->recv_len = pos;
-                    }
-                }
-                pthread_rwlock_unlock(&g_auth_domains_lock);
-                return r;
-            }
-            pthread_rwlock_unlock(&g_auth_domains_lock);
-            return NULL;   /* not authoritative — forward to upstream */
-        }
-
-        /* Wildcard match: synthesize a response for the actual owner name. */
-        struct Packet *r = NULL;
-        uint32_t wttl = wc->ttl ? wc->ttl : DEFAULT_RECORD_TTL;
-
-        if (req->q_type == QTYPE_A &&
-            wc->ip[0] != '\0' && strcmp(wc->ip, "0.0.0.0") != 0) {
-            struct in_addr ia;
-            if (inet_pton(AF_INET, wc->ip, &ia) == 1) {
-                int wpos;
-                r = begin_response(req, &wpos, 1);
-                if (r) {
-                    wr16(r->request + wpos, DNS_NAME_PTR);  wpos += 2;
-                    wr16(r->request + wpos, QTYPE_A); wpos += 2;
-                    wr16(r->request + wpos, 1);       wpos += 2;
-                    wr32(r->request + wpos, wttl);    wpos += 4;
-                    wr16(r->request + wpos, 4);       wpos += 2;
-                    memcpy(r->request + wpos, &ia.s_addr, 4);         wpos += 4;
-                    r->recv_len = wpos;
-                }
-            }
-        } else if (req->q_type == QTYPE_AAAA && wc->has_ipv6) {
-            struct in6_addr ia6;
-            if (inet_pton(AF_INET6, wc->ipv6, &ia6) == 1) {
-                int wpos;
-                r = begin_response(req, &wpos, 1);
-                if (r) {
-                    wr16(r->request + wpos, DNS_NAME_PTR);     wpos += 2;
-                    wr16(r->request + wpos, QTYPE_AAAA); wpos += 2;
-                    wr16(r->request + wpos, 1);          wpos += 2;
-                    wr32(r->request + wpos, wttl);       wpos += 4;
-                    wr16(r->request + wpos, 16);         wpos += 2;
-                    memcpy(r->request + wpos, &ia6, 16);                 wpos += 16;
-                    r->recv_len = wpos;
-                }
-            }
-        } else {
-            /* Wildcard-covered but no record of this type → NODATA */
-            r = build_nodata_response(req, soa);
-            if (r && req->do_bit && soa) {
-                int pos = (int)r->recv_len;
-                char nsec_owner[256], nsec_next[256];
-                if (nsec_find_covering(soa->domain, owner, false,
-                                       nsec_owner, nsec_next)) {
-                    unsigned char type_bm[64];
-                    int bm_len = build_nsec_type_bitmap(nsec_owner,
-                                                        type_bm, sizeof(type_bm));
-                    if (bm_len > 0)
-                        append_nsec_authority(r->request, &pos, nsec_owner,
-                                              nsec_next, type_bm, bm_len, req);
-                    r->recv_len = pos;
-                }
-            }
-        }
-
-        pthread_rwlock_unlock(&g_auth_domains_lock);
-        return r;
-    }
-
     /* RFC 1034 §3.6.2: if the owner is a CNAME alias, return the CNAME RR
      * for any query type except QTYPE_CNAME (direct lookup) and QTYPE_ANY
      * (answered with HINFO per RFC 8482 regardless of record type). */
     if (req->q_type != QTYPE_CNAME && req->q_type != QTYPE_ANY) {
         struct Packet *cr = build_cname_response(req, owner);
-        if (cr) {
-            pthread_rwlock_unlock(&g_auth_domains_lock);
-            return cr;
-        }
+        if (cr) return cr;
     }
 
     /* Dispatch by query type. */
@@ -727,6 +629,86 @@ struct Packet *check_internal(struct Packet *req)
         r = build_nodata_response(req, soa);
         break;
     }
+    return r;
+}
+
+struct Packet *check_internal(struct Packet *req)
+{
+    if (!req || !req->full_domain) return NULL;
+
+    const char *owner = req->full_domain;
+
+    pthread_rwlock_rdlock(&g_auth_domains_lock);
+
+    /* Determine if we are authoritative for this owner.
+     * We are if: (a) any record in auth_domains has this exact name, OR
+     *            (b) a SOA entry covers this name as a zone suffix.      */
+    int rec_start;
+    bool has_entry = auth_records_for(owner, &rec_start) > 0;
+    const struct AuthDomain *soa = find_zone_soa(owner);
+
+    /* At or below a zone cut (NS below the apex) the data belongs to the child
+     * zone: answer with a referral, not with our own NXDOMAIN/NODATA or the
+     * NS RRset as authoritative data (RFC 1034 §4.3.2 step 3b).  DS at the cut
+     * itself is parent-side data, so it falls through. */
+    if (soa) {
+        const char *cut = find_zone_cut(owner, soa->domain);
+        if (cut && !(req->q_type == QTYPE_DS && strcmp(cut, owner) == 0)) {
+            struct Packet *ref = build_referral_response(req, cut);
+            pthread_rwlock_unlock(&g_auth_domains_lock);
+            return ref;
+        }
+    }
+
+    /* No exact record for this name.  It is one of: a wildcard match, an empty
+     * non-terminal (NODATA), a genuinely non-existent name inside a zone we own
+     * (NXDOMAIN, RFC 1034/2308), or a name we are not authoritative for at all
+     * (forward upstream). */
+    if (!has_entry) {
+        /* An empty non-terminal exists, so it is NODATA and never
+         * wildcard-synthesized (RFC 4592 §2.2.2). */
+        bool ent = is_empty_non_terminal(owner);
+        const struct AuthDomain *wc = ent ? NULL : find_wildcard(owner);
+        if (!wc) {
+            if (soa) {
+                /* Inside a zone we own but with no exact record: NODATA only
+                 * for an empty non-terminal, otherwise NXDOMAIN. */
+                struct Packet *r = ent ? build_nodata_response(req, soa)
+                                       : build_nxdomain_response(req, soa);
+                if (r && req->do_bit && soa) {
+                    int pos = (int)r->recv_len;
+                    char nsec_owner[256], nsec_next[256];
+                    if (nsec_find_covering(soa->domain, owner, !ent,
+                                           nsec_owner, nsec_next)) {
+                        unsigned char type_bm[64];
+                        int bm_len = build_nsec_type_bitmap(nsec_owner,
+                                                            type_bm, sizeof(type_bm));
+                        if (bm_len > 0)
+                            append_nsec_authority(r->request, &pos, nsec_owner,
+                                                  nsec_next, type_bm, bm_len, req);
+                        r->recv_len = pos;
+                    }
+                }
+                pthread_rwlock_unlock(&g_auth_domains_lock);
+                return r;
+            }
+            pthread_rwlock_unlock(&g_auth_domains_lock);
+            return NULL;   /* not authoritative — forward to upstream */
+        }
+
+        /* Wildcard match (RFC 4592): synthesize the answer from the records
+         * at the wildcard owner, for any type.  Signing of synthesized
+         * answers is not implemented, so they are served unsigned (DO off). */
+        uint8_t saved_do = req->do_bit;
+        req->do_bit = 0;
+        struct Packet *r = answer_from_owner(req, wc->domain, soa);
+        req->do_bit = saved_do;
+
+        pthread_rwlock_unlock(&g_auth_domains_lock);
+        return r;
+    }
+
+    struct Packet *r = answer_from_owner(req, owner, soa);
 
     /* For NODATA responses when DO=1: append NSEC proof of non-existence
      * (RFC 4034 §3.1.3).  Detect NODATA by RCODE=NOERROR + ANCOUNT=0. */

@@ -6,7 +6,8 @@
 #   A / AAAA / NS / MX <prio> <host> / CNAME / TXT "..." ["..."] / SRV <p> <w> <port> <tgt>
 #   HTTPS <prio> <target>
 #   SOA <mname> <rname> <serial> <refresh> <retry> <expire> <minimum>
-# Wildcards: use [*.zone] (A/AAAA only).  Names may use RFC 1035 escapes (\. \DDD).
+# Optional leading TTL on any record line, e.g. "300 A 192.168.1.2" (default 3600).
+# Wildcards: use [*.zone] (any record type).  Names may use RFC 1035 escapes (\. \DDD).
 
 # The whole .priv TLD is served here: any .priv name not listed below gets a
 # local NXDOMAIN instead of being sent to the internet (.priv is not a real TLD).

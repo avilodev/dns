@@ -29,12 +29,22 @@ static inline bool errno_is_timeout(int e)
 #endif
 }
 
+#ifndef PORT
 #define PORT 53
+#endif
 
-#define MAXLINE 4096
+#define MAXLINE 4096   /* receive buffer for incoming queries */
+
+/* Capacity of every response buffer: the protocol's own limit (16-bit TCP
+ * length prefix).  Answers are bounded by this, not by a record count; UDP
+ * replies are then truncated to the client's size (TC=1) and retried on TCP. */
+#define DNS_MSG_MAX 65535
 #define HEADER_LEN 12
 #define SOCKET_TIMEOUT 5
-#define MAX_INTERNAL_HOSTS 500   // entries (each record type = one entry)
+
+/* EDNS UDP payload size we advertise and the largest UDP answer we send:
+ * 1232 avoids IP fragmentation on virtually every path (DNS Flag Day 2020). */
+#define EDNS_UDP_PAYLOAD 1232
 
 // Default TTL for authoritative records (seconds)
 #define DEFAULT_RECORD_TTL 3600

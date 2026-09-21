@@ -127,6 +127,32 @@ int create_tcp_socket_v6(int port) {
 
 /* --- Error replies ------------------------------------------------------- */
 
+/* Does the raw request carry an OPT RR?  Returns 1 with *do_bit set, else 0. */
+static int request_opt(const unsigned char* req, ssize_t req_len, bool* do_bit)
+{
+    if (req_len < HEADER_LEN) return 0;
+    int total = ((req[6] << 8) | req[7]) + ((req[8] << 8) | req[9]) +
+                ((req[10] << 8) | req[11]);
+    int qd = (req[4] << 8) | req[5];
+    ssize_t p = HEADER_LEN;
+    for (int i = 0; i < qd + total; i++) {
+        while (p < req_len) {                          /* skip owner / QNAME */
+            uint8_t l = req[p];
+            if (l == 0)             { p += 1; break; }
+            if ((l & 0xC0) == 0xC0) { p += 2; break; }
+            p += 1 + l;
+        }
+        if (i < qd) { p += 4; continue; }
+        if (p + 10 > req_len) return 0;
+        if (req[p] == 0 && req[p + 1] == 41) {
+            *do_bit = (req[p + 6] & 0x80) != 0;
+            return 1;
+        }
+        p += 10 + ((req[p + 8] << 8) | req[p + 9]);
+    }
+    return 0;
+}
+
 /*
  * Build an error reply (header + echoed question) for a raw query.
  *
@@ -136,15 +162,16 @@ int create_tcp_socket_v6(int port) {
  * full timeout.  Opcode and RD are echoed, RA is set.  Returns the reply length
  * (12 when no question could be echoed), or 0 on bad input.
  */
-int build_error_reply(const unsigned char* req, ssize_t req_len, int rcode,
-                      unsigned char* out, int out_cap)
+static int build_error_reply_ex(const unsigned char* req, ssize_t req_len, int rcode,
+                                unsigned char* out, int out_cap, bool add_opt)
 {
     if (!req || req_len < 2 || !out || out_cap < HEADER_LEN) return 0;
     memset(out, 0, HEADER_LEN);
     out[0] = req[0];
     out[1] = req[1];
     out[2] = (unsigned char)(0x80 | (req_len > 2 ? (req[2] & 0x79) : 0)); /* QR, opcode, RD */
-    out[3] = (unsigned char)(0x80 | (rcode & 0x0F));                      /* RA, RCODE    */
+    out[3] = (unsigned char)(0x80 | (req_len > 3 ? (req[3] & 0x10) : 0) |
+                             (rcode & 0x0F));                /* RA, CD, RCODE */
 
     if (req_len < HEADER_LEN + 5 || req[4] != 0 || req[5] != 1) return HEADER_LEN;
     int q = HEADER_LEN;
@@ -159,21 +186,44 @@ int build_error_reply(const unsigned char* req, ssize_t req_len, int rcode,
     if (HEADER_LEN + qlen > out_cap) return HEADER_LEN;
     memcpy(out + HEADER_LEN, req + HEADER_LEN, (size_t)qlen);
     out[5] = 1;                                   /* QDCOUNT = 1 */
-    return HEADER_LEN + qlen;
+    int n = HEADER_LEN + qlen;
+
+    /* EDNS client: the reply carries an OPT too (RFC 6891 §7).  Not for
+     * FORMERR, where the client's OPT itself may be what was malformed. */
+    bool do_bit = false;
+    if (add_opt && n + 11 <= out_cap && request_opt(req, req_len, &do_bit)) {
+        unsigned char* o = out + n;
+        o[0] = 0;                                  /* root owner */
+        o[1] = 0; o[2] = 41;                       /* TYPE = OPT */
+        o[3] = 1232 >> 8; o[4] = 1232 & 0xFF;      /* our UDP payload size */
+        o[5] = 0; o[6] = 0;                        /* ext-RCODE, version */
+        o[7] = do_bit ? 0x80 : 0; o[8] = 0;        /* flags (DO mirrored) */
+        o[9] = 0; o[10] = 0;                       /* RDLEN */
+        out[11] = 1;                               /* ARCOUNT = 1 */
+        n += 11;
+    }
+    return n;
+}
+
+int build_error_reply(const unsigned char* req, ssize_t req_len, int rcode,
+                      unsigned char* out, int out_cap)
+{
+    return build_error_reply_ex(req, req_len, rcode, out, out_cap,
+                                rcode != RCODE_FORMAT_ERROR);
 }
 
 void send_error_udp(int sock, const struct sockaddr* addr, socklen_t addr_len,
                     const char* buf, ssize_t buf_len, int rcode)
 {
     if (!addr || !buf) return;
-    unsigned char resp[HEADER_LEN + 260] = {0};
+    unsigned char resp[HEADER_LEN + 260 + 11] = {0};
     int n = build_error_reply((const unsigned char*)buf, buf_len, rcode, resp, sizeof(resp));
     if (n > 0) sendto(sock, resp, (size_t)n, 0, addr, addr_len);
 }
 
 void send_error_tcp(int fd, const char* buf, ssize_t buf_len, int rcode)
 {
-    unsigned char resp[HEADER_LEN + 260] = {0};
+    unsigned char resp[HEADER_LEN + 260 + 11] = {0};
     int n = build_error_reply((const unsigned char*)buf, buf_len, rcode, resp, sizeof(resp));
     if (n > 0) tcp_write_msg(fd, resp, (uint16_t)n);
 }
@@ -202,7 +252,7 @@ void send_refused_tcp(int fd, const char* buf, ssize_t buf_len) {
 /* Best-effort length-prefixed write of a small fixed DNS message over TCP.
  * Return values are checked so the build stays clean under _FORTIFY_SOURCE. */
 void tcp_write_msg(int fd, const unsigned char* msg, uint16_t len) {
-    unsigned char out[2 + HEADER_LEN + 260];
+    unsigned char out[2 + HEADER_LEN + 260 + 11];
     if (len > sizeof(out) - 2) return;
     out[0] = (unsigned char)(len >> 8);
     out[1] = (unsigned char)(len & 0xFF);

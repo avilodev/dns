@@ -118,44 +118,96 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
     pkt->q_type = rd16(buffer + pos);
     pkt->q_class = rd16(buffer + pos + 2);
 
-    // Validate QCLASS — only IN (1) and ANY/QCLASS_ANY (255) are valid (RFC 1035)
+    // Only IN (1) and QCLASS ANY (255) are served.  Any other class (e.g. CH
+    // "version.bind") is a well-formed query we don't implement: NOTIMP, not
+    // FORMERR (RFC 1035 §4.1.1).
     if (pkt->q_class != 1 && pkt->q_class != 255) {
-        fprintf(stderr, "Warning: Unsupported QCLASS %u — returning FORMERR\n", pkt->q_class);
-        pkt->rcode = RCODE_FORMAT_ERROR;
+        pkt->rcode = RCODE_NOTIMP;
         return pkt;
     }
 
-    /* Scan additional section for EDNS0 OPT record to detect DO bit.
-     * arcount additional RRs immediately follow the question section
-     * (ancount and nscount are always 0 in a standard query).
-     * OPT owner = root (0x00), type = 41; DO = bit 15 of OPT TTL flags. */
+    /* Walk every RR after the question looking for the EDNS0 OPT record
+     * (DO bit, UDP size, version).  RFC 6891 §6.1.1: at most one OPT, with a
+     * root owner, in the additional section — anything else is FORMERR. */
     pos += 4; /* advance past QTYPE + QCLASS */
-    for (int rri = 0; rri < (int)pkt->arcount && pos < recv_len; rri++) {
-        /* Skip owner name */
-        if ((uint8_t)buffer[pos] == 0) {
-            pos++;                             /* root label */
-        } else {
-            while (pos < recv_len) {
+    int qend = pos;
+    {
+        int total    = (int)pkt->ancount + (int)pkt->nscount + (int)pkt->arcount;
+        int ar_start = (int)pkt->ancount + (int)pkt->nscount;
+        int opt_count = 0;
+        bool opt_bad = false;
+        for (int rri = 0; rri < total && pos < recv_len; rri++) {
+            bool root_owner = ((uint8_t)buffer[pos] == 0);
+            while (pos < recv_len) {                 /* skip owner name */
                 uint8_t llen = (uint8_t)buffer[pos];
                 if (llen == 0)              { pos++; break; }
                 if ((llen & 0xC0) == 0xC0) { pos += 2; break; }
                 pos += 1 + llen;
             }
+            if (pos + 10 > recv_len) break;
+            uint16_t rr_type  = rd16(buffer + pos);     pos += 2;
+            uint16_t rr_class = rd16(buffer + pos);     pos += 2;
+            uint32_t rr_ttl   = rd32(buffer + pos);     pos += 4;
+            uint16_t rr_rdlen = rd16(buffer + pos);     pos += 2;
+            if (rr_type == 41 /* OPT */) {
+                if (++opt_count > 1 || !root_owner || rri < ar_start)
+                    opt_bad = true;
+                pkt->edns_present  = 1;
+                pkt->edns_udp_size = rr_class ? rr_class : 512; /* CLASS = UDP payload size */
+                pkt->edns_version  = (uint8_t)((rr_ttl >> 16) & 0xFF);
+                pkt->do_bit        = (rr_ttl >> 15) & 1;
+            }
+            if (pos + rr_rdlen > recv_len) break;
+            pos += rr_rdlen;
         }
-        if (pos + 10 > recv_len) break;
-        uint16_t rr_type  = rd16(buffer + pos);     pos += 2;
-        uint16_t rr_class = rd16(buffer + pos);     pos += 2;
-        uint32_t rr_ttl   = rd32(buffer + pos);     pos += 4;
-        uint16_t rr_rdlen = rd16(buffer + pos);     pos += 2;
-        if (rr_type == 41 /* OPT */) {
-            pkt->edns_present  = 1;
-            pkt->edns_udp_size = rr_class ? rr_class : 512; /* CLASS = UDP payload size */
-            pkt->edns_version  = (uint8_t)((rr_ttl >> 16) & 0xFF);
-            pkt->do_bit        = (rr_ttl >> 15) & 1;
-            break;
+        /* QTYPE OPT is not a valid question either. */
+        if (opt_bad || pkt->q_type == 41) {
+            pkt->rcode = RCODE_FORMAT_ERROR;
+            return pkt;
         }
-        if (pos + rr_rdlen > recv_len) break;
-        pos += rr_rdlen;
+        /* Zone transfers are not offered (RFC 5936 §4.2: REFUSED); the other
+         * meta types (TKEY/TSIG 249/250, MAILB/MAILA 253/254) are NOTIMP.
+         * Without this, AXFR of one of our zones got NOERROR/NODATA with AA=1
+         * — i.e. "the zone is empty". */
+        if (pkt->q_type == 251 || pkt->q_type == 252) {
+            pkt->rcode = RCODE_REFUSED;
+            return pkt;
+        }
+        if (pkt->q_type >= 249 && pkt->q_type <= 254) {
+            pkt->rcode = RCODE_NOTIMP;
+            return pkt;
+        }
+    }
+
+    /* Keep only header + question (+ a fresh OPT for EDNS clients).  This
+     * buffer is what gets forwarded upstream, so anything else the client
+     * sent — extra records, EDNS options, trailing bytes — is dropped here
+     * rather than relayed. */
+    {
+        int keep = qend + (pkt->edns_present ? 11 : 0);
+        char* clean = malloc((size_t)keep);
+        if (!clean) {
+            perror("Error: Failed to allocate clean request buffer");
+            free_packet(pkt);
+            return NULL;
+        }
+        memcpy(clean, buffer, (size_t)qend);
+        wr16(clean + 6, 0);                              /* ANCOUNT */
+        wr16(clean + 8, 0);                              /* NSCOUNT */
+        wr16(clean + 10, pkt->edns_present ? 1 : 0);     /* ARCOUNT */
+        if (pkt->edns_present) {
+            char* o = clean + qend;
+            o[0] = 0;                                    /* root owner */
+            wr16(o + 1, 41);                             /* OPT */
+            wr16(o + 3, EDNS_UDP_PAYLOAD);               /* UDP payload */
+            wr32(o + 5, pkt->do_bit ? 0x00008000u : 0u); /* ver 0, DO */
+            wr16(o + 9, 0);                              /* RDLEN */
+        }
+        free(pkt->request);
+        pkt->request  = clean;
+        pkt->recv_len = keep;
+        pkt->ancount = pkt->nscount = 0;
+        pkt->arcount = pkt->edns_present ? 1 : 0;
     }
 
     return pkt;

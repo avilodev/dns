@@ -1,547 +1,281 @@
 #include "config.h"
-#include "dns_wire.h"
+#include "dns_name.h"
+#include "dnssec_wire.h"
+#include "infra.h"
 #include "utils.h"
-#include <pthread.h>
+
+#include <ctype.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <strings.h>
 #include <openssl/evp.h>
 
-extern Config g_config;
+/* ---- Command line ------------------------------------------------------ */
 
-static void init_default_config(void) {
-    g_config.port = PORT;
-    g_config.thread_count = NUM_THREADS;
-    g_config.queue_size = QUEUE_SIZE;
-    g_config.bind_addr = NULL;
-    g_config.acl_csv = NULL;
-    g_config.rate_limit_qps = 0;
-    g_config.drop_user = NULL;
+/* Replace a string option, freeing any previous value (the flag may repeat). */
+static bool set_str(char** dst, const char* val)
+{
+    char* copy = strdup(val);
+    if (!copy) { fprintf(stderr, "Out of memory parsing options\n"); return false; }
+    free(*dst);
+    *dst = copy;
+    return true;
 }
 
-/*
- * Parse command-line arguments and populate the server configuration.
- *
- * Initializes defaults then applies -p (port), -t (thread count),
- * -q (queue size), -b (bind address), -a (allow-list CIDRs), and
- * -r (per-source rate limit) flags. Returns -1 on unrecognized flags.
- */
-int load_config(int argc, char** argv) {
-    // Initialize defaults
-    init_default_config();
+/* Parse a bounded integer flag.  Returns false (with a message) if invalid. */
+static bool parse_int(const char* arg, long lo, long hi, const char* what, int* out)
+{
+    char* end;
+    long v = strtol(arg, &end, 10);
+    if (*end != '\0' || v < lo || v > hi) {
+        fprintf(stderr, "Invalid %s: %s\n", what, arg);
+        return false;
+    }
+    *out = (int)v;
+    return true;
+}
 
-    // Parse command line arguments
+int load_config(int argc, char** argv)
+{
+    g_config = (Config){ .port = PORT, .thread_count = NUM_THREADS, .queue_size = QUEUE_SIZE };
+
     int opt;
     while ((opt = getopt(argc, argv, "p:t:q:b:a:r:U:")) != -1) {
-        char *end;
-        long v;
+        bool ok = true;
         switch (opt) {
-            case 'p':
-                v = strtol(optarg, &end, 10);
-                if (*end != '\0' || v < 1 || v > 65535) {
-                    fprintf(stderr, "Invalid port: %s\n", optarg);
-                    return -1;
-                }
-                g_config.port = (int)v;
-                break;
-            case 't':
-                v = strtol(optarg, &end, 10);
-                if (*end != '\0' || v < 1 || v > 1024) {
-                    fprintf(stderr, "Invalid thread count: %s\n", optarg);
-                    return -1;
-                }
-                g_config.thread_count = (int)v;
-                break;
-            case 'q':
-                v = strtol(optarg, &end, 10);
-                if (*end != '\0' || v < 1 || v > 1048576) {
-                    fprintf(stderr, "Invalid queue size: %s\n", optarg);
-                    return -1;
-                }
-                g_config.queue_size = (int)v;
-                break;
-            case 'b':
-                g_config.bind_addr = strdup(optarg);
-                break;
-            case 'a':
-                g_config.acl_csv = strdup(optarg);
-                break;
-            case 'r':
-                v = strtol(optarg, &end, 10);
-                if (*end != '\0' || v < 0 || v > 1000000) {
-                    fprintf(stderr, "Invalid rate limit: %s\n", optarg);
-                    return -1;
-                }
-                g_config.rate_limit_qps = (int)v;
-                break;
-            case 'U':
-                g_config.drop_user = strdup(optarg);
-                break;
-            default:
-                printf("Usage: ./bin/upstream_dns <-p port> <-t thread_count> "
-                       "<-q queue_size> <-b bind_addr> <-a allow_cidrs> "
-                       "<-r per_source_qps> <-U user[:group]>\n");
-                return -1;
+        case 'p': ok = parse_int(optarg, 1, 65535, "port", &g_config.port); break;
+        case 't': ok = parse_int(optarg, 1, 1024, "thread count", &g_config.thread_count); break;
+        case 'q': ok = parse_int(optarg, 1, 1048576, "queue size", &g_config.queue_size); break;
+        case 'r': ok = parse_int(optarg, 0, 1000000, "rate limit", &g_config.rate_limit_qps); break;
+        case 'b': ok = set_str(&g_config.bind_addr, optarg); break;
+        case 'a': ok = set_str(&g_config.acl_csv,   optarg); break;
+        case 'U': ok = set_str(&g_config.drop_user, optarg); break;
+        default:  ok = false;
         }
+        if (!ok) return -1;
     }
-
     printf("Config: port=%d threads=%d queue=%d\n",
            g_config.port, g_config.thread_count, g_config.queue_size);
     return 0;
 }
 
-/*
- * Resolve the configured -b bind address for a given address family.
- *
- *   AF_INET : writes the network address into *out4
- *   AF_INET6: writes the network address into *out6
- *
- * Returns  1 if a bind address was applied for this family,
- *          0 if no -b was given (caller should use the wildcard address),
- *         -1 if -b was given but is not of this family (skip this socket).
- */
-static int resolve_bind_addr(int family, struct in_addr *out4,
-                             struct in6_addr *out6) {
-    if (!g_config.bind_addr) {
-        if (family == AF_INET)  out4->s_addr = INADDR_ANY;
-        if (family == AF_INET6) *out6 = in6addr_any;
-        return 0;
-    }
-    if (family == AF_INET)
-        return (inet_pton(AF_INET, g_config.bind_addr, out4) == 1) ? 1 : -1;
-    return (inet_pton(AF_INET6, g_config.bind_addr, out6) == 1) ? 1 : -1;
-}
+/* ---- Listeners --------------------------------------------------------- */
 
-/*
- * Sets up and opens a new socket on a specified port
- *
- * Creates a socket, and specifies the option to rebind to the port if still open.
- *  This socket binds and listens on a specified port for IPv4 connections only.
- *
- * @param port Port for which OS will bind and listen for connections on
- *
- * @return File Descriptor for the new socket opened
- *
- * @warning Caller must close() the returned socket when done
- */
-int create_server_socket(int port) {
-    // DNS socket definition
-    int dns_sock;
-    struct sockaddr_in dns_addr;
+int create_listener(int family, int type, int port, bool fatal)
+{
+    const char* what = type == SOCK_DGRAM ? (family == AF_INET ? "UDP IPv4" : "UDP IPv6")
+                                          : (family == AF_INET ? "TCP IPv4" : "TCP IPv6");
+    struct sockaddr_storage ss;
+    socklen_t slen = sockaddr_from_ip(g_config.bind_addr ? g_config.bind_addr
+                                      : family == AF_INET ? "0.0.0.0" : "::", (uint16_t)port, &ss);
+    if (slen == 0 || ss.ss_family != family) return -1;   /* -b is the other family */
 
-    // Create UDP socket for DNS
-    dns_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (dns_sock < 0) {
-        perror("Error: Unable to create socket");
-        exit(EXIT_FAILURE);
-    }
+    int one = 1;
+    int sock = socket(family, type, 0);
+    if (sock < 0) goto fail;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (type == SOCK_DGRAM)
+        setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+    if (family == AF_INET6)
+        setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+    if (bind(sock, (struct sockaddr*)&ss, slen) < 0) goto fail;
+    if (type == SOCK_STREAM && listen(sock, SOMAXCONN) < 0) goto fail;
 
-    // Set socket options for address reuse
-    int opt = 1;
-    if (setsockopt(dns_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("Error: SO_REUSEADDR failed");
-        close(dns_sock);
-        exit(EXIT_FAILURE);
-    }
-    if (setsockopt(dns_sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0)
-        perror("Warning: SO_REUSEPORT unavailable");
-
-    // Configure server address
-    memset(&dns_addr, 0, sizeof(dns_addr));
-    dns_addr.sin_family = AF_INET;
-    dns_addr.sin_port = htons(port);
-    // Honor -b bind address; -1 means a non-IPv4 address was given (IPv6-only),
-    // so skip the IPv4 UDP socket entirely rather than binding the wildcard.
-    if (resolve_bind_addr(AF_INET, &dns_addr.sin_addr, NULL) < 0) {
-        close(dns_sock);
-        return -1;
-    }
-
-    // Bind socket to port
-    if (bind(dns_sock, (struct sockaddr*)&dns_addr, sizeof(dns_addr)) < 0) {
-        perror("Error: Bind failed");
-        printf("Note: Port %d requires root privileges. Try 'sudo' or use port >= 1024\n", port);
-        close(dns_sock);
-        exit(EXIT_FAILURE);
-    }
-
-    {
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &dns_addr.sin_addr, ip, sizeof(ip));
-        printf("DNS Server listening on %s:%d (UDP IPv4)\n", ip, port);
-    }
-    return dns_sock;
-}
-
-/*
- * Create an IPv6 UDP socket bound to port with IPV6_V6ONLY.
- * Returns -1 (without exiting) if the kernel has no IPv6 support.
- */
-int create_server_socket_v6(int port) {
-    int sock = socket(AF_INET6, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        perror("Warning: socket() IPv6 UDP; IPv6 not available");
-        return -1;
-    }
-    int opt = 1;
-    setsockopt(sock, SOL_SOCKET,   SO_REUSEADDR, &opt, sizeof(opt));
-    setsockopt(sock, SOL_SOCKET,   SO_REUSEPORT, &opt, sizeof(opt));
-    setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY,  &opt, sizeof(opt));
-    struct sockaddr_in6 addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin6_family = AF_INET6;
-    addr.sin6_port   = htons(port);
-    if (resolve_bind_addr(AF_INET6, NULL, &addr.sin6_addr) < 0) {
-        close(sock);   /* -b is an IPv4 address: no IPv6 socket */
-        return -1;
-    }
-    if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("Warning: bind() IPv6 UDP");
-        close(sock);
-        return -1;
-    }
-    {
-        char ip[INET6_ADDRSTRLEN];
-        inet_ntop(AF_INET6, &addr.sin6_addr, ip, sizeof(ip));
-        printf("DNS Server listening on [%s]:%d (UDP IPv6)\n", ip, port);
-    }
+    char ip[INET6_ADDRSTRLEN];
+    sockaddr_to_ip(&ss, ip, NULL);
+    printf(family == AF_INET ? "DNS Server listening on %s:%d (%s)\n"
+                             : "DNS Server listening on [%s]:%d (%s)\n", ip, port, what);
     return sock;
+
+fail:
+    fprintf(stderr, "%s: %s listener on port %d: %s\n", fatal ? "Error" : "Warning",
+            what, port, strerror(errno));
+    if (sock >= 0) close(sock);
+    if (fatal) exit(EXIT_FAILURE);
+    return -1;
 }
 
-/*
- * Create an IPv4 TCP listener bound to port.
- * Returns -1 on failure (without exiting).
- */
-int create_tcp_socket_v4(int port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("Warning: socket() IPv4 TCP");
-        return -1;
-    }
-    int opt = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = htons(port);
-    if (resolve_bind_addr(AF_INET, &addr.sin_addr, NULL) < 0) {
-        close(sock); return -1;   /* -b is IPv6: no IPv4 TCP socket */
-    }
-    if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("Warning: bind() IPv4 TCP"); close(sock); return -1;
-    }
-    if (listen(sock, SOMAXCONN) < 0) {
-        perror("Warning: listen() IPv4 TCP"); close(sock); return -1;
-    }
-    {
-        char ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
-        printf("DNS Server listening on %s:%d (TCP IPv4)\n", ip, port);
-    }
-    return sock;
-}
+/* ---- Root hints -------------------------------------------------------- */
 
-/*
- * Create an IPv6 TCP listener bound to port with IPV6_V6ONLY.
- * Returns -1 if IPv6 is unavailable (without exiting).
- */
-int create_tcp_socket_v6(int port) {
-    int sock = socket(AF_INET6, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("Warning: socket() IPv6 TCP; IPv6 not available");
-        return -1;
-    }
-    int opt = 1;
-    setsockopt(sock, SOL_SOCKET,   SO_REUSEADDR, &opt, sizeof(opt));
-    setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY,  &opt, sizeof(opt));
-    struct sockaddr_in6 addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin6_family = AF_INET6;
-    addr.sin6_port   = htons(port);
-    if (resolve_bind_addr(AF_INET6, NULL, &addr.sin6_addr) < 0) {
-        close(sock); return -1;   /* -b is IPv4: no IPv6 TCP socket */
-    }
-    if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("Warning: bind() IPv6 TCP"); close(sock); return -1;
-    }
-    if (listen(sock, SOMAXCONN) < 0) {
-        perror("Warning: listen() IPv6 TCP"); close(sock); return -1;
-    }
-    {
-        char ip[INET6_ADDRSTRLEN];
-        inet_ntop(AF_INET6, &addr.sin6_addr, ip, sizeof(ip));
-        printf("DNS Server listening on [%s]:%d (TCP IPv6)\n", ip, port);
-    }
-    return sock;
-}
+typedef struct {
+    char name[256];
+    char ip[INET6_ADDRSTRLEN];   /* IPv4 glue; "" if none */
+} RootHint;
 
-extern Hints* g_hints[13];
-
-/* g_hints is read by every worker and replaced on SIGHUP; all access goes
- * through this lock (writers swap a fully built table, never mutate in place). */
+/* Read by every worker, replaced on SIGHUP: copy in/out under the lock. */
+static RootHint         g_hints[ROOT_SERVERS];
 static pthread_rwlock_t g_hints_lock = PTHREAD_RWLOCK_INITIALIZER;
 
-/* Free a single root-hint Record (ip + type + struct). */
-static void free_hint_record(Record* r)
+static void install_hints(const RootHint* table)
 {
-    if (!r) return;
-    free(r->ip);
-    free(r->type);
-    free(r);
-}
-
-static void free_hint_table(Hints* t[13])
-{
-    for (int i = 0; i < 13; i++) {
-        if (!t[i]) continue;
-        free(t[i]->name);
-        free_hint_record(t[i]->ipv4_record);
-        free_hint_record(t[i]->ipv6_record);
-        free(t[i]);
-        t[i] = NULL;
-    }
-}
-
-static Record* new_hint_record(const char* ip, const char* type, int ttl)
-{
-    Record* rec = malloc(sizeof(Record));
-    if (!rec) return NULL;
-    rec->ip   = strdup(ip);
-    rec->type = strdup(type);
-    rec->ttl  = ttl;
-    if (!rec->ip || !rec->type) { free_hint_record(rec); return NULL; }
-    return rec;
-}
-
-/* Install a freshly built table.  The previous table is freed only after the
- * write lock guarantees no reader still holds a pointer into it. */
-static void install_hint_table(Hints* t[13])
-{
-    Hints* old[13];
     pthread_rwlock_wrlock(&g_hints_lock);
-    for (int i = 0; i < 13; i++) { old[i] = g_hints[i]; g_hints[i] = t[i]; }
+    memcpy(g_hints, table, sizeof(g_hints));
     pthread_rwlock_unlock(&g_hints_lock);
-    free_hint_table(old);
 }
 
-/*
- * Load root hints from `filename`.  Parses into a private table and swaps it
- * in only when at least one usable (IPv4) root server was read — a missing or
- * unreadable file (e.g. a SIGHUP reload after the privilege drop) leaves the
- * current hints in service instead of emptying them.  Returns the number of
- * root servers loaded, or -1 (current hints untouched).
- */
+/* Parse `dig . NS` style output.  Addresses are matched to NS names by owner
+ * afterwards (dig lists all NS before any glue).  Only a table with at least
+ * one IPv4 address replaces the current one. */
 int load_hints(const char* filename)
 {
     int fd = path_open(filename, O_RDONLY, 0);
-    FILE* fp = (fd >= 0) ? fdopen(fd, "r") : NULL;
+    FILE* fp = fd >= 0 ? fdopen(fd, "r") : NULL;
     if (!fp) {
         if (fd >= 0) close(fd);
         perror("Failed to open hints file");
         return -1;
     }
 
-    Hints* t[13] = {0};
+    RootHint t[ROOT_SERVERS] = {0};
+    int ns_count = 0;
+    struct { char owner[256]; char ip[INET6_ADDRSTRLEN]; } v4[64];
+    int nv4 = 0;
+
     char line[512];
-    int hint_index = -1;
-    bool oom = false;
+    while (fgets(line, sizeof(line), fp)) {
+        char tok[5][256];
+        int ntok = sscanf(line, "%255s %255s %255s %255s %255s",
+                          tok[0], tok[1], tok[2], tok[3], tok[4]);
+        if (ntok < 3 || tok[0][0] == ';') continue;
 
-    while (!oom && fgets(line, sizeof(line), fp)) {
-        if (line[0] == ';' || line[0] == '\n' || line[0] == '\r') continue;
+        /* owner [ttl] [IN] type value */
+        int k = 1;
+        if (isdigit((unsigned char)tok[k][0])) k++;
+        if (k < ntok && strcasecmp(tok[k], "IN") == 0) k++;
+        if (k + 1 >= ntok) continue;
+        const char* rtype = tok[k];
+        const char* value = tok[k + 1];
 
-        // Trim leading whitespace (cast to unsigned char: isspace() is UB for
-        // negative values other than EOF, which a signed char can produce).
-        char* start = line;
-        while (*start && isspace((unsigned char)*start)) start++;
-        if (*start == '\0') continue;
-
-        char domain[256], record_type[16], value[256];
-        int ttl;
-        if (sscanf(start, "%255s %d %15s %255s", domain, &ttl, record_type, value) < 4)
-            continue;
-
-        if (strcmp(domain, ".") == 0 && strcmp(record_type, "NS") == 0) {
-            if (++hint_index >= 13) break;
-            t[hint_index] = calloc(1, sizeof(Hints));
-            if (!t[hint_index] || !(t[hint_index]->name = strdup(value))) { oom = true; break; }
-        } else if (hint_index >= 0 &&
-                   (strcmp(record_type, "A") == 0 || strcmp(record_type, "AAAA") == 0)) {
-            Record* rec = new_hint_record(value, record_type, ttl);
-            if (!rec) { oom = true; break; }
-            Record** slot = (record_type[1] == '\0') ? &t[hint_index]->ipv4_record
-                                                     : &t[hint_index]->ipv6_record;
-            free_hint_record(*slot);   /* no leak on dup */
-            *slot = rec;
+        if (strcmp(tok[0], ".") == 0 && strcasecmp(rtype, "NS") == 0) {
+            if (ns_count < ROOT_SERVERS)
+                snprintf(t[ns_count++].name, sizeof(t[0].name), "%s", value);
+        } else if (strcasecmp(rtype, "A") == 0 && nv4 < (int)(sizeof(v4) / sizeof(v4[0]))) {
+            snprintf(v4[nv4].owner, sizeof(v4[0].owner), "%s", tok[0]);
+            snprintf(v4[nv4].ip, sizeof(v4[0].ip), "%s", value);
+            nv4++;
         }
     }
     fclose(fp);
 
     int usable = 0;
-    for (int i = 0; i < 13; i++)
-        if (t[i] && t[i]->ipv4_record) usable++;
-    if (oom || usable == 0) {
-        free_hint_table(t);
+    for (int i = 0; i < ns_count; i++) {
+        for (int j = 0; j < nv4 && !t[i].ip[0]; j++)      /* first match wins */
+            if (dname_is_subdomain(v4[j].owner, t[i].name) &&
+                dname_is_subdomain(t[i].name, v4[j].owner))
+                snprintf(t[i].ip, sizeof(t[i].ip), "%s", v4[j].ip);
+        if (t[i].ip[0]) usable++;
+    }
+    if (usable == 0) {
         fprintf(stderr, "Hints file %s yielded no usable root servers; keeping current hints\n",
                 filename);
         return -1;
     }
-    install_hint_table(t);
-    return hint_index >= 13 ? 13 : hint_index + 1;
+    install_hints(t);
+    return ns_count;
 }
 
-// Helper function to free the hints data
-void free_hints(void)
+/* Fallback when the hints file is missing: IANA root addresses (2024). */
+int load_hints_builtin(void)
 {
-    Hints* none[13] = {0};
-    install_hint_table(none);
+    static const char* ips[ROOT_SERVERS] = {
+        "198.41.0.4",   "170.247.170.2", "192.33.4.12",   "199.7.91.13",
+        "192.203.230.10", "192.5.5.241", "192.112.36.4",  "198.97.190.53",
+        "192.36.148.17", "192.58.128.30", "193.0.14.129", "199.7.83.42",
+        "202.12.27.33",
+    };
+    RootHint t[ROOT_SERVERS];
+    for (int i = 0; i < ROOT_SERVERS; i++) {
+        snprintf(t[i].name, sizeof(t[i].name), "%c.root-servers.net.", 'a' + i);
+        snprintf(t[i].ip, sizeof(t[i].ip), "%s", ips[i]);
+    }
+    install_hints(t);
+    return ROOT_SERVERS;
 }
 
-/* strdup() the IPv4 address of a random root server, skipping empty slots.
- * Returns NULL only when no root hints are loaded at all. */
+/* Lowest infra_score() wins; the score's jitter spreads load across near-equal
+ * roots, and the random start breaks remaining ties. */
 char* hints_random_root_ip(void)
 {
-    char* ip = NULL;
-    int start = get_random_server();
+    char best[INET6_ADDRSTRLEN] = "";
+    int best_score = 0;
+    int start = random_index(ROOT_SERVERS);
     pthread_rwlock_rdlock(&g_hints_lock);
-    for (int k = 0; k < 13 && !ip; k++) {
-        const Hints* h = g_hints[(start + k) % 13];
-        if (h && h->ipv4_record && h->ipv4_record->ip)
-            ip = strdup(h->ipv4_record->ip);
+    for (int k = 0; k < ROOT_SERVERS; k++) {
+        const RootHint* h = &g_hints[(start + k) % ROOT_SERVERS];
+        if (!h->ip[0]) continue;
+        int sc = infra_score(h->ip);
+        if (!best[0] || sc < best_score) {
+            memcpy(best, h->ip, sizeof(best));
+            best_score = sc;
+        }
     }
     pthread_rwlock_unlock(&g_hints_lock);
-    return ip;
+    return best[0] ? strdup(best) : NULL;
 }
 
-/* Copy the root server names into names[] (up to 13); returns how many. */
-int hints_copy_names(char names[13][256])
+int hints_copy_names(char names[ROOT_SERVERS][256])
 {
     int n = 0;
     pthread_rwlock_rdlock(&g_hints_lock);
-    for (int i = 0; i < 13; i++)
-        if (g_hints[i] && g_hints[i]->name)
-            snprintf(names[n++], 256, "%s", g_hints[i]->name);
+    for (int i = 0; i < ROOT_SERVERS; i++)
+        if (g_hints[i].name[0])
+            memcpy(names[n++], g_hints[i].name, 256);
     pthread_rwlock_unlock(&g_hints_lock);
     return n;
 }
 
-/* -------------------------------------------------------------------------
- * Built-in root hints fallback — used when the hints file is missing.
- * IPs are the official IANA root server addresses (as of 2024).
- * ------------------------------------------------------------------------- */
-int load_hints_builtin(void)
-{
-    static const struct { const char* name; const char* ip; } roots[13] = {
-        { "a.root-servers.net.", "198.41.0.4"    },
-        { "b.root-servers.net.", "170.247.170.2"  },
-        { "c.root-servers.net.", "192.33.4.12"    },
-        { "d.root-servers.net.", "199.7.91.13"    },
-        { "e.root-servers.net.", "192.203.230.10" },
-        { "f.root-servers.net.", "192.5.5.241"    },
-        { "g.root-servers.net.", "192.112.36.4"   },
-        { "h.root-servers.net.", "198.97.190.53"  },
-        { "i.root-servers.net.", "192.36.148.17"  },
-        { "j.root-servers.net.", "192.58.128.30"  },
-        { "k.root-servers.net.", "193.0.14.129"   },
-        { "l.root-servers.net.", "199.7.83.42"    },
-        { "m.root-servers.net.", "202.12.27.33"   },
-    };
-
-    Hints* t[13] = {0};
-    for (int i = 0; i < 13; i++) {
-        t[i] = calloc(1, sizeof(Hints));
-        if (!t[i] || !(t[i]->name = strdup(roots[i].name)) ||
-            !(t[i]->ipv4_record = new_hint_record(roots[i].ip, "A", 518400))) {
-            free_hint_table(t);
-            return -1;
-        }
-    }
-    install_hint_table(t);
-    return 13;
-}
-
-/* -------------------------------------------------------------------------
- * Trust anchor loading
- * File format (one per line, comment lines begin with ';' or '#'):
- *   owner TTL IN DNSKEY flags protocol algorithm pubkey_base64
- * Example:
- *   . 172800 IN DNSKEY 257 3 8 AwEAAaz/...
- * ------------------------------------------------------------------------- */
+/* ---- Trust anchors ----------------------------------------------------- */
 
 TrustAnchor* load_trust_anchors(const char* filename)
 {
-    FILE* fp = fopen(filename, "r");
+    /* Through the pin, like the hints file: a plain open() cannot traverse a
+     * non-searchable ancestor once privileges have been dropped. */
+    int fd = path_open(filename, O_RDONLY, 0);
+    FILE* fp = fd >= 0 ? fdopen(fd, "r") : NULL;
     if (!fp) {
+        if (fd >= 0) close(fd);
         perror("Warning: Cannot open trust anchor file");
         return NULL;
     }
 
     TrustAnchor* head = NULL;
-    TrustAnchor* tail = NULL;
+    TrustAnchor** tail = &head;
     char line[4096];
-
     while (fgets(line, sizeof(line), fp)) {
-        /* Skip comment and blank lines */
-        char* p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == ';' || *p == '#' || *p == '\n' || *p == '\r' || *p == '\0')
+        char owner[256], class_str[8], rtype[16], b64[4096];
+        int ttl;
+        unsigned flags, protocol, algorithm;
+        if (line[strspn(line, " \t")] == '#' ||
+            sscanf(line, "%255s %d %7s %15s %u %u %u %4095s", owner, &ttl, class_str,
+                   rtype, &flags, &protocol, &algorithm, b64) < 8 ||
+            owner[0] == ';' || strcasecmp(rtype, "DNSKEY") != 0)
             continue;
 
-        /* Parse: owner TTL IN DNSKEY flags protocol algorithm pubkey_base64 */
-        char owner[256], class_str[8], rtype[16], b64key[4096];
-        int ttl;
-        uint16_t flags;
-        uint8_t protocol, algorithm;
-        unsigned int flags_u, protocol_u, algorithm_u;
-
-        int n = sscanf(p, "%255s %d %7s %15s %u %u %u %4095s",
-                       owner, &ttl, class_str, rtype,
-                       &flags_u, &protocol_u, &algorithm_u, b64key);
-        if (n < 8) continue;
-        if (strcasecmp(rtype, "DNSKEY") != 0) continue;
-
-        flags     = (uint16_t)flags_u;
-        protocol  = (uint8_t)protocol_u;
-        algorithm = (uint8_t)algorithm_u;
-
-        /* Base64-decode the public key using OpenSSL */
-        size_t b64_len = strlen(b64key);
-        /* EVP_DecodeBlock output is at most ceil(b64_len * 3/4) bytes */
-        int max_out = (int)((b64_len * 3) / 4 + 4);
-        uint8_t* pubkey = malloc((size_t)max_out);
-        if (!pubkey) continue;
-
-        int decoded_len = EVP_DecodeBlock(pubkey, (const unsigned char*)b64key,
-                                          (int)b64_len);
-        if (decoded_len <= 0) {
-            free(pubkey);
+        size_t b64_len = strlen(b64);
+        uint8_t* key = malloc(b64_len * 3 / 4 + 4);
+        int n = key ? EVP_DecodeBlock(key, (const unsigned char*)b64, (int)b64_len) : -1;
+        if (n <= 0) {
+            free(key);
             fprintf(stderr, "Warning: Failed to base64-decode trust anchor key for %s\n", owner);
             continue;
         }
-        /* EVP_DecodeBlock may pad output; trim trailing padding bytes */
-        uint16_t pubkey_len = (uint16_t)decoded_len;
-        /* Count '=' padding to subtract */
-        for (int i = (int)b64_len - 1; i >= 0 && b64key[i] == '='; i--)
-            pubkey_len--;
+        /* EVP_DecodeBlock counts '=' padding as output bytes. */
+        for (size_t i = b64_len; i > 0 && b64[i - 1] == '='; i--) n--;
 
-        /* Allocate and populate TrustAnchor */
-        TrustAnchor* ta = calloc(1, sizeof(TrustAnchor));
-        if (!ta) { free(pubkey); continue; }
-
+        TrustAnchor* ta = calloc(1, sizeof(*ta));
+        if (!ta) { free(key); continue; }
         snprintf(ta->owner, sizeof(ta->owner), "%s", owner);
-        ta->flags      = flags;
-        ta->protocol   = protocol;
-        ta->algorithm  = algorithm;
-        ta->pubkey     = pubkey;
-        ta->pubkey_len = pubkey_len;
-        ta->key_tag    = compute_key_tag(flags, protocol, algorithm,
-                                         pubkey, pubkey_len);
-        ta->next = NULL;
-
-        if (!head) head = tail = ta;
-        else { tail->next = ta; tail = ta; }
-
+        ta->flags      = (uint16_t)flags;
+        ta->protocol   = (uint8_t)protocol;
+        ta->algorithm  = (uint8_t)algorithm;
+        ta->pubkey     = key;
+        ta->pubkey_len = (uint16_t)n;
+        ta->key_tag    = compute_key_tag(ta->flags, ta->protocol, ta->algorithm, key, ta->pubkey_len);
+        *tail = ta;
+        tail = &ta->next;
         printf("Loaded trust anchor: %s DNSKEY flags=%u alg=%u key_tag=%u\n",
-               owner, flags, algorithm, ta->key_tag);
+               owner, ta->flags, ta->algorithm, ta->key_tag);
     }
-
     fclose(fp);
     return head;
 }

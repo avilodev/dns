@@ -18,4 +18,8 @@ struct Packet *build_soa_response(struct Packet *req, const char *owner);
 struct Packet *build_dnskey_response(struct Packet *req, const char *owner);
 struct Packet *build_hinfo_response(struct Packet *req);
 
+/* Referral to the child zone at `cut` (RFC 1034 §4.3.2 step 3b): AA=0, the
+ * cut's NS RRset in the authority section, in-data glue in additional. */
+struct Packet *build_referral_response(struct Packet *req, const char *cut);
+
 #endif /* AUTH_RECORDS_H */

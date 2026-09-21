@@ -10,8 +10,9 @@
  *
  *   - CIDR allow-list: refuse recursion/forwarding for sources outside the
  *     trusted network, closing the open-resolver amplification vector.
- *   - Per-source-IP token-bucket rate limiting: bound the query rate any one
- *     client can drive, regardless of allow-list membership.
+ *   - Per-source token-bucket rate limiting (IPv4 address / IPv6 /64): bound
+ *     the query rate any one client can drive, regardless of allow-list
+ *     membership, plus a cap on concurrent TCP connections per source.
  *
  * The allow-list is configured once at startup (before worker threads start)
  * and is read-only thereafter, so allow-list lookups are lock-free.  The rate
@@ -52,5 +53,15 @@ void rl_configure(int qps, int burst);
  * responding would still amplify).  Always true when rate limiting is disabled.
  */
 bool rl_allow(const struct sockaddr_storage *src);
+
+/*
+ * Per-source cap on concurrent TCP connections (each one holds a worker until
+ * it closes or idles out).  acquire() returns false when src already has
+ * TCP_MAX_CONNS_PER_SOURCE open — the caller closes the new connection;
+ * every successful acquire() must be paired with a release() on close.
+ */
+#define TCP_MAX_CONNS_PER_SOURCE 8
+bool tcp_conn_acquire(const struct sockaddr_storage *src);
+void tcp_conn_release(const struct sockaddr_storage *src);
 
 #endif /* ACCESS_CONTROL_H */

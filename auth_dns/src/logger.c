@@ -2,11 +2,18 @@
 #include "utils.h"   /* path_open */
 #include <pthread.h>
 #include <pwd.h>
+#include <sys/stat.h>
 
 extern Config g_config;
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int log_fd = -1;
+static off_t log_bytes = 0;   /* bytes since the last truncate (log_mutex) */
+
+/* Safety net for deployments where cron_scripts/dns_log was never installed:
+ * past this size the log is truncated in place (no rotation files).  The cron
+ * job, when present, archives a copy first and hits this far less often. */
+#define LOG_MAX_BYTES (20 * 1024 * 1024)
 
 /* Open the query log (O_APPEND).  If we still hold root and a privilege drop is
  * configured (-U), hand the file to that user now so reopens AFTER the drop
@@ -25,6 +32,8 @@ static int open_log_fd(void) {
             /* best-effort: the fd we just opened still works regardless */
         }
     }
+    struct stat st;
+    log_bytes = (fstat(fd, &st) == 0) ? st.st_size : 0;
     return fd;
 }
 
@@ -40,6 +49,7 @@ const char* qtype_name(uint16_t qtype) {
         case 16:  return "TXT";
         case 28:  return "AAAA";
         case 33:  return "SRV";
+        case 65:  return "HTTPS";
         case 43:  return "DS";
         case 46:  return "RRSIG";
         case 47:  return "NSEC";
@@ -144,8 +154,21 @@ int log_entry(const char* client_ip, uint16_t port, uint16_t qtype,
             len = (int)sizeof(log_line) - 1;
             log_line[len - 1] = '\n';   /* keep one entry per line when truncated */
         }
-        if (write(log_fd, log_line, len) < 0)
+        if (write(log_fd, log_line, len) < 0) {
             perror("Warning: Log write failed");
+        } else {
+            /* O_APPEND: after a truncate, writes resume at offset 0. */
+            log_bytes += len;
+            if (log_bytes >= LOG_MAX_BYTES) {
+                /* Re-stat before discarding anything: the daily cron job may
+                 * have archived and truncated the file behind us, which would
+                 * leave this counter stale-high. */
+                struct stat st;
+                if (fstat(log_fd, &st) == 0) log_bytes = st.st_size;
+                if (log_bytes >= LOG_MAX_BYTES && ftruncate(log_fd, 0) == 0)
+                    log_bytes = 0;
+            }
+        }
     }
 
     pthread_mutex_unlock(&log_mutex);

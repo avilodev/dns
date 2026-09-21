@@ -1,12 +1,8 @@
 #ifndef DNSSEC_TYPES_H
 #define DNSSEC_TYPES_H
 
-/*
- * Wire-format DNSSEC record structs (RFC 4034, RFC 5155).
- * Pointer fields (pubkey, signature, digest, etc.) are malloc'd by the
- * corresponding parse_*_rdata() function; caller must free with the matching
- * free_*_rdata() helper.
- */
+/* Parsed DNSSEC RDATA (RFC 4034).  Pointer fields are malloc'd by
+ * parse_*_rdata(); release with the matching free_*_rdata(). */
 
 #include "dns_name.h"   /* DNAME_TEXT_MAX */
 #include <stdint.h>
@@ -44,19 +40,6 @@ typedef struct {
     uint16_t digest_len;
 } DsRdata;
 
-/* NSEC3 RDATA (RFC 5155 §3.2) */
-typedef struct {
-    uint8_t  hash_alg;      /* 1 = SHA-1 */
-    uint8_t  flags;         /* bit 0 = Opt-Out */
-    uint16_t iterations;
-    uint8_t* salt;          /* malloc'd (salt_len bytes) */
-    uint8_t  salt_len;
-    uint8_t* next_hashed;   /* malloc'd (next_hashed_len bytes) */
-    uint8_t  next_hashed_len;
-    uint8_t* type_bitmaps;  /* malloc'd (bitmaps_len bytes) */
-    uint16_t bitmaps_len;
-} Nsec3Rdata;
-
 /* Free helpers */
 static inline void free_dnskey_rdata(DnskeyRdata* r)
     { if (r) { free(r->pubkey); } }
@@ -64,8 +47,5 @@ static inline void free_rrsig_rdata(RrsigRdata* r)
     { if (r) { free(r->signature); } }
 static inline void free_ds_rdata(DsRdata* r)
     { if (r) { free(r->digest); } }
-static inline void free_nsec3_rdata(Nsec3Rdata* r) {
-    if (r) { free(r->salt); free(r->next_hashed); free(r->type_bitmaps); }
-}
 
 #endif /* DNSSEC_TYPES_H */

@@ -8,9 +8,7 @@
 #include <pthread.h>
 #include <arpa/inet.h>
 
-/* ==========================================================================
- * CIDR allow-list
- * ========================================================================== */
+/* ---- CIDR allow-list ------------------------------------------------------- */
 
 #define ACL_MAX 64
 
@@ -52,8 +50,13 @@ static int parse_cidr(const char *tok, Cidr *out)
     int   prefix = -1;
     char *slash  = strchr(buf, '/');
     if (slash) {
+        /* The prefix must be a non-empty run of digits: strtol() reads "" as 0
+         * and accepts a leading sign, so "10.0.0.0/" would otherwise parse as
+         * /0 and silently match every address. */
+        const char *digits = slash + 1;
+        if (*digits < '0' || *digits > '9') return -1;
         char *end;
-        long  v = strtol(slash + 1, &end, 10);
+        long  v = strtol(digits, &end, 10);
         if (*end != '\0' || v < 0) return -1;
         prefix = (int)v;
         *slash = '\0';
@@ -154,17 +157,17 @@ bool acl_allows(const struct sockaddr_storage *src)
     return false;
 }
 
-/* ==========================================================================
- * Per-source token-bucket rate limiter
- * ========================================================================== */
+/* ---- Per-source token-bucket rate limiter ---------------------------------- */
 
 #define RL_SLOTS 4096
+#define RL_WAYS  4                  /* set-associative: RL_SLOTS / RL_WAYS sets */
 
 typedef struct {
     uint8_t         key[16];
     int             keylen;   /* 0 = empty slot, else 4 or 16 */
     double          tokens;
     struct timespec last;
+    int             tcp_conns;   /* open TCP connections from this source */
 } RlSlot;
 
 static RlSlot          rl_table[RL_SLOTS];
@@ -183,18 +186,25 @@ void rl_configure(int qps, int burst)
     pthread_mutex_unlock(&rl_lock);
 }
 
-/* Copy the source address bytes into key[]; returns key length (4/16) or 0. */
+/* Per-source key: the IPv4 address, or the IPv6 /64 (one end site usually
+ * owns a whole /64, so keying on the /128 is trivially evaded by rotating
+ * addresses).  IPv4-mapped IPv6 keys as the IPv4 address.  Returns the key
+ * length (4/16) or 0. */
 static int rl_key(const struct sockaddr_storage *src, uint8_t key[16])
 {
+    memset(key, 0, 16);
     if (src->ss_family == AF_INET) {
         const struct sockaddr_in *s = (const struct sockaddr_in *)src;
-        memset(key, 0, 16);
         memcpy(key, &s->sin_addr, 4);
         return 4;
     }
     if (src->ss_family == AF_INET6) {
         const struct sockaddr_in6 *s = (const struct sockaddr_in6 *)src;
-        memcpy(key, &s->sin6_addr, 16);
+        if (IN6_IS_ADDR_V4MAPPED(&s->sin6_addr)) {
+            memcpy(key, (const uint8_t *)&s->sin6_addr + 12, 4);
+            return 4;
+        }
+        memcpy(key, &s->sin6_addr, 8);          /* /64 prefix */
         return 16;
     }
     return 0;
@@ -211,6 +221,49 @@ static uint32_t rl_hash(const uint8_t *key, int len)
     return h;
 }
 
+static double ts_diff(const struct timespec *a, const struct timespec *b)
+{
+    return (double)(a->tv_sec - b->tv_sec) + (double)(a->tv_nsec - b->tv_nsec) / 1e9;
+}
+
+/* Find src's slot, or claim one in its set (an empty way, else the way idle
+ * longest).  Two colliding sources therefore keep separate buckets instead of
+ * resetting each other to a full burst.
+ *
+ * A way whose source still has TCP connections open is NEVER reclaimed: its
+ * tcp_conns is the only record of those connections, and zeroing it both lost
+ * the per-source cap for the evicted source (its release() then matched no
+ * slot and decremented nothing) and handed the claiming source a fresh full
+ * token bucket.  When every way is busy this returns NULL and the caller
+ * decides; see rl_allow() and tcp_conn_acquire().
+ *
+ * Caller holds rl_lock. */
+static RlSlot *rl_slot(const uint8_t key[16], int klen, const struct timespec *now,
+                       bool *fresh)
+{
+    uint32_t set = (rl_hash(key, klen) % (RL_SLOTS / RL_WAYS)) * RL_WAYS;
+    RlSlot *empty = NULL, *idle = NULL;
+    for (int w = 0; w < RL_WAYS; w++) {
+        RlSlot *s = &rl_table[set + w];
+        if (s->keylen == klen && memcmp(s->key, key, 16) == 0) {
+            *fresh = false;
+            return s;
+        }
+        if (s->keylen == 0) { if (!empty) empty = s; continue; }
+        if (s->tcp_conns == 0 && (!idle || ts_diff(&idle->last, &s->last) > 0))
+            idle = s;                      /* oldest way with no open TCP */
+    }
+    RlSlot *victim = empty ? empty : idle;
+    if (!victim) return NULL;              /* every way holds live connections */
+    memset(victim, 0, sizeof(*victim));
+    memcpy(victim->key, key, 16);
+    victim->keylen = klen;
+    victim->tokens = rl_burst;
+    victim->last   = *now;
+    *fresh = true;
+    return victim;
+}
+
 bool rl_allow(const struct sockaddr_storage *src)
 {
     if (rl_qps <= 0) return true;
@@ -222,20 +275,20 @@ bool rl_allow(const struct sockaddr_storage *src)
 
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    uint32_t idx = rl_hash(key, klen) % RL_SLOTS;
 
-    bool allowed;
+    bool allowed, fresh;
     pthread_mutex_lock(&rl_lock);
-    RlSlot *s = &rl_table[idx];
-    if (s->keylen != klen || memcmp(s->key, key, (size_t)klen) != 0) {
-        /* Fresh source, or a hash collision evicting a previous one. */
-        memcpy(s->key, key, (size_t)klen);
-        s->keylen = klen;
-        s->tokens = rl_burst;
-        s->last   = now;
-    } else {
-        double elapsed = (double)(now.tv_sec - s->last.tv_sec) +
-                         (double)(now.tv_nsec - s->last.tv_nsec) / 1e9;
+    RlSlot *s = rl_slot(key, klen, &now, &fresh);
+    if (!s) {
+        /* No way in this set can be reclaimed without discarding another
+         * source's open TCP connections.  Allow: reaching this needs RL_WAYS
+         * distinct sources holding TCP connections that hash to one set, and
+         * dropping an innocent new client's query is the worse failure. */
+        pthread_mutex_unlock(&rl_lock);
+        return true;
+    }
+    if (!fresh) {
+        double elapsed = ts_diff(&now, &s->last);
         if (elapsed < 0) elapsed = 0;
         s->tokens += elapsed * rl_qps;
         if (s->tokens > rl_burst) s->tokens = rl_burst;
@@ -249,4 +302,42 @@ bool rl_allow(const struct sockaddr_storage *src)
     }
     pthread_mutex_unlock(&rl_lock);
     return allowed;
+}
+
+bool tcp_conn_acquire(const struct sockaddr_storage *src)
+{
+    if (!src) return true;
+    uint8_t key[16];
+    int klen = rl_key(src, key);
+    if (klen == 0) return true;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    bool ok, fresh;   /* fresh unused: a new slot starts at 0 conns */
+    pthread_mutex_lock(&rl_lock);
+    RlSlot *s = rl_slot(key, klen, &now, &fresh);
+    /* No slot means every way in this set is already at its connection cap:
+     * refuse rather than accept a connection we cannot account for. */
+    ok = s && s->tcp_conns < TCP_MAX_CONNS_PER_SOURCE;
+    if (ok) s->tcp_conns++;
+    pthread_mutex_unlock(&rl_lock);
+    return ok;
+}
+
+void tcp_conn_release(const struct sockaddr_storage *src)
+{
+    if (!src) return;
+    uint8_t key[16];
+    int klen = rl_key(src, key);
+    if (klen == 0) return;
+    uint32_t set = (rl_hash(key, klen) % (RL_SLOTS / RL_WAYS)) * RL_WAYS;
+    pthread_mutex_lock(&rl_lock);
+    for (int w = 0; w < RL_WAYS; w++) {
+        RlSlot *s = &rl_table[set + w];
+        if (s->keylen == klen && memcmp(s->key, key, 16) == 0) {
+            if (s->tcp_conns > 0) s->tcp_conns--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&rl_lock);
 }

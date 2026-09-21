@@ -2,6 +2,7 @@
 #define POLICY_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "dns_synth.h"   /* SynthAnswer */
 
 /*
@@ -48,8 +49,15 @@ int policy_block_mode_rcode(void);
  * out->addrlen == 0 && out->qtype == 0 means "emit no answer" (NXDOMAIN, or
  * NODATA for a sinkhole that has no record for this qtype).
  * Match is a subtree test against the blocklist; otherwise PASS.
+ *
+ * `zone_out` (optional, may be NULL) receives the blocklist entry that matched
+ * — the name itself or the listed ancestor covering it.  That entry is the
+ * apex of the zone being refused, which a negative answer's SOA must name
+ * (RFC 2308 §3); using the QNAME there instead stops strict resolvers from
+ * negative-caching the refusal at all.
  */
-PolicyAction policy_lookup(const char* qname, uint16_t qtype, SynthAnswer* out);
+PolicyAction policy_lookup(const char* qname, uint16_t qtype, SynthAnswer* out,
+                           char* zone_out, size_t zone_cap);
 
 /* Number of queries blocked since startup (for SIGUSR2 stats). */
 uint64_t policy_blocked_count(void);

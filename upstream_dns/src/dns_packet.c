@@ -1,273 +1,81 @@
 #include "dns_packet.h"
+#include "dns_name.h"
+#include "dns_wire.h"
+#include "utils.h"
 
-struct Packet* copy_packet(struct Packet* pkt)
-{ 
-    if(!pkt)
-        return NULL;
-
-    struct Packet* copy = calloc(1, sizeof(struct Packet));
-    if (!copy) 
-        return NULL;
-
-    // Always allocate a buffer for the copy
-    copy->request = malloc(MAX_PACKET_SIZE);
-    if (!copy->request) {
-        free(copy);
-        return NULL;
-    }
-    
-    // If source has data, copy it; otherwise buffer is initialized to zeros (from malloc)
-    if (pkt->request && pkt->recv_len > 0) {
-        memcpy(copy->request, pkt->request, pkt->recv_len);
-        copy->recv_len = pkt->recv_len;
-    } else {
-        // No source data - set recv_len to buffer size so construct_dns_packet() can use it
-        copy->recv_len = MAX_PACKET_SIZE;
-    }
-
-    copy->id = pkt->id;
-    copy->flags = pkt->flags;
-    copy->qr = 1;
-    copy->opcode = pkt->opcode;
-    copy->aa = 0;   
-    copy->tc = pkt->tc;   
-    copy->rd = pkt->rd;    
-    copy->ra = 1;     
-    copy->z = pkt->z;     
-    copy->ad = 0;                 //DNSSEC - for future
-    copy->cd = pkt->cd;   
-    copy->rcode = pkt->rcode;  
-
-   
-    copy->qdcount = pkt->qdcount;
-    copy->ancount = pkt->ancount;
-    copy->nscount = pkt->nscount;
-    copy->arcount = pkt->arcount;
-
-
-    copy->full_domain = pkt->full_domain ? strdup(pkt->full_domain) : NULL;
-
-    copy->q_type = pkt->q_type; 
-    copy->q_class = pkt->q_class;
-
-    return copy;
-}
-
-
-// Construct DNS packet into pkt->request buffer, returns bytes written or -1 on error
-int construct_dns_packet(struct Packet* pkt)
+void packet_read_header(struct Packet* pkt, const uint8_t* m)
 {
-    if (!pkt || !pkt->request) {
-        return -1;
-    }
-    
-    // Assume standard DNS buffer size if recv_len is 0 or negative
-    size_t buffer_size = (pkt->recv_len > 0) ? (size_t)pkt->recv_len : 4096;
-    
-    if (buffer_size < 12) {
-        return -1;  // Need at least header size
-    }
-    
-    unsigned char* ptr = (unsigned char*)pkt->request;
-    size_t remaining = buffer_size;
-    
-    // Transaction ID (2 bytes)
-    *ptr++ = (pkt->id >> 8) & 0xFF;
-    *ptr++ = pkt->id & 0xFF;
-    
-    // Flags (2 bytes)
-    // Build flags from individual bits
-    uint16_t flags = 0;
-    flags |= (pkt->qr & 0x01) << 15;      // QR bit
-    flags |= (pkt->opcode & 0x0F) << 11;  // Opcode (4 bits)
-    flags |= (pkt->aa & 0x01) << 10;      // AA bit
-    flags |= (pkt->tc & 0x01) << 9;       // TC bit
-    flags |= (pkt->rd & 0x01) << 8;       // RD bit
-    flags |= (pkt->ra & 0x01) << 7;       // RA bit
-    flags |= (pkt->z & 0x01) << 6;        // Z bit
-    flags |= (pkt->ad & 0x01) << 5;       // AD bit
-    flags |= (pkt->cd & 0x01) << 4;       // CD bit
-    flags |= (pkt->rcode & 0x0F);         // RCODE (4 bits)
-    
-    *ptr++ = (flags >> 8) & 0xFF;
-    *ptr++ = flags & 0xFF;
-    
-    // Question count (2 bytes)
-    *ptr++ = (pkt->qdcount >> 8) & 0xFF;
-    *ptr++ = pkt->qdcount & 0xFF;
-    
-    // Answer count (2 bytes)
-    *ptr++ = (pkt->ancount >> 8) & 0xFF;
-    *ptr++ = pkt->ancount & 0xFF;
-    
-    // Authority count (2 bytes)
-    *ptr++ = (pkt->nscount >> 8) & 0xFF;
-    *ptr++ = pkt->nscount & 0xFF;
-    
-    // Additional count (2 bytes)
-    *ptr++ = (pkt->arcount >> 8) & 0xFF;
-    *ptr++ = pkt->arcount & 0xFF;
-    
-    remaining = buffer_size - (ptr - (unsigned char*)pkt->request);
-    
-    // Question Section
-    if (pkt->qdcount > 0 && pkt->full_domain) {
-        // Encode domain name in DNS format
-        int qname_len = encode_dns_name(pkt->full_domain, ptr, remaining);
-        if (qname_len < 0) {
-            return -1;  // Buffer too small
-        }
-        ptr += qname_len;
-        remaining -= qname_len;
-        
-        if (remaining < 4) {
-            return -1;  // Not enough space for QTYPE and QCLASS
-        }
-        
-        // QTYPE (2 bytes)
-        *ptr++ = (pkt->q_type >> 8) & 0xFF;
-        *ptr++ = pkt->q_type & 0xFF;
-        
-        // QCLASS (2 bytes)
-        *ptr++ = (pkt->q_class >> 8) & 0xFF;
-        *ptr++ = pkt->q_class & 0xFF;
-        
-        remaining -= 4;
-    }
-    
-    // EDNS0 OPT Section
-    if (remaining >= 11) {
-        // NAME: root domain (1 byte)
-        *ptr++ = 0x00;
-        
-        // TYPE: OPT (41 = 0x0029) (2 bytes)
-        *ptr++ = 0x00;
-        *ptr++ = 0x29;
-        
-        // CLASS: UDP payload size (2 bytes) — EDNS_UDP_PAYLOAD (1232) so
-        // authoritative answers never need IP fragmentation; bigger ones come
-        // back TC=1 and are re-fetched over TCP.
-        *ptr++ = (EDNS_UDP_PAYLOAD >> 8) & 0xFF;
-        *ptr++ = EDNS_UDP_PAYLOAD & 0xFF;
-        
-        // TTL: Extended RCODE and flags (4 bytes)
-        // Byte 0: extended RCODE, Byte 1: EDNS version
-        // Bytes 2-3: EDNS flags — bit 15 (0x8000) = DO (DNSSEC OK)
-        *ptr++ = 0x00;
-        *ptr++ = 0x00;
-        *ptr++ = 0x80;  // DO bit set: request DNSSEC records
-        *ptr++ = 0x00;
-        
-        // RDLENGTH: 0 - no EDNS options (2 bytes)
-        *ptr++ = 0x00;
-        *ptr++ = 0x00;
-        
-        // Update ARCOUNT in header to 1
-        unsigned char* pkt_bytes = (unsigned char*)pkt->request;
-        pkt_bytes[10] = 0x00;
-        pkt_bytes[11] = 0x01;
-        pkt->arcount = 1;
-    }
-
-    // Total bytes written
-    return ptr - (unsigned char*)pkt->request;
+    uint16_t flags = rd16(m + 2);
+    pkt->id      = rd16(m);
+    pkt->qr      = (flags >> 15) & 1;
+    pkt->opcode  = (flags >> 11) & 0xF;
+    pkt->aa      = (flags >> 10) & 1;
+    pkt->tc      = (flags >> 9) & 1;
+    pkt->rd      = (flags >> 8) & 1;
+    pkt->ad      = (flags >> 5) & 1;
+    pkt->cd      = (flags >> 4) & 1;
+    pkt->rcode   = flags & 0xF;
+    pkt->qdcount = rd16(m + 4);
+    pkt->ancount = rd16(m + 6);
+    pkt->nscount = rd16(m + 8);
+    pkt->arcount = rd16(m + 10);
 }
 
-/*
- * Free packet structure and all allocated memory
- */
-int free_packet(struct Packet* pkt) {
-    if (!pkt) {
-        return -1;
-    }
-
-    if(pkt->request)
-        free(pkt->request);
-
-    if(pkt->full_domain)
-        free(pkt->full_domain);
-
-    free(pkt);
-
-    return 0;
-}
-
-
-/*
- * Format a DNS query packet for iterative resolution
- * Sets RD=0 (no recursion desired) for iterative queries
- */
-struct Packet* format_resolver(struct Packet* pkt)
+struct Packet* parse_response(const char* buffer, ssize_t recv_len)
 {
-    if (!pkt) {
-        fprintf(stderr, "Error: NULL packet provided to format_resolver\n");
+    if (!buffer || recv_len < HEADER_LEN) return NULL;
+
+    struct Packet* pkt = calloc(1, sizeof(*pkt));
+    if (!pkt || !(pkt->request = malloc((size_t)recv_len))) {
+        free(pkt);
         return NULL;
     }
+    memcpy(pkt->request, buffer, (size_t)recv_len);
+    pkt->recv_len = recv_len;
 
-    struct Packet* copy_pkt = copy_packet(pkt);
-    if (!copy_pkt) {
-        fprintf(stderr, "Error: Failed to copy packet\n");
-        return NULL;
+    const uint8_t* m = (const uint8_t*)buffer;
+    packet_read_header(pkt, m);
+
+    /* Question, case preserved: matched against what we asked (RFC 5452). */
+    if (pkt->qdcount > 0) {
+        char domain[DNAME_TEXT_MAX];
+        int pos = dname_from_wire(m, (int)recv_len, HEADER_LEN, false, domain, sizeof(domain));
+        if (pos >= 0) {
+            pkt->full_domain = strdup(domain);
+            if (pos + 4 <= recv_len) {
+                pkt->q_type  = rd16(m + pos);
+                pkt->q_class = rd16(m + pos + 2);
+            }
+        }
     }
-
-    set_packet_fields(copy_pkt);
-
-    /* copy_packet() always allocates a full MAX_PACKET_SIZE buffer, so let
-     * construct_dns_packet() use all of it.  Otherwise recv_len still reflects
-     * the (smaller) source query length — and for a client query the upstream
-     * parser already trimmed that to exactly header+question, leaving no room.
-     * construct_dns_packet() would then drop the trailing EDNS OPT, which
-     * carries the DO bit, so upstream nameservers return no RRSIGs and DNSSEC
-     * validation can never run.  construct_dns_packet() rebuilds the packet
-     * from struct fields, so the source length is irrelevant here. */
-    copy_pkt->recv_len = MAX_PACKET_SIZE;
-
-    int ret = construct_dns_packet(copy_pkt);
-    if (ret < 0) {
-        fprintf(stderr, "Error: Failed to construct DNS packet\n");
-        free_packet(copy_pkt);
-        return NULL;
-    }
-
-    copy_pkt->recv_len = ret;
-    return copy_pkt;
+    return pkt;
 }
 
+struct Packet* build_query(const char* name, uint16_t qtype, uint16_t qclass)
+{
+    if (!name) return NULL;
+    uint8_t buf[HEADER_LEN + 255 + 4 + OPT_RR_LEN] = {0};
 
-/*
- * Set packet fields for iterative DNS query (non-recursive)
- */
-void set_packet_fields(struct Packet* pkt)
+    wr16(buf, (uint16_t)get_random_id());
+    wr16(buf + 4, 1);                                   /* QDCOUNT */
+    wr16(buf + 10, 1);                                  /* ARCOUNT: our OPT */
+    int n = dname_to_wire(name, buf + HEADER_LEN, 255);
+    if (n < 0) return NULL;
+    int pos = HEADER_LEN + n;
+    wr16(buf + pos, qtype);
+    wr16(buf + pos + 2, qclass);
+    pos += 4;
+    /* DO=1 so authorities return RRSIGs; bigger answers come back TC=1. */
+    write_opt_rr(buf + pos, true, 0);
+    pos += OPT_RR_LEN;
+
+    return parse_response((const char*)buf, pos);
+}
+
+void free_packet(struct Packet* pkt)
 {
     if (!pkt) return;
-
-    pkt->id = get_random_id();
-    pkt->qr = 0;       // Query Count
-    pkt->opcode = 0;   // Standard Query
-    pkt->rd = 0;       // No recursion desired (iterative)
-    pkt->ra = 0;
-    pkt->aa = 0;
-    pkt->tc = 0;
-    pkt->ad = 0;
-    pkt->cd = 0;
-    pkt->z = 0;
-    pkt->rcode = 0;
-    
-    // Rebuild flags field
-    pkt->flags = 0;
-    pkt->flags |= (pkt->qr & 0x01) << 15;
-    pkt->flags |= (pkt->opcode & 0x0F) << 11;
-    pkt->flags |= (pkt->aa & 0x01) << 10;
-    pkt->flags |= (pkt->tc & 0x01) << 9;
-    pkt->flags |= (pkt->rd & 0x01) << 8;
-    pkt->flags |= (pkt->ra & 0x01) << 7;
-    pkt->flags |= (pkt->z & 0x01) << 6;
-    pkt->flags |= (pkt->ad & 0x01) << 5;
-    pkt->flags |= (pkt->cd & 0x01) << 4;
-    pkt->flags |= (pkt->rcode & 0x0F);
-    
-    pkt->qdcount = 1;
-    pkt->ancount = 0;
-    pkt->nscount = 0;
-    pkt->arcount = 0;
+    free(pkt->request);
+    free(pkt->full_domain);
+    free(pkt);
 }
