@@ -1,79 +1,85 @@
 #include "query_log.h"
+#include "config.h"
+#include "utils.h"
 
-#include <pthread.h>
 #include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <time.h>
+#include <inttypes.h>
+#include <pthread.h>
 #include <pwd.h>
-#include <stdio.h>
-#include <string.h>
+#include <stdatomic.h>
+#include <time.h>
+#include <sys/stat.h>
 
-#include "types.h"
-#include "utils.h"   /* qtype_to_string */
+/* ---- Query counters ------------------------------------------------------ */
 
-/* Defined in main.c; the logger reads only drop_user (for log fd ownership). */
-extern Config g_config;
+static _Atomic uint64_t g_qtype_counters[256];   /* [0] = qtype >= 256 */
+static _Atomic uint64_t g_total_queries;
 
-/* --------------------------------------------------------------------------
- * Simple query logger — persistent fd, localtime_r, mutex-protected.
- * Format (CSV): timestamp,client_ip,port,qtype,domain,rcode,info
- * The info column is empty when there is no answer detail.
- * -------------------------------------------------------------------------- */
+void count_query(uint16_t qtype)
+{
+    atomic_fetch_add(&g_total_queries, 1);
+    atomic_fetch_add(&g_qtype_counters[qtype < 256 ? qtype : 0], 1);
+}
+
+void print_query_stats(void)
+{
+    printf("Query statistics:\n");
+    printf("  Total queries: %" PRIu64 "\n", atomic_load(&g_total_queries));
+    for (int i = 1; i < 256; i++) {
+        uint64_t c = atomic_load(&g_qtype_counters[i]);
+        if (c == 0) continue;
+        const char* name = qtype_to_string((uint16_t)i);
+        if (name) printf("  %-10s %" PRIu64 "\n", name, c);
+        else      printf("  TYPE%-6d %" PRIu64 "\n", i, c);
+    }
+    uint64_t other = atomic_load(&g_qtype_counters[0]);
+    if (other) printf("  %-10s %" PRIu64 "\n", "OTHER", other);
+}
+
+/* ---- CSV log: timestamp,client_ip,port,qtype,domain,rcode,info ------------ */
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int   g_log_fd    = -1;
 static off_t g_log_bytes = 0;   /* bytes in the log since last truncate (g_log_mutex) */
 
-/* Cap upstream.log at this size.  When it is exceeded the log is truncated in
- * place (ftruncate to 0) — no rotation, no upstream.log.1, no other file is
- * ever created.  Replaces the previous logrotate-based rotation. */
+/* Past this size the log is truncated in place (no rotation files). */
 #define LOG_MAX_BYTES (20 * 1024 * 1024)
 
-/* Open the log file (O_APPEND) and seed g_log_bytes from its current size so the
- * in-place cap accounts for bytes already on disk.  Caller holds g_log_mutex.
- * Returns the fd, or -1 on failure. */
+/* Open (O_APPEND) and seed g_log_bytes from the file size.  Caller holds
+ * g_log_mutex.  Returns the fd or -1. */
 static int log_open_locked(void) {
     int fd = path_open(LOG_FILE_PATH, O_CREAT | O_WRONLY | O_APPEND, 0644);
     if (fd < 0) return -1;
-    /* If we still hold root and will drop to an unprivileged user, hand the log
-     * to that user now.  Later reopens (SIGHUP/logrotate) run AFTER the drop, so
-     * without this they fail with EACCES on a root-owned 0644 log. */
+    /* Still root and about to drop: hand the log to the drop user, or later
+     * reopens (after the drop) fail on a root-owned 0644 file. */
     if (geteuid() == 0 && g_config.drop_user && *g_config.drop_user) {
         char u[128];
         snprintf(u, sizeof(u), "%s", g_config.drop_user);
         char *colon = strchr(u, ':');
         if (colon) *colon = '\0';
         struct passwd *pw = getpwnam(u);
-        if (pw && fchown(fd, pw->pw_uid, pw->pw_gid) != 0) {
-            /* best-effort: the fd we just opened still works regardless */
-        }
+        if (pw && fchown(fd, pw->pw_uid, pw->pw_gid) != 0) { /* best-effort */ }
     }
     struct stat st;
     g_log_bytes = (fstat(fd, &st) == 0) ? st.st_size : 0;
     return fd;
 }
 
-static const char* rcode_name_up(uint8_t rcode) {
+static const char* rcode_name(uint8_t rcode) {
     switch (rcode) {
-        case 0:  return "NOERROR";
-        case 1:  return "FORMERR";
-        case 2:  return "SERVFAIL";
-        case 3:  return "NXDOMAIN";
-        case 4:  return "NOTIMP";
-        case 5:  return "REFUSED";
-        case 9:  return "NOTAUTH";
-        case 16: return "BADVERS";
-        default: return "ERR";
+        case RCODE_NO_ERROR:       return "NOERROR";
+        case RCODE_FORMAT_ERROR:   return "FORMERR";
+        case RCODE_SERVER_FAILURE: return "SERVFAIL";
+        case RCODE_NAME_ERROR:     return "NXDOMAIN";
+        case RCODE_NOTIMP:         return "NOTIMP";
+        case RCODE_REFUSED:        return "REFUSED";
+        case RCODE_NOTAUTH:        return "NOTAUTH";
+        case RCODE_BADVERS:        return "BADVERS";
+        default:                   return "ERR";
     }
 }
 
-/*
- * Percent-encode CSV-unsafe bytes (known_issues 4.6).  The QNAME and answer
- * fields are attacker-influenced and DNS labels may carry arbitrary octets;
- * encoding control chars, commas, double-quotes, backslash, percent, and
- * non-ASCII bytes as %XX prevents log-line injection / column-splitting while
- * keeping ordinary names readable.  Always NUL-terminates.
- */
+/* Percent-encode control chars, non-ASCII, and , " \ % so attacker-chosen
+ * names can't inject lines or columns.  Always NUL-terminates. */
 static const char* csv_escape(const char* in, char* out, size_t out_size) {
     static const char hex[] = "0123456789ABCDEF";
     if (out_size == 0) return out;
@@ -119,32 +125,24 @@ void log_query(const char* client_ip, uint16_t port,
     char qt_buf[12];
     if (!qt) { snprintf(qt_buf, sizeof(qt_buf), "TYPE%u", qtype_val); qt = qt_buf; }
 
-    /* CSV: timestamp,client_ip,port,qtype,domain,rcode,info  (info empty if none).
-     * domain (QNAME) and info (answer data) are attacker-influenced — escape
-     * them so they cannot inject newlines or commas (4.6). */
     char dom_esc[512], info_esc[512];
     char line[512];
     int len = snprintf(line, sizeof(line), "%s,%s,%u,%s,%s,%s,%s\n",
                        ts, client_ip ? client_ip : "-", port,
                        qt, csv_escape(domain ? domain : "-", dom_esc, sizeof(dom_esc)),
-                       rcode_name_up(rcode),
+                       rcode_name(rcode),
                        csv_escape(info ? info : "", info_esc, sizeof(info_esc)));
 
-    /* snprintf returns the number of bytes it WOULD have written, even when
-     * it truncated.  Without clamping, write() reads past the end of line[]
-     * and writes uninitialized stack memory to the log (and the trailing '\n'
-     * gets lost, causing log entries to run together). */
+    /* snprintf reports the untruncated length: clamp, and keep the newline. */
     if (len > 0) {
         if (len >= (int)sizeof(line)) {
             len = (int)sizeof(line) - 1;
-            line[len - 1] = '\n';   /* keep one entry per line when truncated */
+            line[len - 1] = '\n';
         }
         if (write(g_log_fd, line, len) < 0) {
             perror("Warning: Upstream log write failed");
         } else {
-            /* In-place size cap: once the log passes LOG_MAX_BYTES, truncate it
-             * back to empty.  O_APPEND means the next write resumes at offset 0,
-             * so the file is reset in place and no other file is ever created. */
+            /* O_APPEND: after truncation writes resume at offset 0. */
             g_log_bytes += len;
             if (g_log_bytes >= LOG_MAX_BYTES && ftruncate(g_log_fd, 0) == 0)
                 g_log_bytes = 0;
@@ -167,7 +165,6 @@ void log_reopen_upstream(void) {
         if (g_log_fd >= 0) close(g_log_fd);
         g_log_fd = fd;
     } else {
-        /* Keep logging to the old fd rather than losing the log entirely. */
         perror("Warning: log_reopen: Failed to open upstream log file; keeping current fd");
     }
     pthread_mutex_unlock(&g_log_mutex);

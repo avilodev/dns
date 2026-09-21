@@ -22,8 +22,11 @@ mkdir -p "$DEST_DIR"
 chown @RUN_USER@:@RUN_GROUP@ "$BASE_DIR/$YEAR" "$BASE_DIR/$YEAR/$MONTH" "$DEST_DIR"
 chmod 755 "$BASE_DIR/$YEAR" "$BASE_DIR/$YEAR/$MONTH" "$DEST_DIR"
 
-# Use flock to lock the file, copy it, then truncate it
-# Lock timeout of 60 seconds
+# copy-then-truncate (like logrotate's copytruncate): the server keeps its
+# O_APPEND fd, so after the truncate it simply continues at offset 0.  Lines
+# written between the cp and the truncate are lost; that window is a few ms.
+# The flock only stops two runs of THIS script overlapping — the server does
+# not take it.
 (
     flock -x -w 60 200 || exit 1
     

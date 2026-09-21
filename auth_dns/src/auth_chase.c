@@ -224,20 +224,22 @@ int merge_chased_answer(struct Packet* resp, const struct Packet* sub)
     int rcode = m[3] & 0x0F;
     if (rcode != 0 && rcode != 3) return -1;           /* only answers / NXDOMAIN */
 
-    unsigned char tmp[MAXLINE];
+    unsigned char* tmp = malloc(DNS_MSG_MAX);
+    if (!tmp) return -1;
     int op = 0;
     int ip = skip_question(m, slen);
-    if (ip < 0) return -1;
-    int wan = copy_rrs(m, slen, &ip, an, tmp, sizeof(tmp), &op);
-    if (wan < 0) return -1;
+    if (ip < 0) { free(tmp); return -1; }
+    int wan = copy_rrs(m, slen, &ip, an, tmp, DNS_MSG_MAX, &op);
+    if (wan < 0) { free(tmp); return -1; }
     int wns = 0;
     if (an == 0) {                                      /* negative: keep the SOA */
-        wns = copy_rrs(m, slen, &ip, ns, tmp, sizeof(tmp), &op);
-        if (wns < 0) return -1;
+        wns = copy_rrs(m, slen, &ip, ns, tmp, DNS_MSG_MAX, &op);
+        if (wns < 0) { free(tmp); return -1; }
     }
-    if (resp->recv_len + op > MAXLINE) return -1;
+    if (resp->recv_len + op > DNS_MSG_MAX) { free(tmp); return -1; }
 
     memcpy(r + resp->recv_len, tmp, (size_t)op);
+    free(tmp);
     resp->recv_len += op;
     int ancount = ((r[6] << 8) | r[7]) + wan;
     r[6] = (unsigned char)(ancount >> 8); r[7] = (unsigned char)(ancount & 0xFF);

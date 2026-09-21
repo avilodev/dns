@@ -91,6 +91,17 @@ static void* worker_thread(void* arg) {
     return NULL;
 }
 
+/* Free the pre-allocated WorkItem freelist (error paths and destroy). */
+static void free_item_freelist(struct ThreadPool* pool) {
+    struct WorkItem* item = pool->item_freelist;
+    while (item) {
+        struct WorkItem* next = item->next;
+        free(item);
+        item = next;
+    }
+    pool->item_freelist = NULL;
+}
+
 /*
  * Allocate and start a thread pool.  Returns NULL on error.
  * config.max_queue_size = 0 means unlimited queue depth.
@@ -152,6 +163,7 @@ struct ThreadPool* threadpool_create(struct ThreadPoolConfig config) {
     pool->threads = calloc(pool->num_threads, sizeof(pthread_t));
     if (!pool->threads) {
         perror("Failed to allocate thread array");
+        free_item_freelist(pool);
         pthread_cond_destroy(&pool->work_done);
         pthread_cond_destroy(&pool->work_available);
         pthread_mutex_destroy(&pool->queue_mutex);
@@ -171,6 +183,7 @@ struct ThreadPool* threadpool_create(struct ThreadPoolConfig config) {
             }
             
             free(pool->threads);
+            free_item_freelist(pool);
             pthread_cond_destroy(&pool->work_done);
             pthread_cond_destroy(&pool->work_available);
             pthread_mutex_destroy(&pool->queue_mutex);
@@ -291,12 +304,7 @@ void threadpool_destroy(struct ThreadPool* pool) {
     }
 
     // Free the pre-allocated WorkItem freelist.
-    item = pool->item_freelist;
-    while (item) {
-        struct WorkItem* next = item->next;
-        free(item);
-        item = next;
-    }
+    free_item_freelist(pool);
 
     // Cleanup
     free(pool->threads);

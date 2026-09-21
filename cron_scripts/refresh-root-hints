@@ -35,7 +35,12 @@ echo "refresh-root-hints: root hints updated at $DEST"
 #   containers — docker kill (the container has its own PID namespace, so the
 #                host-side methods above can't see it)
 PIDFILE="/run/upstream_dns.pid"
-if [ -f "$PIDFILE" ] && kill -HUP "$(cat "$PIDFILE")" 2>/dev/null; then
+# Only trust the PID file if that PID really is upstream_dns: a stale file
+# (after a crash or restart) could name an unrelated process, and SIGHUP's
+# default action terminates it.
+PID="$(cat "$PIDFILE" 2>/dev/null || true)"
+if [ -n "$PID" ] && [ "$(cat "/proc/$PID/comm" 2>/dev/null)" = "upstream_dns" ] \
+        && kill -HUP "$PID" 2>/dev/null; then
     echo "refresh-root-hints: sent SIGHUP to upstream_dns (pid file)"
 elif pkill -HUP -x upstream_dns 2>/dev/null; then
     echo "refresh-root-hints: sent SIGHUP to upstream_dns (pgrep)"

@@ -1,6 +1,7 @@
 #include "response.h"
 #include "auth.h"
 #include "utils.h"
+#include "dns_name.h"   /* dname_to_wire */
 #include <string.h>
 
 /*
@@ -27,7 +28,7 @@ void echo_question(char* buf, int* pos, const struct Packet* request)
         }
         if (q >= HEADER_LEN && q + 4 <= len) {
             int qlen = (q + 4) - HEADER_LEN;     /* QNAME + QTYPE + QCLASS */
-            if (*pos + qlen <= MAXLINE) {
+            if (*pos + qlen <= DNS_MSG_MAX) {
                 memcpy(buf + *pos, r + HEADER_LEN, (size_t)qlen);
                 *pos += qlen;
                 return;
@@ -35,9 +36,11 @@ void echo_question(char* buf, int* pos, const struct Packet* request)
         }
     }
 
-    /* Fallback: re-encode from the (lowercased) parsed name. */
+    /* Fallback: re-encode from the (lowercased) parsed name.  Cap the name at
+     * DNS_MSG_MAX-4 so the QTYPE/QCLASS below always have room. */
+    if (*pos + 5 > DNS_MSG_MAX) return;
     if (request->full_domain)
-        write_dns_labels(request->full_domain, buf, pos, MAXLINE);
+        write_dns_labels(request->full_domain, buf, pos, DNS_MSG_MAX - 4);
     else
         buf[(*pos)++] = 0;
     wr16(buf + *pos, request->q_type);   *pos += 2;
@@ -58,6 +61,7 @@ static void append_soa_authority(char* buf, int* pos, const struct AuthDomain* s
     int rdata_len = 0;
     write_dns_labels(soa->soa_mname, rdata, &rdata_len, sizeof(rdata));
     write_dns_labels(soa->soa_rname, rdata, &rdata_len, sizeof(rdata));
+    if (rdata_len + 20 > (int)sizeof(rdata)) return;      /* names too long */
     wr32(rdata + rdata_len, soa->soa_serial);   rdata_len += 4;
     wr32(rdata + rdata_len, soa->soa_refresh);  rdata_len += 4;
     wr32(rdata + rdata_len, soa->soa_retry);    rdata_len += 4;
@@ -67,8 +71,14 @@ static void append_soa_authority(char* buf, int* pos, const struct AuthDomain* s
     // SOA RR TTL: min(soa_ttl, soa_minimum) per RFC 2308 §5
     uint32_t ttl = (soa->soa_ttl < soa->soa_minimum) ? soa->soa_ttl : soa->soa_minimum;
 
-    // Owner name: zone apex in wire format
-    write_dns_labels(soa->domain, buf, pos, MAXLINE);
+    /* Owner name: the zone apex, uncompressed.  Encode it before reserving
+     * space so the check below covers the whole record. */
+    uint8_t owner[256];
+    int owner_len = dname_to_wire(soa->domain, owner, sizeof(owner));
+    if (owner_len < 0) return;
+    if (*pos + owner_len + 10 + rdata_len > DNS_MSG_MAX) return;
+
+    memcpy(buf + *pos, owner, (size_t)owner_len); *pos += owner_len;
     wr16(buf + *pos, QTYPE_SOA);   *pos += 2;
     wr16(buf + *pos, 1);            *pos += 2;  // CLASS IN
     wr32(buf + *pos, ttl);          *pos += 4;
@@ -76,8 +86,8 @@ static void append_soa_authority(char* buf, int* pos, const struct AuthDomain* s
     memcpy(buf + *pos, rdata, rdata_len);
     *pos += rdata_len;
 
-    // Update NSCOUNT at wire offset 8
-    wr16(buf + 8, 1);
+    // One more authority record (increment, don't assume this is the first)
+    wr16(buf + 8, (uint16_t)(rd16(buf + 8) + 1));
 }
 
 
@@ -163,7 +173,7 @@ struct Packet* build_nxdomain_response(struct Packet* request,
         return NULL;
     }
 
-    response->request = calloc(1, MAXLINE);
+    response->request = calloc(1, DNS_MSG_MAX);
     if (!response->request) {
         perror("Error: Failed to allocate response buffer");
         free(response);
@@ -181,6 +191,7 @@ struct Packet* build_nxdomain_response(struct Packet* request,
     flags |= (1 << 15);           // Response
     flags |= (1 << 10);           // Authoritative Answer
     flags |= (request->rd << 8);  // Copy recursion desired
+    flags |= (request->cd << 4);  // Copy CD (RFC 4035 §3.2.2)
     flags |= (1 << 7);            // Recursion Available
     flags |= RCODE_NAME_ERROR;    // RCODE: NXDOMAIN = 3
     wr16(response->request + pos, flags);
@@ -225,7 +236,7 @@ struct Packet* build_nodata_response(struct Packet* request,
         return NULL;
     }
 
-    response->request = calloc(1, MAXLINE);
+    response->request = calloc(1, DNS_MSG_MAX);
     if (!response->request) {
         perror("Error: Failed to allocate response buffer");
         free(response);
@@ -241,6 +252,7 @@ struct Packet* build_nodata_response(struct Packet* request,
     flags |= (1 << 15);           // QR: Response
     flags |= (1 << 10);           // AA: Authoritative Answer
     flags |= (request->rd << 8);  // Copy recursion desired
+    flags |= (request->cd << 4);  // Copy CD (RFC 4035 §3.2.2)
     flags |= (1 << 7);            // RA: Recursion Available
     flags |= RCODE_NO_ERROR;      // RCODE: 0 (no error, but no data)
     wr16(response->request + pos, flags);
@@ -280,7 +292,7 @@ struct Packet* build_servfail_response(struct Packet* request) {
         return NULL;
     }
 
-    response->request = calloc(1, MAXLINE);
+    response->request = calloc(1, DNS_MSG_MAX);
     if (!response->request) {
         perror("Error: Failed to allocate response buffer");
         free(response);
@@ -295,6 +307,7 @@ struct Packet* build_servfail_response(struct Packet* request) {
     uint16_t flags = 0;
     flags |= (1 << 15);               // QR: Response
     flags |= (request->rd << 8);      // Copy recursion desired
+    flags |= (request->cd << 4);      // Copy CD
     flags |= (1 << 7);                // RA: Recursion Available
     flags |= RCODE_SERVER_FAILURE;    // RCODE: 2 (SERVFAIL)
     wr16(response->request + pos, flags);
@@ -327,7 +340,7 @@ struct Packet* build_badvers_response(struct Packet* request) {
     struct Packet* response = calloc(1, sizeof(struct Packet));
     if (!response) { perror("Error: Failed to allocate BADVERS response"); return NULL; }
 
-    response->request = calloc(1, MAXLINE);
+    response->request = calloc(1, DNS_MSG_MAX);
     if (!response->request) {
         perror("Error: Failed to allocate BADVERS response buffer");
         free(response);
@@ -343,6 +356,7 @@ struct Packet* build_badvers_response(struct Packet* request) {
     uint16_t flags = 0;
     flags |= (1u << 15);              /* QR */
     flags |= ((unsigned)request->rd << 8); /* RD */
+    flags |= ((unsigned)request->cd << 4); /* CD */
     flags |= (1u << 7);              /* RA */
     wr16(response->request + pos, flags);
     pos += 2;
@@ -359,16 +373,18 @@ struct Packet* build_badvers_response(struct Packet* request) {
     /* Question section — echo verbatim to preserve QNAME case (4.8) */
     echo_question(response->request, &pos, request);
 
-    /* OPT RR: root name + type=41 + payload=4096 + TTL=BADVERS_extRCODE + RDLEN=0
+    /* OPT RR: root name + type=41 + payload + TTL=BADVERS_extRCODE + RDLEN=0
      * OPT TTL layout (RFC 6891 §6.1.3):
      *   byte 0 = extended RCODE (16 = BADVERS)
      *   byte 1 = EDNS version (0)
      *   bytes 2-3 = flags (DO bit etc.) */
-    if (pos + 11 <= MAXLINE) {
+    if (pos + 11 <= DNS_MSG_MAX) {
         response->request[pos++] = 0x00;                              /* root name  */
         wr16(response->request + pos, 41);            pos += 2; /* OPT  */
-        wr16(response->request + pos, 4096);          pos += 2; /* payload */
-        wr32(response->request + pos, RCODE_BADVERS << 24); pos += 4; /* TTL */
+        wr16(response->request + pos, EDNS_UDP_PAYLOAD); pos += 2; /* payload */
+        /* The OPT extended-RCODE byte holds the UPPER 8 bits of the 12-bit
+         * RCODE: BADVERS (16) = ext 1, header 0. */
+        wr32(response->request + pos, (uint32_t)(RCODE_BADVERS >> 4) << 24); pos += 4;
         wr16(response->request + pos, 0);             pos += 2; /* RDLEN=0 */
     }
 
@@ -426,7 +442,7 @@ static int message_has_opt(const unsigned char* buf, int len)
  * EDNS/DO clients see the DO/AD signalling over TCP too.  No-op when the client
  * sent no EDNS, when the response already carries an OPT (e.g. a forwarded
  * upstream answer — RFC 6891 §6.1.1 allows at most one OPT), or when the OPT
- * would not fit.  Advertises a 4096-byte UDP payload and mirrors the DO bit.
+ * would not fit.  Advertises EDNS_UDP_PAYLOAD and mirrors the DO bit.
  * ========================================================================== */
 void append_edns_opt(struct Packet *response, const struct Packet *request)
 {
@@ -436,10 +452,10 @@ void append_edns_opt(struct Packet *response, const struct Packet *request)
                         (int)response->recv_len)) return;
 
     int pos = (int)response->recv_len;
-    if (pos + 11 > MAXLINE) return;
+    if (pos + 11 > DNS_MSG_MAX) return;
     response->request[pos++] = 0x00;                          /* root name  */
     wr16(response->request + pos, 41);        pos += 2; /* OPT  */
-    wr16(response->request + pos, 4096);      pos += 2; /* payload */
+    wr16(response->request + pos, EDNS_UDP_PAYLOAD); pos += 2; /* payload */
     /* TTL: [ext_rcode=0][version=0][flags] — mirror DO bit   */
     uint32_t opt_ttl = request->do_bit ? 0x00008000u : 0u;
     wr32(response->request + pos, opt_ttl);   pos += 4;
@@ -470,6 +486,9 @@ void finalize_udp_response(struct Packet *response, const struct Packet *request
     /* --- 2. Truncate if response exceeds UDP payload limit --- */
     int udp_limit = request->edns_present ? (int)request->edns_udp_size : 512;
     if (udp_limit < 512) udp_limit = 512;          /* minimum enforced by RFC */
+    /* Never send more than we advertise: avoids IP fragmentation (DNS Flag
+     * Day 2020); larger answers go TC=1 and the client retries over TCP. */
+    if (udp_limit > EDNS_UDP_PAYLOAD) udp_limit = EDNS_UDP_PAYLOAD;
 
     if ((int)response->recv_len > udp_limit) {
         /* Walk to end of question section (QNAME labels + QTYPE + QCLASS). */
@@ -494,11 +513,11 @@ void finalize_udp_response(struct Packet *response, const struct Packet *request
          * every response, including truncated ones.  Re-write a minimal OPT
          * immediately after the question section and keep ARCOUNT = 1.
          * If no EDNS was present, zero ARCOUNT and trim to question only. */
-        if (request->edns_present && qend + 11 <= MAXLINE) {
+        if (request->edns_present && qend + 11 <= DNS_MSG_MAX) {
             char *p = response->request + qend;
             p[0] = 0x00;                                          /* root name  */
             wr16(p + 1, 41);                      /* OPT        */
-            wr16(p + 3, 4096);                    /* payload    */
+            wr16(p + 3, EDNS_UDP_PAYLOAD);        /* payload    */
             uint32_t opt_ttl = request->do_bit ? 0x00008000u : 0u;
             wr32(p + 5, opt_ttl);                 /* TTL/flags  */
             wr16(p + 9, 0);                       /* RDLEN = 0  */

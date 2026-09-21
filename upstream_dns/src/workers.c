@@ -1,325 +1,181 @@
 #include "workers.h"
-
-#include <pthread.h>
-#include <stdbool.h>
-#include <stdatomic.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <errno.h>
-#include <poll.h>
-#include <time.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-
-#include "config.h"
-#include "types.h"
-#include "shared_types.h"
-#include "thread_pool.h"
-#include "utils.h"
+#include "access_control.h"
+#include "cache.h"
+#include "client_reply.h"
+#include "query_log.h"
 #include "request.h"
 #include "resolve.h"
-#include "cache.h"
-#include "access_control.h"
-#include "query_log.h"
-#include "udp_helpers.h"
+#include "response_handler.h"
+#include "utils.h"
 
-/* Per-QTYPE query counters — defined in main.c, also read by print_qtype_stats(). */
-extern _Atomic uint64_t g_qtype_counters[256];
-extern _Atomic uint64_t g_total_queries;
+#include <netinet/tcp.h>
+#include <sys/time.h>
 
-void* process_query(void* arg) {
-    struct QueryContext* ctx = (struct QueryContext*)arg;
+/* malloc'd error reply for a raw query. */
+static char* error_reply(const char* req, ssize_t req_len, int rcode, ssize_t* out_len)
+{
+    unsigned char tmp[ERROR_REPLY_MAX];
+    int n = build_error_reply((const unsigned char*)req, req_len, rcode, tmp, sizeof(tmp));
+    char* out = n > 0 ? malloc((size_t)n) : NULL;
+    if (out) memcpy(out, tmp, (size_t)n);
+    *out_len = out ? n : 0;
+    return out;
+}
 
-    if (!ctx) return NULL;
+/* RD=0 (RFC 1034 §4.3.1): answer only from what we already hold. */
+static struct Packet* cache_only_answer(const struct Packet* pkt)
+{
+    if (!g_answer_cache || pkt->q_class != CLASS_IN) return NULL;
+    return answer_cache_get(g_answer_cache, pkt->full_domain, pkt->q_type);
+}
 
-    char client_ip_buf[INET6_ADDRSTRLEN];
-    uint16_t client_port_val;
-    if (ctx->client_addr.ss_family == AF_INET6) {
-        inet_ntop(AF_INET6,
-                  &((struct sockaddr_in6*)&ctx->client_addr)->sin6_addr,
-                  client_ip_buf, sizeof(client_ip_buf));
-        client_port_val = ntohs(((struct sockaddr_in6*)&ctx->client_addr)->sin6_port);
-    } else {
-        inet_ntop(AF_INET,
-                  &((struct sockaddr_in*)&ctx->client_addr)->sin_addr,
-                  client_ip_buf, sizeof(client_ip_buf));
-        client_port_val = ntohs(((struct sockaddr_in*)&ctx->client_addr)->sin_port);
-    }
+/*
+ * Resolve one client query and return the malloc'd reply (NULL = send
+ * nothing).  UDP replies are trimmed to the client's size; TCP replies are
+ * sent whole.
+ */
+static char* answer_query(char* buf, ssize_t len, const char* ip, uint16_t port,
+                          bool tcp, ssize_t* out_len)
+{
+    *out_len = 0;
+    /* QR=1 is a response: answering it invites reflection loops. */
+    if (len >= 3 && (buf[2] & 0x80)) return NULL;
 
-    const struct sockaddr* caddr = (const struct sockaddr*)&ctx->client_addr;
-
-    /* A QR=1 datagram is a response, not a query: never answer it (answering
-     * responses invites reflection loops between two servers). */
-    if (ctx->recv_len >= 3 && (ctx->buffer[2] & 0x80)) { free(ctx); return NULL; }
-
-    struct Packet* pkt = parse_request_headers(ctx->buffer, ctx->recv_len);
+    struct Packet* pkt = parse_request_headers(buf, len);
     if (!pkt) {
-        fprintf(stderr, "Failed to parse request from %s\n", client_ip_buf);
-        send_error_rcode(ctx->dns_sock, caddr, ctx->client_addr_len,
-                         (unsigned char*)ctx->buffer, ctx->recv_len, RCODE_FORMAT_ERROR);
-        free(ctx);
-        return NULL;
+        fprintf(stderr, "Failed to parse request from %s\n", ip);
+        return error_reply(buf, len, RCODE_FORMAT_ERROR, out_len);
     }
 
-    // Non-standard opcode (NOTIMP) and pre-set parser errors (e.g. FORMERR for
-    // an invalid QCLASS): reply with that RCODE, echoing the question.
-    if (pkt->rcode != 0) {
-        send_error_rcode(ctx->dns_sock, caddr, ctx->client_addr_len,
-                         (unsigned char*)ctx->buffer, ctx->recv_len, pkt->rcode);
-        free_packet(pkt); free(ctx);
-        return NULL;
-    }
+    char* reply = NULL;
+    struct Packet* query = NULL;
+    struct Packet* ret = NULL;
 
-    // Unsupported EDNS version: send BADVERS (RFC 6891 §6.1.3)
+    if (pkt->rcode != 0) {                        /* NOTIMP / FORMERR from the parser */
+        reply = error_reply(buf, len, pkt->rcode, out_len);
+        goto done;
+    }
     if (pkt->edns_present && pkt->edns_version > 0) {
-        // BADVERS = 16 (0x10): upper 8 bits go in OPT TTL extended-RCODE field (= 1),
-        // lower 4 bits in header RCODE = 0
-        unsigned char bv[23] = {0};
-        bv[0] = (unsigned char)ctx->buffer[0];
-        bv[1] = (unsigned char)ctx->buffer[1];
-        bv[2] = 0x80;                   // QR=1
-        bv[3] = 0x00;                   // header RCODE = 0 (extended portion in OPT)
-        bv[11] = 1;                     // ARCOUNT = 1
-        bv[12] = 0x00;                  // OPT owner = root
-        bv[13] = 0x00; bv[14] = 0x29;  // TYPE = OPT (41)
-        bv[15] = 0x02; bv[16] = 0x00;  // CLASS = 512 (UDP payload size)
-        bv[17] = 0x01;                  // Extended RCODE upper 8 bits = 1 → BADVERS=16
-        bv[18] = 0x00;                  // EDNS Version = 0
-        bv[19] = 0x00; bv[20] = 0x00;  // Flags = 0
-        bv[21] = 0x00; bv[22] = 0x00;  // RDLEN = 0
-        sendto(ctx->dns_sock, bv, sizeof(bv), 0, caddr, ctx->client_addr_len);
-        free_packet(pkt); free(ctx);
-        return NULL;
+        unsigned char bv[ERROR_REPLY_MAX];
+        int n = build_badvers_reply((unsigned char*)buf, len, pkt->do_bit, bv, sizeof(bv));
+        if (n > 0 && (reply = malloc((size_t)n))) {
+            memcpy(reply, bv, (size_t)n);
+            *out_len = n;
+        }
+        goto done;
+    }
+    count_query(pkt->q_type);
+
+    /* The client's DO/CD decide whether we validate (RFC 4035 §3.2.2); the
+     * wire query itself always asks for DNSSEC data. */
+    query = build_query(pkt->full_domain, pkt->q_type, pkt->q_class);
+    if (query) {
+        query->do_bit = pkt->do_bit;
+        query->cd     = pkt->cd;
+        ret = pkt->rd ? send_resolver(query) : cache_only_answer(pkt);
+    }
+    if (!ret || !ret->request || ret->recv_len < HEADER_LEN) {
+        /* SERVFAIL either way.  An RD=0 miss is "I could not answer this one",
+         * which is what 1.1.1.1 and 8.8.8.8 return; REFUSED would mean "I will
+         * not serve you" and can make a stub drop the server entirely. */
+        int rc = RCODE_SERVER_FAILURE;
+        if (pkt->rd) fprintf(stderr, "Failed to resolve %s\n", pkt->full_domain);
+        log_query(ip, port, pkt->q_type, pkt->full_domain, (uint8_t)rc, NULL);
+        reply = error_reply(buf, len, rc, out_len);
+        goto done;
     }
 
-    if (!pkt->full_domain) {
-        fprintf(stderr, "No domain in request from %s\n", client_ip_buf);
-        send_servfail(ctx->dns_sock, caddr, ctx->client_addr_len,
-                      (unsigned char*)ctx->buffer, ctx->recv_len);
-        free_packet(pkt);
-        free(ctx);
-        return NULL;
-    }
-
-    /* Count this query. */
-    atomic_fetch_add(&g_total_queries, 1);
-    {
-        uint8_t idx = (pkt->q_type < 256) ? (uint8_t)pkt->q_type : 0;
-        atomic_fetch_add(&g_qtype_counters[idx], 1);
-    }
-
-    struct Packet* answer = format_resolver(pkt);
-    if (!answer) {
-        fprintf(stderr, "Failed to format resolver for %s\n", pkt->full_domain);
-        send_servfail(ctx->dns_sock, caddr, ctx->client_addr_len,
-                      (unsigned char*)ctx->buffer, ctx->recv_len);
-        free_packet(pkt);
-        free(ctx);
-        return NULL;
-    }
-
-    /* Carry the client's DNSSEC intent (DO/CD) onto the resolver query so
-     * validation runs only when the client asked for it (RFC 4035 §3.2.2).
-     * format_resolver()/set_packet_fields() zero these on the outgoing wire
-     * query, so we copy them from the parsed client request here. */
-    answer->do_bit = pkt->do_bit;
-    answer->cd     = pkt->cd;
-
-    struct Packet* ret = send_resolver(answer);
-    if (!ret) {
-        fprintf(stderr, "Failed to resolve %s\n", pkt->full_domain);
-        log_query(client_ip_buf, client_port_val, pkt->q_type, pkt->full_domain,
-                  RCODE_SERVER_FAILURE, NULL);
-        send_servfail(ctx->dns_sock, caddr, ctx->client_addr_len,
-                      (unsigned char*)ctx->buffer, ctx->recv_len);
-        free_packet(pkt);
-        free_packet(answer);
-        free(ctx);
-        return NULL;
-    }
-
-    // Update transaction ID to match client's
-    ret->id = pkt->id;
-    if (ret->request && ret->recv_len >= 2) {
-        ((unsigned char*)ret->request)[0] = (ret->id >> 8) & 0xFF;
-        ((unsigned char*)ret->request)[1] = ret->id & 0xFF;
-    }
-
-    // Present our own recursive-resolver flags, not the upstream authority's
-    // (clear AA, set RA, echo client RD) — RFC 1035 §4.1.1.
-    normalize_forwarded_flags((unsigned char*)ret->request, ret->recv_len, pkt->rd);
-
-    // A client that did not set DO must not receive DNSSEC records / AD / DO
-    // (RFC 4035 §3.2.1) — we validated upstream with DO=1, now strip on the way
-    // out so the answer matches a plain resolver (e.g. 1.1.1.1).
+    wr16(ret->request, pkt->id);
+    normalize_forwarded_flags((unsigned char*)ret->request, ret->recv_len, pkt->rd, pkt->cd);
+    restore_question_case((unsigned char*)ret->request, ret->recv_len,
+                          (const unsigned char*)buf, len);
+    /* We fetched with DO=1; a non-DO client gets a plain answer (RFC 4035 §3.2.1). */
     if (!pkt->do_bit)
         strip_dnssec_for_non_do(&ret->request, &ret->recv_len, pkt->q_type);
+    if (!tcp)
+        finalize_udp_truncation(&ret->request, &ret->recv_len,
+                                pkt->edns_present ? (pkt->edns_udp_size ? pkt->edns_udp_size : 512) : 0,
+                                pkt->do_bit);
+    else if (pkt->edns_present)
+        ensure_edns_opt(&ret->request, &ret->recv_len, pkt->do_bit);
 
-    // EDNS-aware TC truncation + OPT echo (RFC 6891 §7), shared with the
-    // cache fast path.  Pass the client's UDP size (0 = no EDNS → 512 limit).
-    finalize_udp_truncation(&ret->request, &ret->recv_len,
-                            pkt->edns_present
-                                ? (pkt->edns_udp_size ? pkt->edns_udp_size : 512)
-                                : 0);
+    log_query(ip, port, pkt->q_type, pkt->full_domain, (uint8_t)(ret->request[3] & 0x0F), NULL);
+    reply = ret->request;
+    *out_len = ret->recv_len;
+    ret->request = NULL;
 
-    // Log and send response
-    {
-        uint8_t ans_rcode = (ret->recv_len >= HEADER_LEN && ret->request)
-            ? (uint8_t)(rd16(ret->request + 2) & 0xF) : 0;
-        log_query(client_ip_buf, client_port_val, pkt->q_type,
-                  pkt->full_domain, ans_rcode, NULL);
-    }
-
-    if (ret->request && ret->recv_len > 0) {
-        sendto(ctx->dns_sock, ret->request, ret->recv_len, 0,
-               caddr, ctx->client_addr_len);
-    }
-
+done:
     free_packet(ret);
-    free_packet(answer);
+    free_packet(query);
     free_packet(pkt);
+    return reply;
+}
+
+void* process_query(void* arg)
+{
+    struct QueryContext* ctx = arg;
+    char ip[INET6_ADDRSTRLEN];
+    uint16_t port;
+    sockaddr_to_ip(&ctx->client_addr, ip, &port);
+
+    ssize_t n;
+    char* reply = answer_query(ctx->buffer, ctx->recv_len, ip, port, false, &n);
+    if (reply)
+        sendto(ctx->dns_sock, reply, (size_t)n, 0,
+               (const struct sockaddr*)&ctx->client_addr, ctx->client_addr_len);
+    free(reply);
     free(ctx);
     return NULL;
 }
 
-/*
- * Worker function for TCP queries.
- * Reads DNS-over-TCP messages (2-byte length prefix + payload) and resolves
- * them iteratively. Supports connection reuse / pipelining (RFC 7766).
- */
-void* process_tcp_query(void* arg) {
-    struct TCPQueryContext* ctx = (struct TCPQueryContext*)arg;
+/* Idle clients are cut off after TCP_IDLE_TIMEOUT (each holds a worker);
+ * keepalive reaps dead half-open peers (RFC 7766 §6.2.3). */
+static void tune_client_socket(int fd)
+{
+    struct timeval rtv = { .tv_sec = TCP_IDLE_TIMEOUT };
+    struct timeval wtv = { .tv_sec = SOCKET_TIMEOUT };
+    int on = 1, idle = 60, intvl = 10, cnt = 3;
+    setsockopt(fd, SOL_SOCKET,  SO_RCVTIMEO,   &rtv,   sizeof(rtv));
+    setsockopt(fd, SOL_SOCKET,  SO_SNDTIMEO,   &wtv,   sizeof(wtv));
+    setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE,  &on,    sizeof(on));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+}
+
+/* Pipelined DNS-over-TCP (RFC 7766): serve messages until EOF or timeout. */
+void* process_tcp_query(void* arg)
+{
+    struct TCPQueryContext* ctx = arg;
     int fd = ctx->client_fd;
+    char ip[INET6_ADDRSTRLEN];
+    uint16_t port;
+    sockaddr_to_ip(&ctx->client_ss, ip, &port);
+    tune_client_socket(fd);
 
-    /* Guard against slow and idle clients: each connection holds a TCP worker,
-     * so one that sits silent is closed within TCP_IDLE_TIMEOUT (RFC 7766
-     * §6.2.3).  Real clients send their query immediately. */
-    struct timeval rtv = { .tv_sec = TCP_IDLE_TIMEOUT, .tv_usec = 0 };
-    struct timeval wtv = { .tv_sec = SOCKET_TIMEOUT,   .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &wtv, sizeof(wtv));
+    for (;;) {
+        uint8_t prefix[2];
+        if (recv(fd, prefix, 2, MSG_WAITALL) != 2) break;
+        uint16_t len = rd16(prefix);
+        if (len < HEADER_LEN) break;
 
-    // SO_KEEPALIVE: detect dead half-open connections (RFC 7766 §6.2.3)
-    int ka = 1;
-    setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE,  &ka,  sizeof(ka));
-    int ka_idle = 60, ka_intvl = 10, ka_cnt = 3;
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &ka_idle,  sizeof(ka_idle));
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &ka_intvl, sizeof(ka_intvl));
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &ka_cnt,   sizeof(ka_cnt));
+        /* RFC 7766: a TCP message may be up to 65535 bytes, far above the UDP
+         * receive buffer.  Size the read to the length prefix rather than
+         * capping at MAXLINE, which dropped a large query AND tore down the
+         * connection instead of answering it. */
+        char* buf = malloc(len);
+        if (!buf) break;
+        if (recv(fd, buf, len, MSG_WAITALL) != len) { free(buf); break; }
 
-    /* RFC 7766: process multiple queries on one TCP connection (pipelining).
-     * Loop until EOF, timeout (RCVTIMEO fires), or a hard error. */
-    while (1) {
-        // DNS-over-TCP: read 2-byte length prefix
-        uint16_t msg_len_net;
-        ssize_t n = recv(fd, &msg_len_net, 2, MSG_WAITALL);
-        if (n != 2) break;  // EOF or timeout → close connection
-
-        uint16_t msg_len = ntohs(msg_len_net);
-        if (msg_len < HEADER_LEN || msg_len > MAXLINE) break;
-
-        char* buffer = malloc(msg_len);
-        if (!buffer) break;
-
-        n = recv(fd, buffer, msg_len, MSG_WAITALL);
-        if (n != msg_len) { free(buffer); break; }
-
-        if (buffer[2] & 0x80) { free(buffer); continue; }   /* a response — ignore */
-
-        struct Packet* pkt = parse_request_headers(buffer, msg_len);
-        if (!pkt) {
-            send_error_tcp(fd, (unsigned char*)buffer, msg_len, RCODE_FORMAT_ERROR);
-            free(buffer); continue;
-        }
-
-        // NOTIMP / FORMERR set by the parser: reply, then continue pipelining
-        if (pkt->rcode != 0) {
-            send_error_tcp(fd, (unsigned char*)buffer, msg_len, pkt->rcode);
-            free_packet(pkt); free(buffer); continue;
-        }
-
-        if (!pkt->full_domain) {
-            send_error_tcp(fd, (unsigned char*)buffer, msg_len, RCODE_SERVER_FAILURE);
-            free_packet(pkt); free(buffer); continue;
-        }
-
-        struct Packet* answer = format_resolver(pkt);
-        if (!answer) {
-            send_error_tcp(fd, (unsigned char*)buffer, msg_len, RCODE_SERVER_FAILURE);
-            free_packet(pkt); free(buffer); continue;
-        }
-
-        /* Carry the client's DNSSEC intent (DO/CD) onto the resolver query
-         * (see process_query() for rationale). */
-        answer->do_bit = pkt->do_bit;
-        answer->cd     = pkt->cd;
-
-        struct Packet* ret = send_resolver(answer);
-        if (!ret) {
-            log_query(ctx->client_ip, ctx->client_port, pkt->q_type,
-                      pkt->full_domain, RCODE_SERVER_FAILURE, NULL);
-            // Send SERVFAIL to client so it gets an answer rather than timing out
-            send_error_tcp(fd, (unsigned char*)buffer, msg_len, RCODE_SERVER_FAILURE);
-            free_packet(pkt); free_packet(answer); free(buffer);
-            continue;
-        }
-
-        // Update transaction ID to match client's
-        ret->id = pkt->id;
-        if (ret->request && ret->recv_len >= 2) {
-            ((unsigned char*)ret->request)[0] = (ret->id >> 8) & 0xFF;
-            ((unsigned char*)ret->request)[1] = ret->id & 0xFF;
-        }
-        // Present our own recursive-resolver flags, not the upstream authority's
-        // (clear AA, set RA, echo client RD) — RFC 1035 §4.1.1.
-        normalize_forwarded_flags((unsigned char*)ret->request, ret->recv_len, pkt->rd);
-        // Strip DNSSEC machinery for a non-DO client (RFC 4035 §3.2.1).
-        if (!pkt->do_bit)
-            strip_dnssec_for_non_do(&ret->request, &ret->recv_len, pkt->q_type);
-        // No TC over TCP (no 512-byte limit), but an EDNS client must still get
-        // an OPT RR back (RFC 6891 §7) — rebuilt CNAME answers carry none.
-        if (pkt->edns_present) ensure_edns_opt(&ret->request, &ret->recv_len, pkt->do_bit);
-
-        {
-            uint8_t ans_rcode = (ret->recv_len >= HEADER_LEN && ret->request)
-                ? (uint8_t)(rd16(ret->request + 2) & 0xF) : 0;
-            log_query(ctx->client_ip, ctx->client_port, pkt->q_type,
-                      pkt->full_domain, ans_rcode, NULL);
-        }
-
-        // Send TCP response: 2-byte length prefix + payload
-        if (ret->request && ret->recv_len > 0) {
-            uint16_t resp_len = htons((uint16_t)ret->recv_len);
-            const uint8_t* p = (const uint8_t*)&resp_len;
-            size_t rem = 2;
-            bool send_ok = true;
-            while (rem > 0) {
-                ssize_t nw = write(fd, p, rem);
-                if (nw <= 0) { send_ok = false; break; }
-                p += nw; rem -= (size_t)nw;
-            }
-            if (send_ok) {
-                p = (const uint8_t*)ret->request;
-                rem = (size_t)ret->recv_len;
-                while (rem > 0) {
-                    ssize_t nw = write(fd, p, rem);
-                    if (nw <= 0) break;
-                    p += nw; rem -= (size_t)nw;
-                }
-            }
-        }
-
-        free_packet(ret);
-        free_packet(answer);
-        free_packet(pkt);
-        free(buffer);
+        ssize_t n;
+        char* reply = answer_query(buf, len, ip, port, true, &n);
+        free(buf);
+        if (reply) tcp_send_msg(fd, reply, (size_t)n);
+        free(reply);
     }
 
     close(fd);
+    tcp_conn_release(&ctx->client_ss);
     free(ctx);
     return NULL;
 }

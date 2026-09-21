@@ -34,60 +34,43 @@ struct AuthDomain {
     bool     is_wildcard;      // true → domain is "*.parent.zone"
     uint32_t ttl;              // Per-record TTL override (0 = DEFAULT_RECORD_TTL)
 
-    // A record (plain IPv4)
-    char     ip[16];           // "0.0.0.0" if not an A record
+    // Record type flags: exactly one is set.
+    bool     has_a, has_ipv6, has_cname, has_mx, has_ns, has_txt, has_srv,
+             has_https, has_soa;
 
-    // AAAA record
-    bool     has_ipv6;
-    char     ipv6[40];
+    // A record address (valid only when has_a).  A record carried no flag of
+    // its own and was identified by ip[] not holding the placeholder
+    // "0.0.0.0", which made a deliberate null-route "A 0.0.0.0" unservable.
+    char     ip[16];
 
-    // CNAME record
-    bool     has_cname;
-    char     cname_target[256];
-
-    // MX record
-    bool     has_mx;
-    char     mx_hostname[256];
-    uint16_t mx_priority;
-
-    // NS record
-    bool     has_ns;
-    char     ns_name[256];
-
-    // TXT record (one RR per entry; multiple entries = RRset)
-    bool     has_txt;
-    char     txt_data[512];        // presentation form (for logs)
-    unsigned char txt_wire[512];   // RDATA: one or more <len><bytes> strings
-    uint16_t txt_wire_len;
-
-    // SRV record (_service._proto.owner)
-    bool     has_srv;
-    uint16_t srv_priority;
-    uint16_t srv_weight;
-    uint16_t srv_port;
-    char     srv_target[256];
-
-    // HTTPS record (RFC 9460) — priority + TargetName, no SvcParams
-    bool     has_https;
-    uint16_t https_priority;
-    char     https_target[256];  // "." means same-as-owner (root label)
-
-    // SOA record fields (RFC 1035 §3.3.13, RFC 2308)
-    bool     has_soa;
-    char     soa_mname[256];
-    char     soa_rname[256];
-    uint32_t soa_serial;
-    uint32_t soa_refresh;
-    uint32_t soa_retry;
-    uint32_t soa_expire;
-    uint32_t soa_minimum;   // Negative-caching TTL (RFC 2308 §5)
-    uint32_t soa_ttl;       // TTL for the SOA RR itself
+    /* Type-specific data.  Only the member matching the has_* flag is valid;
+     * sharing storage keeps each record ~1 KB instead of ~3 KB. */
+    union {
+        char ipv6[INET6_ADDRSTRLEN];                 // AAAA (46: the
+                                                     //  longest form is
+                                                     //  "…:255.255.255.255")
+        char cname_target[256];                      // CNAME
+        struct { char mx_hostname[256];  uint16_t mx_priority; };    // MX
+        char ns_name[256];                           // NS
+        struct { unsigned char txt_wire[512];        // TXT RDATA: one or
+                 uint16_t txt_wire_len; };           //  more <len><bytes>
+        struct { uint16_t srv_priority, srv_weight, srv_port;         // SRV
+                 char srv_target[256]; };
+        struct { uint16_t https_priority;            // HTTPS (RFC 9460)
+                 char https_target[256]; };          //  "." = owner itself
+        struct { char soa_mname[256];                // SOA (RFC 1035
+                 char soa_rname[256];                //  §3.3.13, RFC 2308)
+                 uint32_t soa_serial, soa_refresh, soa_retry, soa_expire;
+                 uint32_t soa_minimum;               // negative-caching TTL
+                 uint32_t soa_ttl; };                // TTL of the SOA RR
+    };
 };
 
-/* The authoritative record store. Defined in auth_zonefile.c (which owns
- * loading); the serving path (check_internal) reads it. Guard with
+/* The authoritative record store: a heap array sorted by owner name (records
+ * of one owner are contiguous, in file order).  Defined in auth_zonefile.c,
+ * which owns loading; swapped as a whole on reload.  Guard with
  * g_auth_domains_lock. */
-extern struct AuthDomain auth_domains[];
+extern struct AuthDomain *auth_domains;
 extern int auth_domain_count;
 
 /* Check if domain should be handled authoritatively.
@@ -101,8 +84,5 @@ int load_auth_domains(const char* filename);
 /* Reload under write-lock (SIGHUP handler). */
 void reload_auth_domains(const char* filename);
 
-/* Thread-safe A-record lookup.
- * Returns IP string, or NULL if not found. */
-const char* lookup_auth_domain(const char* full_domain);
 
 #endif // AUTH_H

@@ -1,326 +1,187 @@
 #include "thread_pool.h"
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
 
-// Work queue node
+#include <stdio.h>
+#include <stdlib.h>
+
 struct WorkItem {
     work_func_t func;
     void* arg;
     struct WorkItem* next;
 };
 
-// Thread pool structure
 struct ThreadPool {
     pthread_t* threads;
     int num_threads;
 
-    // Work queue
-    struct WorkItem* work_queue_head;
-    struct WorkItem* work_queue_tail;
+    struct WorkItem* head;          /* FIFO work queue */
+    struct WorkItem* tail;
     int queue_size;
     int max_queue_size;
+    struct WorkItem* freelist;      /* recycled items: no malloc per enqueue */
 
-    // Pre-allocated WorkItem free-list: eliminates malloc/free per enqueue.
-    // Guarded by queue_mutex (same lock as the work queue).
-    struct WorkItem* item_freelist;
+    pthread_mutex_t lock;           /* guards everything above and below */
+    pthread_cond_t  work_available;
+    pthread_cond_t  work_done;
 
-    // Synchronization
-    pthread_mutex_t queue_mutex;
-    pthread_cond_t work_available;
-    pthread_cond_t work_done;
-
-    // State
     bool shutdown;
-    int active_workers;
-
-    // Statistics
-    int completed_work;
-    int rejected_work;
+    int  active_workers;
+    int  completed_work;
+    int  rejected_work;
 };
 
-/*
- * Worker thread main loop — waits on the queue condition variable and
- * executes work items until pool->shutdown is set.
- */
-static void* worker_thread(void* arg) {
-    struct ThreadPool* pool = (struct ThreadPool*)arg;
-    
-    while (1) {
-        pthread_mutex_lock(&pool->queue_mutex);
-        
-        // Wait for work or shutdown signal
-        while (pool->work_queue_head == NULL && !pool->shutdown) {
-            pthread_cond_wait(&pool->work_available, &pool->queue_mutex);
-        }
-        
-        // Check for shutdown
-        if (pool->shutdown && pool->work_queue_head == NULL) {
-            pthread_mutex_unlock(&pool->queue_mutex);
-            break;
-        }
-        
-        // Get work item from queue
-        struct WorkItem* item = pool->work_queue_head;
-        if (item) {
-            pool->work_queue_head = item->next;
-            if (pool->work_queue_tail == item) {
-                pool->work_queue_tail = NULL;
-            }
-            pool->queue_size--;
-            pool->active_workers++;
-        }
-        
-        pthread_mutex_unlock(&pool->queue_mutex);
-        
-        // Execute work (outside of lock to allow other threads to run)
-        if (item) {
-            item->func(item->arg);
-
-            // Return item to freelist instead of freeing; update stats.
-            pthread_mutex_lock(&pool->queue_mutex);
-            pool->active_workers--;
-            pool->completed_work++;
-            item->next = pool->item_freelist;
-            pool->item_freelist = item;
-            pthread_cond_signal(&pool->work_done);
-            pthread_mutex_unlock(&pool->queue_mutex);
-        }
+static void free_items(struct WorkItem* item)
+{
+    while (item) {
+        struct WorkItem* next = item->next;
+        free(item);
+        item = next;
     }
-    
+}
+
+static void recycle_item(struct ThreadPool* pool, struct WorkItem* item)
+{
+    item->next = pool->freelist;
+    pool->freelist = item;
+}
+
+static void* worker_thread(void* arg)
+{
+    struct ThreadPool* pool = arg;
+    pthread_mutex_lock(&pool->lock);
+    for (;;) {
+        while (!pool->head && !pool->shutdown)
+            pthread_cond_wait(&pool->work_available, &pool->lock);
+        if (!pool->head) break;                         /* shutdown, queue drained */
+
+        struct WorkItem* item = pool->head;
+        pool->head = item->next;
+        if (!pool->head) pool->tail = NULL;
+        pool->queue_size--;
+        pool->active_workers++;
+        pthread_mutex_unlock(&pool->lock);
+
+        item->func(item->arg);
+
+        pthread_mutex_lock(&pool->lock);
+        pool->active_workers--;
+        pool->completed_work++;
+        recycle_item(pool, item);
+        pthread_cond_signal(&pool->work_done);
+    }
+    pthread_mutex_unlock(&pool->lock);
     return NULL;
 }
 
-/*
- * Allocate and start a thread pool.  Returns NULL on error.
- * config.max_queue_size = 0 means unlimited queue depth.
- * Caller must call threadpool_destroy() when done.
- */
-struct ThreadPool* threadpool_create(struct ThreadPoolConfig config) {
+/* Signal shutdown and join the first `started` workers. */
+static void stop_workers(struct ThreadPool* pool, int started)
+{
+    pthread_mutex_lock(&pool->lock);
+    pool->shutdown = true;
+    pthread_cond_broadcast(&pool->work_available);
+    pthread_mutex_unlock(&pool->lock);
+    for (int i = 0; i < started; i++)
+        pthread_join(pool->threads[i], NULL);
+}
+
+/* Queued args are not freed: their owners' layouts are unknown here (and
+ * threadpool_wait() normally empties the queue first). */
+static void free_pool(struct ThreadPool* pool)
+{
+    free_items(pool->head);
+    free_items(pool->freelist);
+    free(pool->threads);
+    pthread_cond_destroy(&pool->work_done);
+    pthread_cond_destroy(&pool->work_available);
+    pthread_mutex_destroy(&pool->lock);
+    free(pool);
+}
+
+struct ThreadPool* threadpool_create(struct ThreadPoolConfig config)
+{
     if (config.num_threads <= 0) {
         fprintf(stderr, "Invalid thread count: %d\n", config.num_threads);
         return NULL;
     }
-    
-    struct ThreadPool* pool = calloc(1, sizeof(struct ThreadPool));
-    if (!pool) {
-        perror("Failed to allocate thread pool");
-        return NULL;
-    }
-    
-    pool->num_threads = config.num_threads;
+    struct ThreadPool* pool = calloc(1, sizeof(*pool));
+    if (!pool) return NULL;
+    pool->num_threads    = config.num_threads;
     pool->max_queue_size = config.max_queue_size;
-    pool->shutdown = false;
-    pool->active_workers = 0;
-    pool->completed_work = 0;
-    pool->rejected_work = 0;
-    
-    // Initialize synchronization primitives
-    if (pthread_mutex_init(&pool->queue_mutex, NULL) != 0) {
-        perror("Mutex init failed");
-        free(pool);
-        return NULL;
-    }
-    
-    if (pthread_cond_init(&pool->work_available, NULL) != 0) {
-        perror("Condition variable init failed");
-        pthread_mutex_destroy(&pool->queue_mutex);
-        free(pool);
-        return NULL;
-    }
-    
-    if (pthread_cond_init(&pool->work_done, NULL) != 0) {
-        perror("Condition variable init failed");
-        pthread_cond_destroy(&pool->work_available);
-        pthread_mutex_destroy(&pool->queue_mutex);
-        free(pool);
-        return NULL;
-    }
-    
-    // Pre-allocate WorkItems into the freelist.
-    // Cap at max_queue_size (or 512 if unlimited) so we don't over-allocate.
-    int prealloc = (config.max_queue_size > 0 && config.max_queue_size <= 1024)
-                   ? config.max_queue_size : 512;
+    pthread_mutex_init(&pool->lock, NULL);
+    pthread_cond_init(&pool->work_available, NULL);
+    pthread_cond_init(&pool->work_done, NULL);
+
+    /* Pre-allocate queue items (capped); more are malloc'd on demand. */
+    int prealloc = config.max_queue_size > 0 && config.max_queue_size <= 1024
+                 ? config.max_queue_size : 512;
     for (int i = 0; i < prealloc; i++) {
-        struct WorkItem* wi = malloc(sizeof(struct WorkItem));
-        if (!wi) break;  // non-fatal: will fall back to malloc on demand
-        wi->next = pool->item_freelist;
-        pool->item_freelist = wi;
+        struct WorkItem* wi = malloc(sizeof(*wi));
+        if (!wi) break;
+        recycle_item(pool, wi);
     }
 
-    // Create worker threads
-    pool->threads = calloc(pool->num_threads, sizeof(pthread_t));
+    pool->threads = calloc((size_t)pool->num_threads, sizeof(pthread_t));
     if (!pool->threads) {
-        perror("Failed to allocate thread array");
-        pthread_cond_destroy(&pool->work_done);
-        pthread_cond_destroy(&pool->work_available);
-        pthread_mutex_destroy(&pool->queue_mutex);
-        free(pool);
+        free_pool(pool);
         return NULL;
     }
-    
     for (int i = 0; i < pool->num_threads; i++) {
         if (pthread_create(&pool->threads[i], NULL, worker_thread, pool) != 0) {
             perror("Failed to create worker thread");
-            pool->shutdown = true;
-            pthread_cond_broadcast(&pool->work_available);
-            
-            // Wait for already created threads
-            for (int j = 0; j < i; j++) {
-                pthread_join(pool->threads[j], NULL);
-            }
-            
-            free(pool->threads);
-            pthread_cond_destroy(&pool->work_done);
-            pthread_cond_destroy(&pool->work_available);
-            pthread_mutex_destroy(&pool->queue_mutex);
-            free(pool);
+            stop_workers(pool, i);
+            free_pool(pool);
             return NULL;
         }
     }
-    
     printf("Thread pool created with %d worker threads\n", pool->num_threads);
     return pool;
 }
 
-/*
- * Enqueue a work item.  Returns 0 on success, -1 if the pool is shut down,
- * the queue is full, or allocation fails.
- */
-int threadpool_add_work(struct ThreadPool* pool, work_func_t func, void* arg) {
-    if (!pool || !func) {
-        return -1;
-    }
-    
-    pthread_mutex_lock(&pool->queue_mutex);
+int threadpool_add_work(struct ThreadPool* pool, work_func_t func, void* arg)
+{
+    if (!pool || !func) return -1;
 
-    // Pop a pre-allocated item from the freelist; fall back to malloc if empty.
-    struct WorkItem* item = pool->item_freelist;
-    if (item) {
-        pool->item_freelist = item->next;
-    } else {
-        pthread_mutex_unlock(&pool->queue_mutex);
-        item = malloc(sizeof(struct WorkItem));
-        if (!item) {
-            perror("Failed to allocate work item");
-            return -1;
-        }
-        pthread_mutex_lock(&pool->queue_mutex);
-    }
-
-    item->func = func;
-    item->arg = arg;
-    item->next = NULL;
-    
-    // Check if shutting down
+    pthread_mutex_lock(&pool->lock);
     if (pool->shutdown) {
-        item->next = pool->item_freelist;
-        pool->item_freelist = item;
-        pthread_mutex_unlock(&pool->queue_mutex);
+        pthread_mutex_unlock(&pool->lock);
         return -1;
     }
-
-    // Check queue size limit
     if (pool->max_queue_size > 0 && pool->queue_size >= pool->max_queue_size) {
         pool->rejected_work++;
-        item->next = pool->item_freelist;
-        pool->item_freelist = item;
-        pthread_mutex_unlock(&pool->queue_mutex);
+        pthread_mutex_unlock(&pool->lock);
         fprintf(stderr, "Work queue full, rejecting work\n");
         return -1;
     }
-    
-    // Add to queue
-    if (pool->work_queue_tail) {
-        pool->work_queue_tail->next = item;
-    } else {
-        pool->work_queue_head = item;
+    struct WorkItem* item = pool->freelist;
+    if (item) pool->freelist = item->next;
+    else if (!(item = malloc(sizeof(*item)))) {
+        pthread_mutex_unlock(&pool->lock);
+        return -1;
     }
-    pool->work_queue_tail = item;
+
+    *item = (struct WorkItem){ func, arg, NULL };
+    if (pool->tail) pool->tail->next = item;
+    else            pool->head = item;
+    pool->tail = item;
     pool->queue_size++;
-    
-    // Signal a worker thread
     pthread_cond_signal(&pool->work_available);
-    pthread_mutex_unlock(&pool->queue_mutex);
-    
+    pthread_mutex_unlock(&pool->lock);
     return 0;
 }
 
-/*
- * Block until the work queue is empty and all workers are idle.
- */
-void threadpool_wait(struct ThreadPool* pool) {
+void threadpool_wait(struct ThreadPool* pool)
+{
     if (!pool) return;
-    
-    pthread_mutex_lock(&pool->queue_mutex);
-    
-    while (pool->work_queue_head != NULL || pool->active_workers > 0) {
-        pthread_cond_wait(&pool->work_done, &pool->queue_mutex);
-    }
-    
-    pthread_mutex_unlock(&pool->queue_mutex);
+    pthread_mutex_lock(&pool->lock);
+    while (pool->head || pool->active_workers > 0)
+        pthread_cond_wait(&pool->work_done, &pool->lock);
+    pthread_mutex_unlock(&pool->lock);
 }
 
-/*
- * Signal all workers to shut down, join them, and free all resources.
- * After this call the pool pointer is invalid.
- */
-void threadpool_destroy(struct ThreadPool* pool) {
+void threadpool_destroy(struct ThreadPool* pool)
+{
     if (!pool) return;
-    
-    // Signal shutdown
-    pthread_mutex_lock(&pool->queue_mutex);
-    pool->shutdown = true;
-    pthread_cond_broadcast(&pool->work_available);
-    pthread_mutex_unlock(&pool->queue_mutex);
-    
-    // Wait for all threads to finish
-    for (int i = 0; i < pool->num_threads; i++) {
-        pthread_join(pool->threads[i], NULL);
-    }
-    
-    /* Free remaining work items.  DO NOT free item->arg — each arg is a
-     * UDPQueryContext/TCPQueryContext whose sub-allocations we can't know.
-     * threadpool_wait() is always called before destroy, draining the queue,
-     * so this loop is dead code in practice. */
-    struct WorkItem* item = pool->work_queue_head;
-    while (item) {
-        struct WorkItem* next = item->next;
-        free(item);
-        item = next;
-    }
-
-    // Free the pre-allocated WorkItem freelist.
-    item = pool->item_freelist;
-    while (item) {
-        struct WorkItem* next = item->next;
-        free(item);
-        item = next;
-    }
-
-    // Cleanup
-    free(pool->threads);
-    pthread_cond_destroy(&pool->work_done);
-    pthread_cond_destroy(&pool->work_available);
-    pthread_mutex_destroy(&pool->queue_mutex);
-    
+    stop_workers(pool, pool->num_threads);
     printf("Thread pool destroyed. Completed: %d, Rejected: %d\n",
            pool->completed_work, pool->rejected_work);
-    
-    free(pool);
-}
-
-/*
- * Thread-safe snapshot of pool statistics (active workers, queue depth,
- * completed and rejected task counts).
- */
-void threadpool_get_stats(struct ThreadPool* pool, struct ThreadPoolStats* stats) {
-    if (!pool || !stats) return;
-    
-    pthread_mutex_lock(&pool->queue_mutex);
-    stats->active_threads = pool->active_workers;
-    stats->queued_work = pool->queue_size;
-    stats->completed_work = pool->completed_work;
-    stats->rejected_work = pool->rejected_work;
-    pthread_mutex_unlock(&pool->queue_mutex);
+    free_pool(pool);
 }

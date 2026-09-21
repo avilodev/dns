@@ -1,91 +1,51 @@
 #include "ns_resolver.h"
-#include "ns_resolution_context.h"
-#include "resolve.h"        
- 
+#include "dns_packet.h"
+#include "resolve.h"
+#include "response_handler.h"
 
-/*
- * Resolve a nameserver name to an IP address
- */
-char* resolve_ns_name(const char* ns_name, uint16_t qtype)
+#include <strings.h>
+
+bool already_resolving_ns(const NSResolutionContext* ctx, const char* ns_name)
 {
-    if (!ns_name) return NULL;
-    
-    NSResolutionContext context;
-    init_ns_context(&context);
-    
-    char* result = resolve_ns_name_internal(ns_name, qtype, &context);
-    
-    free_ns_context(&context);
-    return result;
+    if (!ctx || !ns_name) return false;
+    for (int i = 0; i < ctx->count; i++)
+        if (strcasecmp(ctx->ns_names[i], ns_name) == 0) return true;
+    return false;
 }
 
-/*
- * Internal NS resolution with depth and loop tracking
- */
-char* resolve_ns_name_internal(const char* ns_name, uint16_t qtype, 
-                               NSResolutionContext* context)
+static char* resolve_in_context(const char* ns_name, uint16_t qtype, NSResolutionContext* ctx)
 {
-    if (!ns_name || !context) return NULL;
-    
-    // Check depth limit
-    if (context->depth >= MAX_NS_RESOLUTION_DEPTH) {
+    if (ctx->depth >= MAX_NS_RESOLUTION_DEPTH || ctx->count >= MAX_NS_NAMES_TRACKED ||
+        already_resolving_ns(ctx, ns_name))
+        return NULL;
+
+    struct Packet* query = build_query(ns_name, qtype, CLASS_IN);
+    char* name = strdup(ns_name);
+    if (!query || !name) {
+        free_packet(query);
+        free(name);
         return NULL;
     }
 
-    // Check for resolution loop
-    if (already_resolving_ns(context, ns_name)) {
-        return NULL;
-    }
+    /* Track the name while its resolution is on the stack. */
+    ctx->ns_names[ctx->count++] = name;
+    ctx->depth++;
+    struct Packet* resp = send_resolver_with_ns_context(query, ctx);
+    ctx->depth--;
+    free(ctx->ns_names[--ctx->count]);
+    free_packet(query);
 
-    // Add to context
-    if (!add_ns_to_context(context, ns_name)) {
-        return NULL;
-    }
-    
-    // Increment depth
-    context->depth++;
-    
-    // Create temporary packet for NS resolution
-    struct Packet temp_query = {0};
-    temp_query.full_domain = strdup(ns_name);
-    temp_query.q_type = qtype;
-    temp_query.q_class = 1; // IN
-    
-    temp_query.request = malloc(512);
-    if (!temp_query.request) {
-        free(temp_query.full_domain);
-        context->depth--;
-        remove_ns_from_context(context, ns_name);
-        return NULL;
-    }
-    temp_query.recv_len = 512;
-    
-    // Format and construct the query
-    struct Packet* formatted = format_resolver(&temp_query);
-    free(temp_query.request);
-    free(temp_query.full_domain);
-    
-    if (!formatted) {
-        context->depth--;
-        remove_ns_from_context(context, ns_name);
-        return NULL;
-    }
-    
-    // Recursively resolve the NS name with context
-    struct Packet* ns_response = send_resolver_with_ns_context(formatted, context);
-    free_packet(formatted);
-    
-    // Decrement depth and remove from context
-    context->depth--;
-    remove_ns_from_context(context, ns_name);
-    
-    if (!ns_response || ns_response->ancount == 0) {
-        if (ns_response) free_packet(ns_response);
-        return NULL;
-    }
-    
-    // Extract IP from answer section
-    char* ip = extract_ip_from_answer(ns_response, qtype);
-    free_packet(ns_response);
+    char* ip = resp && resp->ancount > 0 ? extract_ip_from_answer(resp, qtype) : NULL;
+    free_packet(resp);
+    return ip;
+}
+
+char* resolve_ns_addr(const char* ns_name, NSResolutionContext* ctx)
+{
+    if (!ns_name) return NULL;
+    NSResolutionContext fresh = {0};
+    if (!ctx) ctx = &fresh;
+    char* ip = resolve_in_context(ns_name, QTYPE_A, ctx);
+    if (!ip) ip = resolve_in_context(ns_name, QTYPE_AAAA, ctx);   /* IPv6-only NS */
     return ip;
 }

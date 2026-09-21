@@ -4,10 +4,32 @@
 
 /* ---- Pinned paths (see utils.h) ---------------------------------------- */
 
-#define MAX_PINS 8
-static struct { char* path; char* base; int dirfd; } g_pins[MAX_PINS];
+#define MAX_PINS 32
+typedef struct { char* path; char* base; int dirfd; } Pin;
+static Pin g_pins[MAX_PINS];
 static int g_pin_count = 0;
 static pthread_mutex_t g_pin_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Parent directory of `path` into dir[cap]. */
+static void parent_dir(const char* path, char* dir, size_t cap)
+{
+    const char* slash = strrchr(path, '/');
+    if (!slash)             snprintf(dir, cap, ".");
+    else if (slash == path) snprintf(dir, cap, "/");
+    else                    snprintf(dir, cap, "%.*s", (int)(slash - path), path);
+}
+
+/* An already-pinned fd for `dir`, or -1.  Caller holds g_pin_lock.  Pins are
+ * never closed, so sharing one dirfd between several files is safe. */
+static int pinned_dirfd(const char* dir)
+{
+    char other[1024];
+    for (int i = 0; i < g_pin_count; i++) {
+        parent_dir(g_pins[i].path, other, sizeof(other));
+        if (strcmp(other, dir) == 0) return g_pins[i].dirfd;
+    }
+    return -1;
+}
 
 void path_pin(const char* path)
 {
@@ -18,16 +40,21 @@ void path_pin(const char* path)
     if (g_pin_count < MAX_PINS) {
         const char* slash = strrchr(path, '/');
         char dir[1024];
-        if (!slash)             snprintf(dir, sizeof(dir), ".");
-        else if (slash == path) snprintf(dir, sizeof(dir), "/");
-        else                    snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
-        int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        parent_dir(path, dir, sizeof(dir));
+
+        /* Files in one directory share a single dirfd. */
+        int fd = pinned_dirfd(dir);
+        bool fresh = fd < 0;
+        if (fresh) fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (fd >= 0) {
-            g_pins[g_pin_count].path  = strdup(path);
-            g_pins[g_pin_count].base  = strdup(slash ? slash + 1 : path);
-            g_pins[g_pin_count].dirfd = fd;
-            if (g_pins[g_pin_count].path && g_pins[g_pin_count].base) g_pin_count++;
-            else { free(g_pins[g_pin_count].path); free(g_pins[g_pin_count].base); close(fd); }
+            char* p = strdup(path);
+            char* b = strdup(slash ? slash + 1 : path);
+            if (p && b) {
+                g_pins[g_pin_count++] = (Pin){ p, b, fd };
+            } else {
+                free(p); free(b);
+                if (fresh) close(fd);   /* a shared dirfd stays with its owner */
+            }
         }
     }
     pthread_mutex_unlock(&g_pin_lock);
@@ -74,6 +101,15 @@ static void init_default_config(void) {
     g_config.config_path = NULL;
 }
 
+/* Replace a string option, freeing any previous value (the flag may repeat). */
+static bool set_str(char** dst, const char* val) {
+    char* copy = strdup(val);
+    if (!copy) { fprintf(stderr, "Out of memory parsing options\n"); return false; }
+    free(*dst);
+    *dst = copy;
+    return true;
+}
+
 /* Parse command-line flags (-p/-t/-u/-q/-b/-a/-r/-U) into g_config. Returns 0 on success, -1 on unknown flag. */
 int load_config(int argc, char** argv) {
     // Initialize defaults
@@ -111,8 +147,7 @@ int load_config(int argc, char** argv) {
                     fprintf(stderr, "Invalid upstream address: %s\n", optarg);
                     return -1;
                 }
-                free(g_config.upstream_dns);
-                g_config.upstream_dns = strdup(optarg);
+                if (!set_str(&g_config.upstream_dns, optarg)) return -1;
                 break;
             }
             case 'q':
@@ -124,10 +159,10 @@ int load_config(int argc, char** argv) {
                 g_config.queue_size = (int)v;
                 break;
             case 'b':
-                g_config.bind_addr = strdup(optarg);
+                if (!set_str(&g_config.bind_addr, optarg)) return -1;
                 break;
             case 'a':
-                g_config.acl_csv = strdup(optarg);
+                if (!set_str(&g_config.acl_csv, optarg)) return -1;
                 break;
             case 'r':
                 v = strtol(optarg, &end, 10);
@@ -138,13 +173,13 @@ int load_config(int argc, char** argv) {
                 g_config.rate_limit_qps = (int)v;
                 break;
             case 'U':
-                g_config.drop_user = strdup(optarg);
+                if (!set_str(&g_config.drop_user, optarg)) return -1;
                 break;
             case 'S':
-                g_config.block_mode = strdup(optarg);
+                if (!set_str(&g_config.block_mode, optarg)) return -1;
                 break;
             case 'c':
-                g_config.config_path = strdup(optarg);
+                if (!set_str(&g_config.config_path, optarg)) return -1;
                 break;
             default:
                 printf("Usage: ./bin/auth_dns <-p upstream_port> <-t thread_count> "

@@ -5,18 +5,33 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <pwd.h>
 #include <grp.h>
 #include <sys/types.h>
 
+/* PID file.  The fd stays open for the process lifetime: after the privilege
+ * drop we can no longer unlink() it from root-owned /run, but we can still
+ * truncate it through this fd on exit, so a stale PID is never left behind
+ * for the root-hints cron job to signal. */
+static int g_pid_fd = -1;
+
 /* Write PID to PID_FILE_PATH; best-effort, non-fatal. */
 void write_pid_file(void) {
-    FILE *f = fopen(PID_FILE_PATH, "w");
-    if (!f) { perror("Warning: Cannot write PID file " PID_FILE_PATH); return; }
-    fprintf(f, "%d\n", (int)getpid());
-    fclose(f);
+    g_pid_fd = open(PID_FILE_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (g_pid_fd < 0) { perror("Warning: Cannot write PID file " PID_FILE_PATH); return; }
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
+    if (write(g_pid_fd, buf, (size_t)n) != n)
+        perror("Warning: Short write to PID file " PID_FILE_PATH);
 }
-void remove_pid_file(void) { unlink(PID_FILE_PATH); }
+void remove_pid_file(void)
+{
+    /* unlink() works while still root; otherwise empty the file in place. */
+    if (unlink(PID_FILE_PATH) != 0 && g_pid_fd >= 0 && ftruncate(g_pid_fd, 0) != 0)
+        perror("Warning: Cannot clear PID file " PID_FILE_PATH);
+    if (g_pid_fd >= 0) { close(g_pid_fd); g_pid_fd = -1; }
+}
 
 /*
  * Drop from root to an unprivileged user[:group] AFTER all listening sockets
@@ -34,7 +49,10 @@ void drop_privileges(const char *spec) {
     }
 
     char buf[128];
-    snprintf(buf, sizeof(buf), "%s", spec);
+    if (snprintf(buf, sizeof(buf), "%s", spec) >= (int)sizeof(buf)) {
+        fprintf(stderr, "Error: -U value too long\n");
+        exit(EXIT_FAILURE);
+    }
     char *colon = strchr(buf, ':');
     const char *gname = NULL;
     if (colon) { *colon = '\0'; gname = colon + 1; }
