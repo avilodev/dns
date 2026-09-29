@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 struct WorkItem {
     work_func_t func;
@@ -25,8 +26,9 @@ struct ThreadPool {
 
     bool shutdown;
     int  active_workers;
-    int  completed_work;
-    int  rejected_work;
+    unsigned long long completed_work;
+    unsigned long long rejected_work;
+    time_t last_full_warn;          /* rate-limits the "queue full" warning */
 };
 
 static void free_items(struct WorkItem* item)
@@ -147,8 +149,14 @@ int threadpool_add_work(struct ThreadPool* pool, work_func_t func, void* arg)
     }
     if (pool->max_queue_size > 0 && pool->queue_size >= pool->max_queue_size) {
         pool->rejected_work++;
+        /* Once a minute at most: under overload this fires per query. */
+        time_t now = time(NULL);
+        bool warn = now - pool->last_full_warn >= 60;
+        unsigned long long rejected = pool->rejected_work;
+        if (warn) pool->last_full_warn = now;
         pthread_mutex_unlock(&pool->lock);
-        fprintf(stderr, "Work queue full, rejecting work\n");
+        if (warn)
+            fprintf(stderr, "Work queue full, rejecting work (%llu rejected so far)\n", rejected);
         return -1;
     }
     struct WorkItem* item = pool->freelist;
@@ -168,6 +176,15 @@ int threadpool_add_work(struct ThreadPool* pool, work_func_t func, void* arg)
     return 0;
 }
 
+bool threadpool_has_waiting(struct ThreadPool* pool)
+{
+    if (!pool) return false;
+    pthread_mutex_lock(&pool->lock);
+    bool waiting = pool->head != NULL;
+    pthread_mutex_unlock(&pool->lock);
+    return waiting;
+}
+
 void threadpool_wait(struct ThreadPool* pool)
 {
     if (!pool) return;
@@ -181,7 +198,7 @@ void threadpool_destroy(struct ThreadPool* pool)
 {
     if (!pool) return;
     stop_workers(pool, pool->num_threads);
-    printf("Thread pool destroyed. Completed: %d, Rejected: %d\n",
+    printf("Thread pool destroyed. Completed: %llu, Rejected: %llu\n",
            pool->completed_work, pool->rejected_work);
     free_pool(pool);
 }

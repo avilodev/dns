@@ -27,6 +27,9 @@ if diff -q "$TMP" "$DEST" > /dev/null 2>&1; then
 fi
 
 cp "$TMP" "$DEST"
+# mktemp makes its file 0600; if DEST did not exist, cp copied that mode and the
+# resolver (running as its drop user) could no longer read the hints on SIGHUP.
+chmod 644 "$DEST"
 echo "refresh-root-hints: root hints updated at $DEST"
 
 # Signal the running upstream_dns to reload hints (SIGHUP). Works for either

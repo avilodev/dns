@@ -29,4 +29,9 @@ void  path_pin(const char* path);
 int   path_open(const char* path, int flags, int mode);
 FILE* path_fopen(const char* path);   /* read-only */
 
+/* Rename between two pinned names in the SAME pinned directory (renameat), so
+ * the logger can rotate its own file after the drop.  Falls back to rename()
+ * when either name is unpinned.  Returns 0 on success. */
+int   path_rename(const char* from, const char* to);
+
 #endif /* UTILS_H */

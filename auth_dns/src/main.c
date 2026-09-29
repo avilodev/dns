@@ -14,6 +14,7 @@
 #include "auth_process.h"
 #include "auth_chase.h"
 #include "dns_name.h"
+#include "diag.h"
 
 #include <poll.h>
 #include <pthread.h>
@@ -30,6 +31,7 @@ extern ZoneKey *g_zone_keys;
 
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_reload  = 0;
+static volatile sig_atomic_t g_reopen_log = 0;
 
 static char g_config_path[256];   /* SERVER_PATH + CONFIG_FILE_PATH (config.txt) */
 
@@ -37,7 +39,7 @@ static char g_config_path[256];   /* SERVER_PATH + CONFIG_FILE_PATH (config.txt)
 static _Atomic uint64_t g_qtype_counters[256];
 static _Atomic uint64_t g_total_queries;
 
-/* Self-pipe for async-signal-safe SIGUSR2 stats dump. */
+/* Self-pipe for async-signal-safe SIGUSR1 stats dump. */
 static int stats_pipe[2] = {-1, -1};
 
 /* qtype_name() is exported from logger.c — declared in logger.h */
@@ -77,11 +79,17 @@ static void signal_handler(int signum) {
             g_reload = 1;
             break;
         case SIGUSR1:
-        case SIGUSR2:
             if (stats_pipe[1] >= 0) {
                 char b = 's';
                 if (write(stats_pipe[1], &b, 1) < 0) { /* best-effort */ }
             }
+            break;
+        /* Reopen the query log ONLY — this is what the daily archiver sends
+         * after it moves the file aside.  SIGHUP would also work but drags a
+         * full config, zone-key and blocklist reload along with it, which is
+         * far too expensive to pay once a day just to rotate a log. */
+        case SIGUSR2:
+            g_reopen_log = 1;
             break;
         default:
             break;
@@ -608,8 +616,23 @@ static void handle_udp_packet(int sock,
         if (threadpool_add_work(g_forward_pool, forward_job, job) == 0) return;
         free(job);
     }
-    /* Forwarder pool saturated: serve what we have (our CNAME) or SERVFAIL. */
-    udp_finish(&c, pkt, how == LOCAL_CHASE ? answer : (free_packet(answer), NULL));
+    /* Forwarder pool saturated: serve what we have (our CNAME) or SERVFAIL.
+     * A forward-only query still goes through the same gate as the forwarder
+     * would apply, so a flood cannot turn this path into an unmetered
+     * SERVFAIL reflector for sources outside the allow-list. */
+    if (how == LOCAL_FORWARD) {
+        free_packet(answer);
+        if (!rl_allow(&c.addr)) { free_packet(pkt); return; }        /* drop */
+        if (!acl_allows(&c.addr)) {
+            log_entry(c.ip, c.port, pkt->q_type, pkt->full_domain, RCODE_REFUSED, NULL);
+            send_error_udp(c.sock, (const struct sockaddr*)&c.addr, c.addr_len,
+                           pkt->request, pkt->recv_len, RCODE_REFUSED);
+            free_packet(pkt);
+            return;
+        }
+        answer = NULL;
+    }
+    udp_finish(&c, pkt, answer);
     free_packet(pkt);
 }
 
@@ -642,8 +665,17 @@ static void* udp_worker_thread(void *arg)
         if (n < 0) {
             if (errno_is_timeout(errno) || errno == EINTR)
                 continue;   /* timeout — re-check g_running */
-            perror("worker: recvfrom");
-            break;
+            /* Only a broken socket ends the worker.  Anything else (ENOMEM,
+             * ENOBUFS, ...) is transient: exiting would leave this
+             * SO_REUSEPORT socket bound but unread, and the kernel would keep
+             * hashing a slice of clients to it. */
+            if (errno == EBADF || errno == ENOTSOCK || errno == EINVAL) {
+                perror("worker: recvfrom");
+                break;
+            }
+            diag(DIAG_WARN, "worker: recvfrom: %s (continuing)\n", strerror(errno));
+            usleep(10000);   /* don't spin if the condition persists */
+            continue;
         }
         if (n < HEADER_LEN) continue;   /* too short to be DNS */
         handle_udp_packet(sock, &caddr, clen, buf, n);
@@ -668,6 +700,9 @@ static void tcp_send_err(void* ctx, const char* buf, ssize_t n, int rcode) {
 static void tcp_send_pkt(void* ctx, struct Packet* resp) {
     send_tcp_response(*(int*)ctx, resp);
 }
+
+/* TCP worker pool; process_tcp_query() checks it for waiting connections. */
+static struct ThreadPool* g_tcp_pool = NULL;
 
 static void* process_tcp_query(void* arg) {
     struct TCPQueryContext* ctx = (struct TCPQueryContext*)arg;
@@ -726,6 +761,7 @@ static void* process_tcp_query(void* arg) {
             send_refused_tcp(fd, buffer, msg_len);
             free_packet(pkt);
             free(buffer);
+            if (threadpool_has_waiting(g_tcp_pool)) break;
             continue;
         }
 
@@ -741,12 +777,30 @@ static void* process_tcp_query(void* arg) {
 
         free_packet(pkt);
         free(buffer);
+
+        /* Each connection holds a worker for as long as it keeps sending
+         * within TCP_IDLE_TIMEOUT, so a few clients could otherwise hold every
+         * worker indefinitely.  When other connections are queued behind us,
+         * hand the worker over after this answer (RFC 7766 §6.2.3 lets the
+         * server close; clients reconnect for further queries). */
+        if (threadpool_has_waiting(g_tcp_pool)) break;
     }
 
     close(fd);
     tcp_conn_release(&ctx->client_ss);
     free(ctx);
     return NULL;
+}
+
+/* accept() failed.  On descriptor or memory exhaustion the connection stays
+ * in the backlog, so poll() reports the listener readable again at once and
+ * the loop would spin at 100% CPU: pause briefly to let resources free up. */
+static void accept_backoff(void)
+{
+    if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+        diag(DIAG_WARN, "accept: %s; pausing TCP accepts\n", strerror(errno));
+        usleep(100000);
+    }
 }
 
 /* --- Main ---------------------------------------------------------------- */
@@ -767,7 +821,8 @@ int main(int argc, char** argv) {
         printf("Usage: ./bin/auth_dns <-p upstream_port> <-t thread_count> "
                "<-u upstream_dns> <-q queue_size> <-b bind_addr> "
                "<-a recursion_allow_cidrs> <-r per_source_qps> "
-               "<-U user[:group]> <-S block_mode> <-c config_file>\n");
+               "<-U user[:group]> <-S block_mode> <-c config_file> "
+               "<-L error|warn|info|debug>\n");
         exit(1);
     }
 
@@ -795,10 +850,14 @@ int main(int argc, char** argv) {
      * after the privilege drop can reach them even when an ancestor directory
      * (e.g. a 0700 home) is not traversable by the drop user. */
     path_pin(g_config_path);
-    path_pin(LOG_FILE_PATH);
+    log_pin_paths();
 
     /* Blocklist (the [blocklist] section of config.txt). */
-    policy_set_block_mode(g_config.block_mode);
+    if (policy_set_block_mode(g_config.block_mode) != 0) {
+        fprintf(stderr, "Error: invalid -S block mode: %s (want nxdomain|zero|<ip>)\n",
+                g_config.block_mode);
+        exit(1);
+    }
     {
         int pn = policy_load(g_config_path);
         if (pn >= 0)
@@ -811,7 +870,7 @@ int main(int argc, char** argv) {
     // Create self-pipe before setting up signals so the handler can use it.
     // Write end is O_NONBLOCK so writes in signal context never block.
     if (pipe(stats_pipe) < 0) {
-        perror("Warning: Failed to create stats pipe; SIGUSR2 stats disabled");
+        perror("Warning: Failed to create stats pipe; SIGUSR1 stats disabled");
         stats_pipe[0] = stats_pipe[1] = -1;
     } else {
         /* Both ends non-blocking: the handler must never block on write, and
@@ -864,7 +923,13 @@ int main(int argc, char** argv) {
         exit(EXIT_FAILURE);
     }
 
-    for (int i = 0; i < n_udp; i++) {
+    /* A -b that is not an IPv4 address selects IPv6 only: skip IPv4 instead
+     * of treating its (expected) failure as fatal. */
+    struct in_addr bind4;
+    bool want_v4 = !g_config.bind_addr ||
+                   inet_pton(AF_INET, g_config.bind_addr, &bind4) == 1;
+    int n_udp4 = want_v4 ? n_udp : 0;
+    for (int i = 0; i < n_udp4; i++) {
         udp4_fds[i] = create_reuseport_udp_socket(AF_INET, PORT);
         if (udp4_fds[i] < 0) {
             fprintf(stderr, "Error: bind UDP IPv4 on port %d: %s\n",
@@ -879,9 +944,23 @@ int main(int argc, char** argv) {
         udp6_fds[i] = s;
         n_udp6 = i + 1;
     }
+    if (n_udp4 == 0 && n_udp6 == 0) {
+        fprintf(stderr, "Error: no UDP listener could be bound on port %d; check -b %s\n",
+                PORT, g_config.bind_addr ? g_config.bind_addr : "");
+        exit(EXIT_FAILURE);
+    }
+    /* UDP binds share the port (SO_REUSEPORT), so a second instance gets this
+     * far; its TCP bind is what fails.  Running on as a UDP-only half-server
+     * would silently split queries with the first one — stop instead. */
+    if ((n_udp4 > 0 && tcp4_sock < 0) || (n_udp6 > 0 && tcp6_sock < 0)) {
+        fprintf(stderr, "Error: TCP listener failed while the same family's UDP "
+                        "listener bound — another instance is probably already running\n");
+        exit(EXIT_FAILURE);
+    }
 
-    printf("DNS Server listening on port %d (UDP IPv4 SO_REUSEPORT", PORT);
-    if (n_udp6 > 0)     printf(", UDP IPv6 SO_REUSEPORT");
+    printf("DNS Server listening on port %d (", PORT);
+    if (n_udp4 > 0)     printf("UDP IPv4 SO_REUSEPORT");
+    if (n_udp6 > 0)     printf("%sUDP IPv6 SO_REUSEPORT", n_udp4 > 0 ? ", " : "");
     if (tcp4_sock >= 0) printf(", TCP IPv4");
     if (tcp6_sock >= 0) printf(", TCP IPv6");
     printf(")\n");
@@ -912,7 +991,7 @@ int main(int argc, char** argv) {
     }
 
 
-    for (int i = 0; i < n_udp; i++) {
+    for (int i = 0; i < n_udp4; i++) {
         struct UDPWorkerArg *wa = malloc(sizeof(*wa));
         if (!wa) { fprintf(stderr, "Error: malloc UDPWorkerArg\n"); exit(EXIT_FAILURE); }
         wa->sock = udp4_fds[i];
@@ -952,6 +1031,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Error: Failed to create TCP thread pool\n");
         exit(EXIT_FAILURE);
     }
+    g_tcp_pool = thread_pool;
 
     // Build poll() fd set (up to 4: TCP4, TCP6, stats_pipe, unused)
     struct pollfd pfds[4];
@@ -965,6 +1045,12 @@ int main(int argc, char** argv) {
     printf("Waiting for queries...\n\n");
 
     while (g_running) {
+        /* SIGUSR2 from the daily archiver: pick up the freshly created log. */
+        if (g_reopen_log) {
+            g_reopen_log = 0;
+            log_reopen();
+        }
+
         // Handle SIGHUP reload before polling
         if (g_reload) {
             g_reload = 0;
@@ -993,7 +1079,7 @@ int main(int argc, char** argv) {
         }
         if (nready == 0) continue;
 
-        // Handle SIGUSR1/SIGUSR2 stats request from self-pipe
+        // Handle SIGUSR1 stats request from self-pipe
         if (stats_pipe[0] >= 0 && (pfds[stats_idx].revents & POLLIN)) {
             char buf[16];
             while (read(stats_pipe[0], buf, sizeof(buf)) > 0) {}
@@ -1005,6 +1091,7 @@ int main(int argc, char** argv) {
             struct sockaddr_storage caddr;
             socklen_t clen = sizeof(caddr);
             int cfd = accept(tcp4_sock, (struct sockaddr*)&caddr, &clen);
+            if (cfd < 0) accept_backoff();
             if (cfd >= 0 && !tcp_conn_acquire(&caddr)) { close(cfd); cfd = -1; }
             if (cfd >= 0) {
                 struct TCPQueryContext *ctx = malloc(sizeof(*ctx));
@@ -1027,6 +1114,7 @@ int main(int argc, char** argv) {
             struct sockaddr_storage caddr;
             socklen_t clen = sizeof(caddr);
             int cfd = accept(tcp6_sock, (struct sockaddr*)&caddr, &clen);
+            if (cfd < 0) accept_backoff();
             if (cfd >= 0 && !tcp_conn_acquire(&caddr)) { close(cfd); cfd = -1; }
             if (cfd >= 0) {
                 struct TCPQueryContext *ctx = malloc(sizeof(*ctx));
@@ -1048,7 +1136,7 @@ int main(int argc, char** argv) {
     printf("Shutting down DNS server...\n");
 
     /* g_running=0 causes each UDP worker to exit after its 1-second timeout. */
-    for (int i = 0; i < n_udp;  i++) pthread_join(udp4_threads[i], NULL);
+    for (int i = 0; i < n_udp4; i++) pthread_join(udp4_threads[i], NULL);
     for (int i = 0; i < n_udp6; i++) pthread_join(udp6_threads[i], NULL);
     free(udp4_threads);
     free(udp6_threads);
@@ -1059,7 +1147,7 @@ int main(int argc, char** argv) {
     threadpool_destroy(g_forward_pool);
 
     /* Only now are no forward jobs left that could send on these sockets. */
-    for (int i = 0; i < n_udp;  i++) close(udp4_fds[i]);
+    for (int i = 0; i < n_udp4; i++) close(udp4_fds[i]);
     for (int i = 0; i < n_udp6; i++) close(udp6_fds[i]);
     free(udp4_fds);
     free(udp6_fds);

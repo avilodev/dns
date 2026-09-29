@@ -1,19 +1,52 @@
 #include "logger.h"
-#include "utils.h"   /* path_open */
+#include "diag.h"
+#include "utils.h"   /* path_open, path_rename */
 #include <pthread.h>
 #include <pwd.h>
+#include <strings.h>
 #include <sys/stat.h>
 
 extern Config g_config;
+
+/* ---- Diagnostic level ----------------------------------------------------- */
+
+/* Definition for diag.h.  Warnings and errors by default: per-query chatter
+ * (DIAG_DEBUG) is what used to fill the launcher log. */
+int g_diag_level = DIAG_WARN;
+
+static const char* const k_diag_names[] = { "error", "warn", "info", "debug" };
+
+int diag_level_from_name(const char* name)
+{
+    if (!name) return -1;
+    for (int i = 0; i < (int)(sizeof(k_diag_names) / sizeof(k_diag_names[0])); i++)
+        if (strcasecmp(name, k_diag_names[i]) == 0) return i;
+    return -1;
+}
+
+const char* diag_level_name(int level)
+{
+    if (level < 0 || level > DIAG_DEBUG) return "?";
+    return k_diag_names[level];
+}
+
+/* ---- CSV query log -------------------------------------------------------- */
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int log_fd = -1;
 static off_t log_bytes = 0;   /* bytes since the last truncate (log_mutex) */
 
-/* Safety net for deployments where cron_scripts/dns_log was never installed:
- * past this size the log is truncated in place (no rotation files).  The cron
- * job, when present, archives a copy first and hits this far less often. */
-#define LOG_MAX_BYTES (20 * 1024 * 1024)
+/*
+ * Last-resort cap for a deployment where cron_scripts/dns_log was never
+ * installed.  Deliberately set ABOVE anything the daily archiver leaves
+ * behind, so this is a backstop rather than a competitor to it.
+ *
+ * On hitting it we rotate to LOG_ROTATED_PATH and reopen, keeping one
+ * generation — the old behaviour (ftruncate to 0) discarded the entire
+ * history in a single write, with nothing archived and no warning.
+ */
+#define LOG_MAX_BYTES    (64 * 1024 * 1024)
+#define LOG_ROTATED_PATH LOG_FILE_PATH ".0"
 
 /* Open the query log (O_APPEND).  If we still hold root and a privilege drop is
  * configured (-U), hand the file to that user now so reopens AFTER the drop
@@ -35,6 +68,14 @@ static int open_log_fd(void) {
     struct stat st;
     log_bytes = (fstat(fd, &st) == 0) ? st.st_size : 0;
     return fd;
+}
+
+/* Pin the log and its rotation slot while still root, so both the reopen and
+ * the renameat below work as the drop user under a 0700 ancestor. */
+void log_pin_paths(void)
+{
+    path_pin(LOG_FILE_PATH);
+    path_pin(LOG_ROTATED_PATH);
 }
 
 /* Exported — also used by main.c print_qtype_stats(). Returns NULL for unknown. */
@@ -105,6 +146,38 @@ static const char* rcode_name(uint8_t rcode) {
 }
 
 /*
+ * Enforce LOG_MAX_BYTES.  Caller holds log_mutex.
+ *
+ * Preferred path: rename the full log aside and open a fresh one, keeping one
+ * generation.  Creating that fresh file needs write permission on the log
+ * DIRECTORY, which the drop user does not have under the default install
+ * (logs/ is owned by the invoking user, mode 0755) — so when the reopen
+ * fails we put the old name back and fall back to truncating in place.
+ * Either way the log stops growing; only the retained generation is lost.
+ */
+static void log_enforce_cap_locked(void)
+{
+    /* The daily archiver may have rotated behind us, leaving the counter
+     * stale-high; re-stat before discarding anything. */
+    struct stat st;
+    if (fstat(log_fd, &st) == 0) log_bytes = st.st_size;
+    if (log_bytes < LOG_MAX_BYTES) return;
+
+    if (path_rename(LOG_FILE_PATH, LOG_ROTATED_PATH) == 0) {
+        int fd = open_log_fd();
+        if (fd >= 0) {
+            close(log_fd);
+            log_fd = fd;            /* open_log_fd reseeded log_bytes */
+            return;
+        }
+        /* Could not create the replacement: undo, so we keep writing to a
+         * file that still has the name everything else expects. */
+        (void)path_rename(LOG_ROTATED_PATH, LOG_FILE_PATH);
+    }
+    if (ftruncate(log_fd, 0) == 0) log_bytes = 0;
+}
+
+/*
  * Log a DNS query result (thread-safe).
  * Keeps the log fd open for the server's lifetime to avoid per-query open/close overhead.
  * Format (CSV): timestamp,client_ip,port,qtype,domain,rcode,info
@@ -114,13 +187,24 @@ int log_entry(const char* client_ip, uint16_t port, uint16_t qtype,
               const char* domain, uint8_t rcode, const char* info) {
     pthread_mutex_lock(&log_mutex);
 
-    // Open the log file lazily and keep it open for the server's lifetime
+    /* Open the log file lazily and keep it open for the server's lifetime.
+     * Complain once per outage, not once per query: this runs on the hot path,
+     * and a spell of EACCES on the log once wrote thousands of identical
+     * lines into the launcher log. */
+    static bool open_failed = false;
     if (log_fd < 0) {
         log_fd = open_log_fd();
         if (log_fd < 0) {
-            perror("Warning: Failed to open log file");
+            if (!open_failed) {
+                open_failed = true;
+                perror("Error: Cannot open log file");
+            }
             pthread_mutex_unlock(&log_mutex);
             return -1;
+        }
+        if (open_failed) {
+            open_failed = false;
+            fprintf(stderr, "Query log reopened: %s\n", LOG_FILE_PATH);
         }
     }
 
@@ -154,20 +238,16 @@ int log_entry(const char* client_ip, uint16_t port, uint16_t qtype,
             len = (int)sizeof(log_line) - 1;
             log_line[len - 1] = '\n';   /* keep one entry per line when truncated */
         }
+        static bool write_failed = false;   /* guarded by the log mutex */
         if (write(log_fd, log_line, len) < 0) {
-            perror("Warning: Log write failed");
+            /* Once per outage (e.g. disk full), not once per query. */
+            if (!write_failed) perror("Warning: Log write failed");
+            write_failed = true;
         } else {
+            write_failed = false;
             /* O_APPEND: after a truncate, writes resume at offset 0. */
             log_bytes += len;
-            if (log_bytes >= LOG_MAX_BYTES) {
-                /* Re-stat before discarding anything: the daily cron job may
-                 * have archived and truncated the file behind us, which would
-                 * leave this counter stale-high. */
-                struct stat st;
-                if (fstat(log_fd, &st) == 0) log_bytes = st.st_size;
-                if (log_bytes >= LOG_MAX_BYTES && ftruncate(log_fd, 0) == 0)
-                    log_bytes = 0;
-            }
+            if (log_bytes >= LOG_MAX_BYTES) log_enforce_cap_locked();
         }
     }
 

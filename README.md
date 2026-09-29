@@ -43,7 +43,7 @@ Binaries end up at `auth_dns/bin/auth_dns` and `upstream_dns/bin/upstream_dns`.
 
 `make install` installs three cron jobs, all rendered from generic templates in `cron_scripts/` with install-time paths substituted in — no hardcoded paths in the source tree:
 
-- `dns_log` (daily) — archives and truncates the auth `server.log`.
+- `dns_log` (nightly, 00:05) — archives every log into `logs/YYYY/MM/DD/`, gzips it, and prunes anything older than `RETENTION_DAYS` (default 30). Installed as a `/etc/cron.d` entry that runs a copy rendered from `cron_scripts/dns_log`, so re-run `sudo make install` after editing it.
 - `refresh-root-hints` (daily) — refreshes the upstream resolver's root hints.
 - `dns-startup` (`@reboot`) — starts the servers at boot. This is a one-line `/etc/cron.d` entry that points back at the launcher in `cron_scripts/dns-startup`, which is the file you edit to choose what runs.
 
@@ -156,7 +156,7 @@ Port 53 requires root (or `CAP_NET_BIND_SERVICE`).
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-u HOST` | Upstream resolver IPv4 address (bare IP — no port) | 1.1.1.1 |
+| `-u HOST` | Upstream resolver IPv4 or IPv6 address (bare IP — no port) | 1.1.1.1 |
 | `-p PORT` | Upstream resolver **port** | 53 |
 | `-t N` | Number of worker threads | 20 |
 | `-q N` | Thread pool queue depth | 100 |
@@ -166,7 +166,7 @@ Port 53 requires root (or `CAP_NET_BIND_SERVICE`).
 
 > **Note:** the authoritative server always listens on **port 53** (a compile-time
 > constant); there is no flag to change its listen port. `-p` sets the *upstream*
-> port and `-u` takes a bare IPv4 address — pass them separately
+> port and `-u` takes a bare IP address — pass them separately
 > (`-u 127.0.0.1 -p 5335`), not as `host:port`.
 
 > **Access control:** `-a`/`-r` gate only the **recursive/forwarding** path —
@@ -349,8 +349,9 @@ Both servers handle the same signals:
 | Signal | Effect |
 |--------|--------|
 | `SIGINT`, `SIGTERM`, `SIGQUIT` | Graceful shutdown |
-| `SIGHUP` | auth_dns: reload zone file. upstream_dns: reload root hints. |
-| `SIGUSR1` or `SIGUSR2` | Print per-QTYPE query statistics to stdout |
+| `SIGHUP` | auth_dns: reload zone file, DNSSEC keys and blocklist. upstream_dns: reload root hints and flush the NS cache. Both also reopen the query log. |
+| `SIGUSR1` | Print per-QTYPE query statistics to stdout |
+| `SIGUSR2` | Reopen the query log, and nothing else — what the nightly archiver sends after moving the file aside |
 
 ```bash
 kill -USR1 $(pidof auth_dns)    # dump stats (auth_dns)
@@ -363,10 +364,41 @@ kill -HUP  $(pidof upstream_dns) # flush NS cache / reload hints
 
 ## Logs
 
-Both servers write to the `logs/` directory (at the root of the repository):
+Everything lives under `logs/` at the root of the repository — nothing is
+written anywhere else on the system.
 
-- `auth_dns` logs go to `auth.log`
-- `upstream_dns` logs go to `upstream.log`
+| File | Written by | Contents |
+|---|---|---|
+| `server.log` | `auth_dns` | CSV query log |
+| `upstream.log` | `upstream_dns` | CSV query log |
+| `auth.err`, `upstream.err` | each server | diagnostics; volume set by `*_LOG_LEVEL` |
+| `dns-startup.log` | the boot launcher | which servers started, and why one did not |
+| `rotation.log` | the nightly archiver | last 500 lines, trimmed in place |
+| `YYYY/MM/DD/*.gz` | the nightly archiver | one directory per calendar day |
+
+### Rotation
+
+`cron_scripts/dns_log` runs at 00:05 and moves each log into the dated
+directory for the day that just ended, so a dated directory holds exactly one
+calendar day. The query logs are rotated by rename-and-signal: the archiver
+renames the file, creates the replacement, then sends `SIGUSR2`, which means
+"reopen the query log" and nothing else. No line is lost across the boundary.
+The launcher and `.err` files are written by shell redirects with no process
+to signal, so those are copied and truncated instead.
+
+Archives are gzipped (CSV compresses about 7:1) and pruned after
+`RETENTION_DAYS`, which is the only thing bounding total disk use. Each server
+also enforces a 64 MB in-process cap as a backstop for deployments where the
+cron job was never installed; hitting it rotates to `<name>.log.0` rather than
+discarding history, and the archiver sweeps those up on its next run.
+
+### Diagnostic level
+
+`AUTH_LOG_LEVEL` / `UPSTREAM_LOG_LEVEL` in `dns.conf` (`-L` on the command
+line) take `error`, `warn` (default), `info` or `debug`. Per-query detail —
+resolution failures, upstream timeouts, stray packets — is `debug`, because it
+scales with traffic rather than with uptime. The CSV query logs are written at
+every level; only the `.err` files are affected.
 
 Log format — CSV, one row per query:
 `timestamp,client_ip,port,qtype,domain,rcode,info`
@@ -403,8 +435,12 @@ dns/
 │       └── root-trust-anchor.key  # DNSSEC root trust anchor
 │
 └── logs/
-    ├── auth.log
-    └── upstream.log
+    ├── server.log                 # auth query log (CSV)
+    ├── upstream.log               # resolver query log (CSV)
+    ├── auth.err, upstream.err     # per-server diagnostics
+    ├── dns-startup.log            # boot launcher
+    ├── rotation.log               # nightly archiver, self-trimming
+    └── YYYY/MM/DD/*.gz            # archives, pruned after RETENTION_DAYS
 ```
 
 ---

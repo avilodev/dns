@@ -18,6 +18,9 @@ struct ThreadPool* threadpool_create(struct ThreadPoolConfig config);
 /* Queue work.  -1 if shutting down, full, or out of memory. */
 int  threadpool_add_work(struct ThreadPool* pool, work_func_t func, void* arg);
 
+/* True when work is queued behind the busy workers (someone is waiting). */
+bool threadpool_has_waiting(struct ThreadPool* pool);
+
 /* Block until the queue is empty and every worker idle. */
 void threadpool_wait(struct ThreadPool* pool);
 

@@ -1,3 +1,4 @@
+#include "diag.h"
 #include "resolve.h"
 #include <sys/random.h>
 #include <ctype.h>
@@ -94,7 +95,7 @@ static struct Packet* query_upstream_tcp(struct Packet* pkt) {
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     if (connect(sock, (struct sockaddr*)&upstream_server, upstream_len) < 0) {
-        perror("Error: TCP connect() to upstream failed");
+        diag(DIAG_DEBUG, "Error: TCP connect() to upstream failed: %s\n", strerror(errno));
         close(sock);
         return NULL;
     }
@@ -118,7 +119,7 @@ static struct Packet* query_upstream_tcp(struct Packet* pkt) {
     ((uint8_t*)pkt->request)[1] =  client_txid       & 0xFF;
 
     if (!sent_ok) {
-        perror("Error: Failed to send TCP query to upstream");
+        diag(DIAG_DEBUG, "Error: Failed to send TCP query to upstream: %s\n", strerror(errno));
         close(sock);
         return NULL;
     }
@@ -126,13 +127,13 @@ static struct Packet* query_upstream_tcp(struct Packet* pkt) {
     /* Read the 2-byte response length prefix. */
     uint16_t rlen_net = 0;
     if (recv(sock, &rlen_net, 2, MSG_WAITALL) != 2) {
-        fprintf(stderr, "Error: Failed to read TCP length prefix from upstream\n");
+        diag(DIAG_DEBUG, "Error: Failed to read TCP length prefix from upstream\n");
         close(sock);
         return NULL;
     }
     uint16_t rlen = ntohs(rlen_net);
     if (rlen < HEADER_LEN) {
-        fprintf(stderr, "Error: TCP response from upstream too short (%u bytes)\n", rlen);
+        diag(DIAG_DEBUG, "Error: TCP response from upstream too short (%u bytes)\n", rlen);
         close(sock);
         return NULL;
     }
@@ -156,7 +157,7 @@ static struct Packet* query_upstream_tcp(struct Packet* pkt) {
     ssize_t got = recv(sock, response->request, rlen, MSG_WAITALL);
     close(sock);
     if (got != (ssize_t)rlen) {
-        fprintf(stderr, "Error: Short TCP read from upstream (%zd/%u bytes)\n", got, rlen);
+        diag(DIAG_DEBUG, "Error: Short TCP read from upstream (%zd/%u bytes)\n", got, rlen);
         free_packet(response);
         return NULL;
     }
@@ -164,7 +165,7 @@ static struct Packet* query_upstream_tcp(struct Packet* pkt) {
 
     /* Validate TX ID (RFC 5452). */
     if (rd16(response->request) != random_txid) {
-        fprintf(stderr, "Warning: TX ID mismatch from upstream (TCP) — dropping\n");
+        diag(DIAG_DEBUG, "Warning: TX ID mismatch from upstream (TCP) — dropping\n");
         free_packet(response);
         return NULL;
     }
@@ -172,7 +173,7 @@ static struct Packet* query_upstream_tcp(struct Packet* pkt) {
     /* Validate the question matches what we asked (RFC 5452 §6). */
     if (!question_matches(pkt->request, pkt->recv_len,
                           response->request, response->recv_len)) {
-        fprintf(stderr, "Warning: Question mismatch from upstream (TCP) — dropping\n");
+        diag(DIAG_DEBUG, "Question mismatch from upstream (TCP) — dropping\n");
         free_packet(response);
         return NULL;
     }
@@ -212,7 +213,7 @@ static struct Packet* query_upstream_udp(struct Packet* pkt) {
      * exact upstream IP *and port* — closes the "accepts any source port" gap
      * (RFC 5452); the source-port entropy of an off-path spoofer now matters. */
     if (connect(sock, (struct sockaddr*)&upstream_server, upstream_len) < 0) {
-        perror("Error: connect() to upstream failed");
+        diag(DIAG_DEBUG, "Error: connect() to upstream failed: %s\n", strerror(errno));
         close(sock);
         return NULL;
     }
@@ -236,13 +237,13 @@ static struct Packet* query_upstream_udp(struct Packet* pkt) {
     ((uint8_t*)pkt->request)[1] =  client_txid       & 0xFF;
 
     if (sent < 0) {
-        perror("Error: Failed to forward query to upstream");
+        diag(DIAG_DEBUG, "Error: Failed to forward query to upstream: %s\n", strerror(errno));
         close(sock);
         return NULL;
     }
 
     if (sent != pkt->recv_len) {
-        fprintf(stderr, "Warning: Partial send to upstream (%zd/%zd bytes)\n",
+        diag(DIAG_DEBUG, "Warning: Partial send to upstream (%zd/%zd bytes)\n",
                 sent, pkt->recv_len);
     }
 
@@ -279,7 +280,7 @@ static struct Packet* query_upstream_udp(struct Packet* pkt) {
         long rem_us = (deadline.tv_sec - now.tv_sec) * 1000000L +
                       (deadline.tv_nsec - now.tv_nsec) / 1000L;
         if (rem_us <= 0) {
-            fprintf(stderr, "Error: Upstream DNS query timed out\n");
+            diag(DIAG_DEBUG, "Upstream DNS query timed out\n");
             close(sock);
             free_packet(response);
             return NULL;
@@ -295,9 +296,9 @@ static struct Packet* query_upstream_udp(struct Packet* pkt) {
 
         if (response->recv_len < 0) {
             if (errno_is_timeout(errno)) {
-                fprintf(stderr, "Error: Upstream DNS query timed out\n");
+                diag(DIAG_DEBUG, "Upstream DNS query timed out\n");
             } else {
-                perror("Error: Failed to receive upstream response");
+                diag(DIAG_DEBUG, "Error: Failed to receive upstream response: %s\n", strerror(errno));
             }
             close(sock);
             free_packet(response);
@@ -312,7 +313,7 @@ static struct Packet* query_upstream_udp(struct Packet* pkt) {
         /* Validate TX ID. */
         recv_id = rd16(response->request);
         if (random_txid != recv_id) {
-            fprintf(stderr, "Warning: TX ID mismatch from upstream "
+            diag(DIAG_DEBUG, "Warning: TX ID mismatch from upstream "
                     "(sent %u, got %u) — ignoring stray packet\n",
                     random_txid, recv_id);
             continue;
@@ -323,7 +324,7 @@ static struct Packet* query_upstream_udp(struct Packet* pkt) {
          * discarding it and sitting out the whole timeout. */
         if (response->request[4] == 0 && response->request[5] == 0 &&
             (response->request[3] & 0x0F) != 0) {
-            fprintf(stderr, "Upstream returned rcode %d without a question\n",
+            diag(DIAG_DEBUG, "Upstream returned rcode %d without a question\n",
                     response->request[3] & 0x0F);
             close(sock);
             free_packet(response);
@@ -333,8 +334,8 @@ static struct Packet* query_upstream_udp(struct Packet* pkt) {
         /* Validate the question matches what we asked (RFC 5452 §6). */
         if (!question_matches(pkt->request, pkt->recv_len,
                               response->request, response->recv_len)) {
-            fprintf(stderr, "Warning: Question mismatch from upstream "
-                    "— ignoring stray packet\n");
+            diag(DIAG_DEBUG, "Question mismatch from upstream "
+                             "— ignoring stray packet\n");
             continue;
         }
 

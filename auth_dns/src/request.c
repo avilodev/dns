@@ -1,5 +1,6 @@
 #include "request.h"
 #include "dns_name.h"
+#include "diag.h"
 
 
 /* Parse a raw DNS request buffer into a Packet struct.
@@ -11,7 +12,7 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
     }
 
     if (recv_len < HEADER_LEN) {
-        fprintf(stderr, "Error: Buffer too short for DNS header (%zd bytes)\n", recv_len);
+        diag(DIAG_DEBUG, "Error: Buffer too short for DNS header (%zd bytes)\n", recv_len);
         return NULL;
     }
 
@@ -66,7 +67,7 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
     // Validate question count — exactly one question (RFC 1035).  The EDNS OPT
     // scan below assumes a single question, so reject anything else with FORMERR.
     if (pkt->qdcount != 1) {
-        fprintf(stderr, "Error: qdcount=%u (expected 1) — FORMERR\n", pkt->qdcount);
+        diag(DIAG_DEBUG, "Error: qdcount=%u (expected 1) — FORMERR\n", pkt->qdcount);
         pkt->rcode = RCODE_FORMAT_ERROR;
         return pkt;
     }
@@ -77,14 +78,14 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
      * config.txt names are stored lowercase to match. */
     for (int p = HEADER_LEN; ; ) {
         if (p >= recv_len) {
-            fprintf(stderr, "Error: Question name runs past the packet\n");
+            diag(DIAG_DEBUG, "Error: Question name runs past the packet\n");
             free_packet(pkt);
             return NULL;
         }
         uint8_t l = (uint8_t)buffer[p];
         if (l == 0) break;
         if (l & 0xC0) {
-            fprintf(stderr, "Error: Unexpected compression in question section\n");
+            diag(DIAG_DEBUG, "Error: Unexpected compression in question section\n");
             free_packet(pkt);
             return NULL;
         }
@@ -94,7 +95,7 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
     int pos = dname_from_wire((const uint8_t*)buffer, (int)recv_len, HEADER_LEN, true,
                               domain, sizeof(domain));
     if (pos < 0) {
-        fprintf(stderr, "Error: Malformed question name\n");
+        diag(DIAG_DEBUG, "Error: Malformed question name\n");
         free_packet(pkt);
         return NULL;
     }
@@ -110,7 +111,7 @@ struct Packet* parse_request_headers(char* buffer, ssize_t recv_len) {
 
     // Parse question type and class
     if (pos + 4 > recv_len) {
-        fprintf(stderr, "Error: Buffer too short for question type/class\n");
+        diag(DIAG_DEBUG, "Error: Buffer too short for question type/class\n");
         free_packet(pkt);
         return NULL;
     }

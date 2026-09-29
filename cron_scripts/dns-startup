@@ -47,41 +47,64 @@ UPSTREAM_BIN="$REPO/upstream_dns/bin/upstream_dns"
 AUTH_BIN="$REPO/auth_dns/bin/auth_dns"
 
 # --- Logging ----------------------------------------------------------------
-# Each server writes its own query log; this captures the launcher's own
-# diagnostics plus the servers' startup stderr (privilege-drop notices, bind
-# warnings, etc.).
+# Three kinds of output, kept in three kinds of file, all under $REPO/logs:
+#
+#   dns-startup.log   THIS launcher only — which servers it started and why
+#                     one did not start. Grows by a handful of lines per boot.
+#   <server>.err      each server's own stdout/stderr, one file per server.
+#                     Volume here is governed by *_LOG_LEVEL in dns.conf.
+#   server.log /      the CSV query logs, written by the servers themselves.
+#   upstream.log
+#
+# They used to be one file: the launcher log also swallowed both servers'
+# output, so per-query resolver chatter buried the boot diagnostics and the
+# file grew with traffic rather than with boot count. Splitting them means you
+# can read "did it start?" without wading through a day of resolution
+# failures, and lets the archiver treat them differently.
+#
+# All of these are rotated nightly into logs/YYYY/MM/DD/ by cron_scripts/dns_log.
 LOG_DIR="$REPO/logs"
 RUNLOG="$LOG_DIR/dns-startup.log"
 mkdir -p "$LOG_DIR"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') dns-startup: $*" >> "$RUNLOG"; }
 
-# launch <label> <binary> [args...]
+# launch <label> <errlog-basename> <binary> [args...]
 # Starts a foreground server detached from cron's process group (setsid + &)
 # so it keeps running after this launcher exits.
 launch() {
     local label="$1"; shift
+    local errname="$1"; shift
     local bin="$1"; shift
     if [ ! -x "$bin" ]; then
         log "ERROR: $label binary missing or not executable: $bin (did you run 'make'?)"
         return 1
     fi
-    log "starting $label: $bin $*"
-    setsid "$bin" "$@" >> "$RUNLOG" 2>&1 < /dev/null &
+    local errlog="$LOG_DIR/$errname"
+    log "starting $label: $bin $* (output -> $errname)"
+    # Append, so the archiver's copy-then-truncate leaves this fd usable.
+    setsid "$bin" "$@" >> "$errlog" 2>&1 < /dev/null &
 }
 
 # Native bundled-upstream IP is loopback; flags are assembled by dns-args.sh.
 # $args is intentionally unquoted: dns.conf values never contain spaces.
 start_upstream() {
     local args; args="$(build_upstream_args)"
-    launch "upstream_dns (recursive resolver)" "$UPSTREAM_BIN" $args
+    launch "upstream_dns (recursive resolver)" upstream.err "$UPSTREAM_BIN" $args
     # Give the resolver a moment to bind before the front door forwards to it.
     sleep 2
 }
 
 start_auth() {
+    # Same guard as `make docker`: with no upstream running here and no external
+    # resolver configured, every forwarded query would go to a closed port.
+    if [ "${UPSTREAM_ENABLED:-true}" != true ] && [ -z "${AUTH_UPSTREAM_IP:-}" ]; then
+        log "ERROR: auth enabled without upstream and AUTH_UPSTREAM_IP is blank;" \
+            "set AUTH_UPSTREAM_IP in dns.conf (e.g. 1.1.1.1). auth NOT started."
+        return 1
+    fi
     local args; args="$(build_auth_args 127.0.0.1)"
-    launch "auth_dns (authoritative front door)" "$AUTH_BIN" $args
+    launch "auth_dns (authoritative front door)" auth.err "$AUTH_BIN" $args
 }
 
 log "boot launcher running (repo=$REPO)"

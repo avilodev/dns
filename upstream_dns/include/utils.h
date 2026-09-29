@@ -20,6 +20,11 @@ const char* qtype_to_string(uint16_t qtype);
 void path_pin(const char* path);
 int  path_open(const char* path, int flags, int mode);
 
+/* Rename between two pinned names in the SAME pinned directory (renameat), so
+ * the logger can rotate its own file after the drop.  Falls back to rename()
+ * when either name is unpinned.  Returns 0 on success. */
+int  path_rename(const char* from, const char* to);
+
 /* ---- Sockets --------------------------------------------------------- */
 
 /* Send one DNS-over-TCP message (2-byte length prefix + body). */

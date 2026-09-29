@@ -19,8 +19,12 @@ int log_entry(const char* client_ip, uint16_t port, uint16_t qtype,
 /* Close persistent log fd. Call once on shutdown. */
 void log_close(void);
 
-/* Reopen log fd (call after logrotate moves the old file). */
+/* Reopen log fd (call after the archiver moves the old file; SIGUSR2). */
 void log_reopen(void);
+
+/* Pin the log AND its rotation slot while still root.  Call instead of
+ * path_pin(LOG_FILE_PATH) — the in-process size cap renames between them. */
+void log_pin_paths(void);
 
 /* Convert QTYPE to name string; returns NULL for unknown types. */
 const char* qtype_name(uint16_t qtype);

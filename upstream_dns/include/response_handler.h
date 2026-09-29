@@ -45,6 +45,10 @@ NSCandidateList* extract_all_ns_with_glue(struct Packet* response,
                                           const char* server_zone);
 void free_ns_candidate_list(NSCandidateList* list);
 
+/* True when the authority section holds an SOA: what separates an
+ * authoritative NODATA from a delegation. */
+bool authority_has_soa(struct Packet* response);
+
 /* Owner of the first NS in the authority section (malloc'd), or NULL. */
 char* extract_zone_apex(struct Packet* response);
 

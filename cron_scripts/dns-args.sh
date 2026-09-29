@@ -27,6 +27,7 @@ build_auth_args() {
     [ "${AUTH_ACL_ENABLED:-false}" = true ]       && set -- "$@" -a "${AUTH_ACL_CIDRS}"
     [ "${AUTH_BIND_ENABLED:-false}" = true ]      && set -- "$@" -b "${AUTH_BIND_ADDR}"
     [ "${AUTH_BLOCK_ENABLED:-false}" = true ]     && set -- "$@" -S "${AUTH_BLOCK_MODE}"
+    [ -n "${AUTH_LOG_LEVEL:-}" ]                  && set -- "$@" -L "${AUTH_LOG_LEVEL}"
     echo "$@"
 }
 
@@ -37,5 +38,6 @@ build_upstream_args() {
     [ "${UPSTREAM_RATELIMIT_ENABLED:-false}" = true ] && set -- "$@" -r "${UPSTREAM_RATELIMIT_QPS:-0}"
     [ "${UPSTREAM_ACL_ENABLED:-false}" = true ]       && set -- "$@" -a "${UPSTREAM_ACL_CIDRS}"
     [ "${UPSTREAM_BIND_ENABLED:-false}" = true ]      && set -- "$@" -b "${UPSTREAM_BIND_ADDR}"
+    [ -n "${UPSTREAM_LOG_LEVEL:-}" ]                  && set -- "$@" -L "${UPSTREAM_LOG_LEVEL}"
     echo "$@"
 }

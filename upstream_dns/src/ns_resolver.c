@@ -1,4 +1,5 @@
 #include "ns_resolver.h"
+#include "config.h"
 #include "dns_packet.h"
 #include "resolve.h"
 #include "response_handler.h"
@@ -46,6 +47,7 @@ char* resolve_ns_addr(const char* ns_name, NSResolutionContext* ctx)
     NSResolutionContext fresh = {0};
     if (!ctx) ctx = &fresh;
     char* ip = resolve_in_context(ns_name, QTYPE_A, ctx);
-    if (!ip) ip = resolve_in_context(ns_name, QTYPE_AAAA, ctx);   /* IPv6-only NS */
+    if (!ip && hints_ipv6_usable())                                /* IPv6-only NS */
+        ip = resolve_in_context(ns_name, QTYPE_AAAA, ctx);
     return ip;
 }

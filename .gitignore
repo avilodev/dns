@@ -11,8 +11,12 @@ upstream_dns/obj/
 *.d
 
 
-# Query logs (daily-rotating, can be large)
+# Query logs (nightly-rotating into logs/YYYY/MM/DD, can be large)
 logs/
+
+# Rendered copy of cron_scripts/dns_log (paths/user substituted by `make
+# install`); the cron.d entry runs this one. Regenerated, never edited.
+cron_scripts/.dns_log.generated
 
 # Testing scripts and results
 testing/

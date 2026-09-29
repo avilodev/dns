@@ -2,6 +2,7 @@
 #include "auth.h"
 #include "utils.h"
 #include "dns_name.h"   /* dname_to_wire */
+#include "diag.h"
 #include <string.h>
 
 /*
@@ -106,12 +107,12 @@ int send_response(int sock, struct Packet* response,
                           client_addr, addr_len);
 
     if (sent < 0) {
-        perror("Error: Failed to send response to client");
+        diag(DIAG_DEBUG, "Error: Failed to send response to client: %s\n", strerror(errno));
         return -1;
     }
 
     if (sent != response->recv_len) {
-        fprintf(stderr, "Warning: Partial send to client (%zd/%zd bytes)\n",
+        diag(DIAG_DEBUG, "Warning: Partial send to client (%zd/%zd bytes)\n",
                 sent, response->recv_len);
         return -1;
     }
@@ -136,7 +137,7 @@ int send_tcp_response(int fd, struct Packet* response) {
     while (rem > 0) {
         ssize_t n = write(fd, p, rem);
         if (n <= 0) {
-            perror("Error: Failed to send TCP length prefix");
+            diag(DIAG_DEBUG, "Error: Failed to send TCP length prefix: %s\n", strerror(errno));
             return -1;
         }
         p += n; rem -= (size_t)n;
@@ -148,7 +149,7 @@ int send_tcp_response(int fd, struct Packet* response) {
     while (rem > 0) {
         ssize_t n = write(fd, p, rem);
         if (n <= 0) {
-            perror("Error: Failed to send TCP response body");
+            diag(DIAG_DEBUG, "Error: Failed to send TCP response body: %s\n", strerror(errno));
             return -1;
         }
         p += n; rem -= (size_t)n;

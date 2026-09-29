@@ -1,4 +1,5 @@
 #include "utils.h"
+#include "diag.h"
 #include "dns_name.h"
 #include <pthread.h>
 
@@ -9,6 +10,14 @@ typedef struct { char* path; char* base; int dirfd; } Pin;
 static Pin g_pins[MAX_PINS];
 static int g_pin_count = 0;
 static pthread_mutex_t g_pin_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Index of `path` among the pins, or -1.  Caller holds g_pin_lock. */
+static int find_pin(const char* path)
+{
+    for (int i = 0; i < g_pin_count; i++)
+        if (strcmp(g_pins[i].path, path) == 0) return i;
+    return -1;
+}
 
 /* Parent directory of `path` into dir[cap]. */
 static void parent_dir(const char* path, char* dir, size_t cap)
@@ -75,6 +84,22 @@ int path_open(const char* path, int flags, int mode)
     return open(path, flags | O_CLOEXEC, mode);
 }
 
+int path_rename(const char* from, const char* to)
+{
+    if (!from || !to) return -1;
+    pthread_mutex_lock(&g_pin_lock);
+    int i = find_pin(from), j = find_pin(to);
+    /* renameat only helps when both names hang off the same pinned dirfd —
+     * which is the logger's case (log and rotation slot share a directory).
+     * Anything else takes the plain path and needs a traversable ancestor. */
+    int rc = (i >= 0 && j >= 0 && g_pins[i].dirfd == g_pins[j].dirfd)
+                 ? renameat(g_pins[i].dirfd, g_pins[i].base,
+                            g_pins[j].dirfd, g_pins[j].base)
+                 : rename(from, to);
+    pthread_mutex_unlock(&g_pin_lock);
+    return rc;
+}
+
 FILE* path_fopen(const char* path)
 {
     int fd = path_open(path, O_RDONLY, 0);
@@ -99,6 +124,7 @@ static void init_default_config(void) {
     g_config.drop_user = NULL;
     g_config.block_mode = NULL;
     g_config.config_path = NULL;
+    g_config.log_level = NULL;
 }
 
 /* Replace a string option, freeing any previous value (the flag may repeat). */
@@ -110,14 +136,15 @@ static bool set_str(char** dst, const char* val) {
     return true;
 }
 
-/* Parse command-line flags (-p/-t/-u/-q/-b/-a/-r/-U) into g_config. Returns 0 on success, -1 on unknown flag. */
+/* Parse command-line flags (-p/-t/-u/-q/-b/-a/-r/-U/-S/-c/-L) into g_config.
+ * Returns 0 on success, -1 on an unknown or invalid flag. */
 int load_config(int argc, char** argv) {
     // Initialize defaults
     init_default_config();
 
     // Parse command line arguments
     int opt;
-    while ((opt = getopt(argc, argv, "p:t:u:q:b:a:r:U:S:c:")) != -1) {
+    while ((opt = getopt(argc, argv, "p:t:u:q:b:a:r:U:S:c:L:")) != -1) {
         char *end;
         long v;
         switch (opt) {
@@ -181,15 +208,29 @@ int load_config(int argc, char** argv) {
             case 'c':
                 if (!set_str(&g_config.config_path, optarg)) return -1;
                 break;
+            case 'L':
+                if (!set_str(&g_config.log_level, optarg)) return -1;
+                break;
             default:
                 printf("Usage: ./bin/auth_dns <-p upstream_port> <-t thread_count> "
                        "<-u upstream_dns> <-q queue_size> <-b bind_addr> "
                        "<-a recursion_allow_cidrs> <-r per_source_qps> "
-                       "<-U user[:group]> <-S block_mode> <-c config_file>\n");
+                       "<-U user[:group]> <-S block_mode> <-c config_file> "
+                       "<-L error|warn|info|debug>\n");
                 return -1;
         }
     }
-    
+
+    /* Set before any thread exists; diag() only reads it afterwards. */
+    if (g_config.log_level) {
+        int lvl = diag_level_from_name(g_config.log_level);
+        if (lvl < 0) {
+            fprintf(stderr, "Invalid log level: %s (want error|warn|info|debug)\n",
+                    g_config.log_level);
+            return -1;
+        }
+        g_diag_level = lvl;
+    }
     return 0;
 }
 
@@ -301,16 +342,8 @@ char* extract_ip_from_response(const struct Packet* response) {
         }
         // AAAA record (IPv6)
         else if (atype == 28 && rdlength == 16) {
-            char ip_str[40];
-            snprintf(ip_str, sizeof(ip_str), "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
-                    rd16(ptr),
-                    rd16(ptr + 2),
-                    rd16(ptr + 4),
-                    rd16(ptr + 6),
-                    rd16(ptr + 8),
-                    rd16(ptr + 10),
-                    rd16(ptr + 12),
-                    rd16(ptr + 14));
+            char ip_str[INET6_ADDRSTRLEN];
+            if (!inet_ntop(AF_INET6, ptr, ip_str, sizeof(ip_str))) ip_str[0] = '\0';
             
             if (ip_count > 0) {
                 /* Space-separate multiple IPs so the CSV log's info column

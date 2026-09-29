@@ -1,3 +1,4 @@
+#include "diag.h"
 #include "workers.h"
 #include "access_control.h"
 #include "cache.h"
@@ -6,6 +7,7 @@
 #include "request.h"
 #include "resolve.h"
 #include "response_handler.h"
+#include "thread_pool.h"
 #include "utils.h"
 
 #include <netinet/tcp.h>
@@ -43,7 +45,8 @@ static char* answer_query(char* buf, ssize_t len, const char* ip, uint16_t port,
 
     struct Packet* pkt = parse_request_headers(buf, len);
     if (!pkt) {
-        fprintf(stderr, "Failed to parse request from %s\n", ip);
+        diag(DIAG_DEBUG, "Failed to parse request from %s\n", ip);
+        log_query(ip, port, 0, "PARSE_ERROR", RCODE_FORMAT_ERROR, NULL);
         return error_reply(buf, len, RCODE_FORMAT_ERROR, out_len);
     }
 
@@ -52,10 +55,13 @@ static char* answer_query(char* buf, ssize_t len, const char* ip, uint16_t port,
     struct Packet* ret = NULL;
 
     if (pkt->rcode != 0) {                        /* NOTIMP / FORMERR from the parser */
+        log_query(ip, port, pkt->q_type, pkt->full_domain ? pkt->full_domain : "-",
+                  pkt->rcode, NULL);
         reply = error_reply(buf, len, pkt->rcode, out_len);
         goto done;
     }
     if (pkt->edns_present && pkt->edns_version > 0) {
+        log_query(ip, port, pkt->q_type, pkt->full_domain, RCODE_BADVERS, NULL);
         unsigned char bv[ERROR_REPLY_MAX];
         int n = build_badvers_reply((unsigned char*)buf, len, pkt->do_bit, bv, sizeof(bv));
         if (n > 0 && (reply = malloc((size_t)n))) {
@@ -79,7 +85,7 @@ static char* answer_query(char* buf, ssize_t len, const char* ip, uint16_t port,
          * which is what 1.1.1.1 and 8.8.8.8 return; REFUSED would mean "I will
          * not serve you" and can make a stub drop the server entirely. */
         int rc = RCODE_SERVER_FAILURE;
-        if (pkt->rd) fprintf(stderr, "Failed to resolve %s\n", pkt->full_domain);
+        if (pkt->rd) diag(DIAG_DEBUG, "Failed to resolve %s\n", pkt->full_domain);
         log_query(ip, port, pkt->q_type, pkt->full_domain, (uint8_t)rc, NULL);
         reply = error_reply(buf, len, rc, out_len);
         goto done;
@@ -159,6 +165,15 @@ void* process_tcp_query(void* arg)
         uint16_t len = rd16(prefix);
         if (len < HEADER_LEN) break;
 
+        /* Charge EVERY message.  main.c charges rl_allow() once, at accept,
+         * so without this one accepted client could pipeline past its -r rate
+         * indefinitely.  Closing (rather than dropping, as UDP does) frees the
+         * worker this connection is holding and tells the client to back off. */
+        if (!rl_allow(&ctx->client_ss)) {
+            diag(DIAG_DEBUG, "TCP client %s over rate limit — closing connection\n", ip);
+            break;
+        }
+
         /* RFC 7766: a TCP message may be up to 65535 bytes, far above the UDP
          * receive buffer.  Size the read to the length prefix rather than
          * capping at MAXLINE, which dropped a large query AND tore down the
@@ -172,6 +187,12 @@ void* process_tcp_query(void* arg)
         free(buf);
         if (reply) tcp_send_msg(fd, reply, (size_t)n);
         free(reply);
+
+        /* A connection keeps its worker while it sends within the idle
+         * timeout, so a few clients could hold every worker.  When other
+         * connections are queued, hand this worker over after the answer
+         * (RFC 7766 §6.2.3 lets the server close; clients reconnect). */
+        if (threadpool_has_waiting(ctx->pool)) break;
     }
 
     close(fd);

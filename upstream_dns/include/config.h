@@ -21,6 +21,10 @@ int create_listener(int family, int type, int port, bool fatal);
 int   load_hints(const char* filename);   /* count loaded, or -1 (kept old) */
 int   load_hints_builtin(void);
 char* hints_random_root_ip(void);         /* best-scored root IPv4, strdup'd */
+/* Does this host have IPv6 egress (probed when hints are installed)?  Without
+ * it, IPv6 nameserver addresses are unreachable and must not be chosen. */
+bool hints_ipv6_usable(void);
+
 int   hints_copy_names(char names[ROOT_SERVERS][256]);
 
 /* ---- DNSSEC trust anchors -------------------------------------------- */

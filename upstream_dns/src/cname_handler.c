@@ -126,10 +126,10 @@ struct Packet* reconstruct_cname_response(const struct Packet* query,
         final_answer->recv_len < HEADER_LEN)
         return final_answer;
 
-    /* Sized from the final answer (TCP answers can exceed MAXLINE) plus room
-     * for decompression; the transport applies UDP limits later. */
-    MsgWriter w = { .cap = (int)final_answer->recv_len * 2 + 2048 };
-    if (w.cap < MAXLINE) w.cap = MAXLINE;
+    /* Room for the largest message DNS can carry: RDATA names are written out
+     * in full, so the output can far outgrow the input.  Trimmed afterwards;
+     * the transport applies UDP limits later. */
+    MsgWriter w = { .cap = 65535 };
     struct Packet* out = calloc(1, sizeof(*out));
     w.buf = calloc(1, (size_t)w.cap);
     if (!out || !w.buf) { free(out); free(w.buf); return final_answer; }
@@ -169,14 +169,21 @@ struct Packet* reconstruct_cname_response(const struct Packet* query,
 
     /* Then the final answer's records: answers, or its authority for NODATA. */
     int want = final_answer->ancount > 0 ? SEC_ANSWER : SEC_AUTHORITY;
+    bool complete = true;
     RRIter it; DnsRR rr;
     for (rr_iter_init(&it, final_answer->request, (int)final_answer->recv_len); rr_next(&it, &rr); ) {
         if (rr.section != want) continue;
-        if (!copy_rr(&w, final_answer, &rr)) break;
+        if (!copy_rr(&w, final_answer, &rr)) { complete = false; break; }
         if (want == SEC_ANSWER) an++; else ns++;
     }
     wr16(w.buf + 6, (uint16_t)an);
     wr16(w.buf + 8, (uint16_t)ns);
+    /* Records were left out: say so, rather than pass (and cache) a partial
+     * RRset as the whole answer.  cacheable_answer() rejects TC=1. */
+    if (!complete) wr16(w.buf + 2, (uint16_t)(rd16(w.buf + 2) | FLAG_TC));
+
+    uint8_t* trimmed = realloc(w.buf, (size_t)w.pos);
+    if (trimmed) w.buf = trimmed;
 
     out->request     = (char*)w.buf;
     out->recv_len    = w.pos;

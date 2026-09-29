@@ -78,6 +78,22 @@ int path_open(const char* path, int flags, int mode)
     return fd;
 }
 
+int path_rename(const char* from, const char* to)
+{
+    if (!from || !to) return -1;
+    pthread_mutex_lock(&g_pin_lock);
+    int i = find_pin(from), j = find_pin(to);
+    /* renameat only helps when both names hang off the same pinned dirfd —
+     * which is the logger's case (log and rotation slot share a directory).
+     * Anything else takes the plain path and needs a traversable ancestor. */
+    int rc = (i >= 0 && j >= 0 && g_pins[i].dirfd == g_pins[j].dirfd)
+                 ? renameat(g_pins[i].dirfd, g_pins[i].base,
+                            g_pins[j].dirfd, g_pins[j].base)
+                 : rename(from, to);
+    pthread_mutex_unlock(&g_pin_lock);
+    return rc;
+}
+
 /* ---- Randomness ------------------------------------------------------ */
 
 int get_random_id(void)
@@ -141,6 +157,7 @@ static bool write_all(int fd, const void* buf, size_t len)
 /* One write: a separate 2-byte prefix can stall on Nagle + delayed ACK. */
 bool tcp_send_msg(int fd, const void* msg, size_t len)
 {
+    if (len > 65535) return false;          /* the 2-byte prefix would wrap */
     uint8_t* buf = malloc(len + 2);
     if (!buf) return false;
     wr16(buf, (uint16_t)len);

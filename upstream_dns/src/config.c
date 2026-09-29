@@ -1,4 +1,5 @@
 #include "config.h"
+#include "diag.h"
 #include "dns_name.h"
 #include "dnssec_wire.h"
 #include "infra.h"
@@ -40,7 +41,7 @@ int load_config(int argc, char** argv)
     g_config = (Config){ .port = PORT, .thread_count = NUM_THREADS, .queue_size = QUEUE_SIZE };
 
     int opt;
-    while ((opt = getopt(argc, argv, "p:t:q:b:a:r:U:")) != -1) {
+    while ((opt = getopt(argc, argv, "p:t:q:b:a:r:U:L:")) != -1) {
         bool ok = true;
         switch (opt) {
         case 'p': ok = parse_int(optarg, 1, 65535, "port", &g_config.port); break;
@@ -50,12 +51,24 @@ int load_config(int argc, char** argv)
         case 'b': ok = set_str(&g_config.bind_addr, optarg); break;
         case 'a': ok = set_str(&g_config.acl_csv,   optarg); break;
         case 'U': ok = set_str(&g_config.drop_user, optarg); break;
+        case 'L': ok = set_str(&g_config.log_level,  optarg); break;
         default:  ok = false;
         }
         if (!ok) return -1;
     }
-    printf("Config: port=%d threads=%d queue=%d\n",
-           g_config.port, g_config.thread_count, g_config.queue_size);
+    /* Set before any thread exists; diag() only reads it afterwards. */
+    if (g_config.log_level) {
+        int lvl = diag_level_from_name(g_config.log_level);
+        if (lvl < 0) {
+            fprintf(stderr, "Invalid log level: %s (want error|warn|info|debug)\n",
+                    g_config.log_level);
+            return -1;
+        }
+        g_diag_level = lvl;
+    }
+    printf("Config: port=%d threads=%d queue=%d log=%s\n",
+           g_config.port, g_config.thread_count, g_config.queue_size,
+           diag_level_name(g_diag_level));
     return 0;
 }
 
@@ -73,9 +86,14 @@ int create_listener(int family, int type, int port, bool fatal)
     int one = 1;
     int sock = socket(family, type, 0);
     if (sock < 0) goto fail;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    if (type == SOCK_DGRAM)
-        setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+    /* SO_REUSEADDR only for TCP, to rebind a listener still in TIME_WAIT.
+     * UDP gets neither it nor SO_REUSEPORT: this is one process with a thread
+     * pool, so a second binder is always a mistake (a stray manual start
+     * beside the @reboot cron job).  SO_REUSEPORT let that succeed silently
+     * and the kernel then split queries across two processes with separate
+     * caches, NS caches and rate limiters. */
+    if (type == SOCK_STREAM)
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     if (family == AF_INET6)
         setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
     if (bind(sock, (struct sockaddr*)&ss, slen) < 0) goto fail;
@@ -99,18 +117,49 @@ fail:
 
 typedef struct {
     char name[256];
-    char ip[INET6_ADDRSTRLEN];   /* IPv4 glue; "" if none */
+    char ip[INET6_ADDRSTRLEN];    /* IPv4 glue; "" if none */
+    char ip6[INET6_ADDRSTRLEN];   /* IPv6 glue; "" if none */
 } RootHint;
 
 /* Read by every worker, replaced on SIGHUP: copy in/out under the lock. */
 static RootHint         g_hints[ROOT_SERVERS];
+static bool             g_hints_use_v6 = false;
 static pthread_rwlock_t g_hints_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+/*
+ * Has this host a route to the IPv6 internet?  connect() on a UDP socket
+ * sends nothing — it only resolves a route — so this is silent and costs two
+ * syscalls.  The check matters: offering IPv6 roots on an IPv4-only LAN would
+ * make cold resolutions pick an unreachable root and SERVFAIL (the root step
+ * has no sibling list to fall back to) until infra backoff learned to avoid
+ * them.  Re-evaluated whenever hints are installed, so SIGHUP picks up a
+ * connection that has since gained or lost IPv6.
+ */
+static bool have_ipv6_egress(void)
+{
+    struct sockaddr_storage ss;
+    socklen_t len = sockaddr_from_ip("2001:500:2f::f", DNS_PORT, &ss);   /* f.root-servers.net */
+    int fd = len ? socket(AF_INET6, SOCK_DGRAM, 0) : -1;
+    if (fd < 0) return false;
+    bool ok = connect(fd, (struct sockaddr*)&ss, len) == 0;
+    close(fd);
+    return ok;
+}
 
 static void install_hints(const RootHint* table)
 {
+    bool v6 = have_ipv6_egress();          /* probe outside the lock */
+    int n4 = 0, n6 = 0;
+    for (int i = 0; i < ROOT_SERVERS; i++) {
+        if (table[i].ip[0])  n4++;
+        if (table[i].ip6[0]) n6++;
+    }
     pthread_rwlock_wrlock(&g_hints_lock);
     memcpy(g_hints, table, sizeof(g_hints));
+    g_hints_use_v6 = v6;
     pthread_rwlock_unlock(&g_hints_lock);
+    printf("Root hints: %d IPv4, %d IPv6 addresses; IPv6 roots %s\n",
+           n4, n6, v6 ? "enabled" : "skipped (no IPv6 egress)");
 }
 
 /* Parse `dig . NS` style output.  Addresses are matched to NS names by owner
@@ -128,8 +177,9 @@ int load_hints(const char* filename)
 
     RootHint t[ROOT_SERVERS] = {0};
     int ns_count = 0;
-    struct { char owner[256]; char ip[INET6_ADDRSTRLEN]; } v4[64];
-    int nv4 = 0;
+    struct Glue { char owner[256]; char ip[INET6_ADDRSTRLEN]; };
+    struct Glue v4[64], v6[64];
+    int nv4 = 0, nv6 = 0;
 
     char line[512];
     while (fgets(line, sizeof(line), fp)) {
@@ -153,20 +203,32 @@ int load_hints(const char* filename)
             snprintf(v4[nv4].owner, sizeof(v4[0].owner), "%s", tok[0]);
             snprintf(v4[nv4].ip, sizeof(v4[0].ip), "%s", value);
             nv4++;
+        } else if (strcasecmp(rtype, "AAAA") == 0 && nv6 < (int)(sizeof(v6) / sizeof(v6[0]))) {
+            snprintf(v6[nv6].owner, sizeof(v6[0].owner), "%s", tok[0]);
+            snprintf(v6[nv6].ip, sizeof(v6[0].ip), "%s", value);
+            nv6++;
         }
     }
     fclose(fp);
 
-    int usable = 0;
+    int usable4 = 0, usable6 = 0;
     for (int i = 0; i < ns_count; i++) {
         for (int j = 0; j < nv4 && !t[i].ip[0]; j++)      /* first match wins */
             if (dname_is_subdomain(v4[j].owner, t[i].name) &&
                 dname_is_subdomain(t[i].name, v4[j].owner))
                 snprintf(t[i].ip, sizeof(t[i].ip), "%s", v4[j].ip);
-        if (t[i].ip[0]) usable++;
+        for (int j = 0; j < nv6 && !t[i].ip6[0]; j++)
+            if (dname_is_subdomain(v6[j].owner, t[i].name) &&
+                dname_is_subdomain(t[i].name, v6[j].owner))
+                snprintf(t[i].ip6, sizeof(t[i].ip6), "%s", v6[j].ip);
+        if (t[i].ip[0])  usable4++;
+        if (t[i].ip6[0]) usable6++;
     }
-    if (usable == 0) {
-        fprintf(stderr, "Hints file %s yielded no usable root servers; keeping current hints\n",
+    /* An IPv6-only table is only usable if this host can actually reach IPv6;
+     * otherwise keep whatever we already have rather than install a table we
+     * could never query. */
+    if (usable4 == 0 && !(usable6 > 0 && have_ipv6_egress())) {
+        fprintf(stderr, "Hints file %s yielded no reachable root servers; keeping current hints\n",
                 filename);
         return -1;
     }
@@ -183,10 +245,17 @@ int load_hints_builtin(void)
         "192.36.148.17", "192.58.128.30", "193.0.14.129", "199.7.83.42",
         "202.12.27.33",
     };
+    static const char* ip6s[ROOT_SERVERS] = {
+        "2001:503:ba3e::2:30", "2801:1b8:10::b", "2001:500:2::c",  "2001:500:2d::d",
+        "2001:500:a8::e",      "2001:500:2f::f", "2001:500:12::d0d", "2001:500:1::53",
+        "2001:7fe::53",        "2001:503:c27::2:30", "2001:7fd::1", "2001:500:9f::42",
+        "2001:dc3::35",
+    };
     RootHint t[ROOT_SERVERS];
     for (int i = 0; i < ROOT_SERVERS; i++) {
         snprintf(t[i].name, sizeof(t[i].name), "%c.root-servers.net.", 'a' + i);
         snprintf(t[i].ip, sizeof(t[i].ip), "%s", ips[i]);
+        snprintf(t[i].ip6, sizeof(t[i].ip6), "%s", ip6s[i]);
     }
     install_hints(t);
     return ROOT_SERVERS;
@@ -200,17 +269,35 @@ char* hints_random_root_ip(void)
     int best_score = 0;
     int start = random_index(ROOT_SERVERS);
     pthread_rwlock_rdlock(&g_hints_lock);
-    for (int k = 0; k < ROOT_SERVERS; k++) {
-        const RootHint* h = &g_hints[(start + k) % ROOT_SERVERS];
-        if (!h->ip[0]) continue;
-        int sc = infra_score(h->ip);
-        if (!best[0] || sc < best_score) {
-            memcpy(best, h->ip, sizeof(best));
-            best_score = sc;
+    /* IPv4 first, IPv6 only if that found nothing.  The v6 roots are a
+     * fallback for an IPv6-only or NAT64 LAN, not a second pool to spread
+     * load over: letting the families compete on score would hand the first
+     * query for each root to an unreachable address on the networks that
+     * advertise IPv6 routing but cannot actually carry it, and only infra
+     * backoff (after the failure) would steer away. */
+    for (int pass = 0; pass < 2 && !best[0]; pass++) {
+        if (pass == 1 && !g_hints_use_v6) break;
+        for (int k = 0; k < ROOT_SERVERS; k++) {
+            const RootHint* h = &g_hints[(start + k) % ROOT_SERVERS];
+            const char* ip = pass == 0 ? h->ip : h->ip6;
+            if (!ip[0]) continue;
+            int sc = infra_score(ip);
+            if (!best[0] || sc < best_score) {
+                snprintf(best, sizeof(best), "%s", ip);
+                best_score = sc;
+            }
         }
     }
     pthread_rwlock_unlock(&g_hints_lock);
     return best[0] ? strdup(best) : NULL;
+}
+
+bool hints_ipv6_usable(void)
+{
+    pthread_rwlock_rdlock(&g_hints_lock);
+    bool v6 = g_hints_use_v6;
+    pthread_rwlock_unlock(&g_hints_lock);
+    return v6;
 }
 
 int hints_copy_names(char names[ROOT_SERVERS][256])

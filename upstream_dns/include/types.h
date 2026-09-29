@@ -131,6 +131,7 @@ typedef struct ServerConfig {
     char* acl_csv;         /* -a; NULL = built-in allow-list */
     int   rate_limit_qps;  /* -r; 0 = off */
     char* drop_user;       /* -U user[:group]; NULL = no drop */
+    char* log_level;       /* -L error|warn|info|debug; NULL = built-in default */
 } Config;
 
 #endif /* TYPES_H */

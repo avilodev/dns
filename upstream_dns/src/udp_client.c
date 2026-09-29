@@ -1,4 +1,5 @@
 #include "udp_client.h"
+#include "diag.h"
 #include "dns_packet.h"
 #include "infra.h"
 #include "utils.h"
@@ -136,12 +137,12 @@ static struct Packet* query_udp(const char* server_ip, struct Packet* query, int
 
         ssize_t n = recv(fd, buf, sizeof(buf), 0);
         if (n < 0) {
-            if (!errno_is_timeout(errno)) perror("  recv failed");
+            if (!errno_is_timeout(errno)) diag(DIAG_DEBUG, "  recv failed: %s\n", strerror(errno));
             break;
         }
         resp = parse_response(buf, n);
         if (resp && reply_matches(resp, query) && counts_plausible(resp, n)) break;
-        fprintf(stderr, "  Reply from %s does not match the query; ignoring\n", server_ip);
+        diag(DIAG_DEBUG, "  Reply from %s does not match the query; ignoring\n", server_ip);
         free_packet(resp);
         resp = NULL;
     }
@@ -160,6 +161,22 @@ struct Packet* query_server(const char* server_ip, struct Packet* query)
     return query_udp(server_ip, query, timeout_sec);
 }
 
+/* Read exactly len bytes, giving up once timeout_sec has passed since t0. */
+static bool recv_all_by(int fd, void* buf, size_t len, const struct timespec* t0, int timeout_sec)
+{
+    size_t got = 0;
+    while (got < len) {
+        long left = timeout_sec * 1000L - elapsed_ms(t0);
+        if (left <= 0) return false;
+        struct timeval tv = { .tv_sec = left / 1000, .tv_usec = (left % 1000) * 1000 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ssize_t n = recv(fd, (char*)buf + got, len - got, 0);
+        if (n <= 0) return false;
+        got += (size_t)n;
+    }
+    return true;
+}
+
 /* TCP fallback for TC=1 answers (RFC 1035 §4.2.2). */
 struct Packet* query_server_tcp(const char* server_ip, struct Packet* query)
 {
@@ -172,11 +189,16 @@ struct Packet* query_server_tcp(const char* server_ip, struct Packet* query)
     int fd = slen ? socket(srv.ss_family, SOCK_STREAM, 0) : -1;
     if (fd < 0) return NULL;
 
+    /* One deadline for the whole exchange: connect, send and both reads each
+     * waiting a full timeout could run 3x the hop budget and outlast
+     * auth_dns's forward timeout. */
+    struct timespec t_start;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
     struct timeval tv = { .tv_sec = timeout_sec };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (connect(fd, (struct sockaddr*)&srv, slen) < 0) {
-        perror("  TCP connect failed");
+        diag(DIAG_DEBUG, "  TCP connect failed: %s\n", strerror(errno));
         infra_report_failure(server_ip);
         close(fd);
         return NULL;
@@ -189,22 +211,22 @@ struct Packet* query_server_tcp(const char* server_ip, struct Packet* query)
     char* buf = NULL;
     uint16_t rlen = 0;
     bool ok = tcp_send_msg(fd, query->request, (size_t)query->recv_len) &&
-              recv(fd, prefix, 2, MSG_WAITALL) == 2 &&
+              recv_all_by(fd, prefix, 2, &t_start, timeout_sec) &&
               (rlen = rd16(prefix)) >= HEADER_LEN && (buf = malloc(rlen)) &&
-              recv(fd, buf, rlen, MSG_WAITALL) == rlen;
+              recv_all_by(fd, buf, rlen, &t_start, timeout_sec);
     close(fd);
     if (!ok) { free(buf); return NULL; }
 
     struct Packet* resp = parse_response(buf, rlen);
     free(buf);
     if (resp && !counts_plausible(resp, rlen)) {
-        fprintf(stderr, "  TCP response from %s has impossible RR counts; dropping\n", server_ip);
+        diag(DIAG_DEBUG, "  TCP response from %s has impossible RR counts; dropping\n", server_ip);
         infra_report_failure(server_ip);
         free_packet(resp);
         return NULL;
     }
     if (resp && !reply_matches(resp, query)) {
-        fprintf(stderr, "  TCP response from %s does not match the query; dropping\n", server_ip);
+        diag(DIAG_DEBUG, "  TCP response from %s does not match the query; dropping\n", server_ip);
         infra_report_failure(server_ip);
         free_packet(resp);
         return NULL;

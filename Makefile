@@ -17,8 +17,14 @@
 # (no absolute path or username baked in), so cloning the repo to any path / user
 # just works:
 #
-#   dns_log            — daily: archives + truncates the auth server.log
-#                        (rendered into /etc/cron.daily)
+#   dns_log            — nightly at 00:05: archives BOTH query logs, the
+#                        launcher log and the per-server .err files into
+#                        <repo>/logs/YYYY/MM/DD/, gzips them, and prunes past
+#                        RETENTION_DAYS. Installed as a /etc/cron.d entry that
+#                        runs a copy rendered from cron_scripts/dns_log (paths
+#                        substituted), so re-run `make install` after editing.
+#                        (cron.daily is anacron-driven and fires at ~06:25,
+#                        which would put two half-days in each dated dir.)
 #   refresh-root-hints — daily: refreshes the upstream resolver's root hints
 #                        (rendered into /etc/cron.daily)
 #   dns-startup        — @reboot: starts the servers at boot. Installed as a
@@ -38,6 +44,9 @@ CRON_DAILY := /etc/cron.daily
 CRON_D     := /etc/cron.d
 STARTUP_SRC  := $(DNS_ROOT)/cron_scripts/dns-startup
 STARTUP_CRON := $(CRON_D)/dns-startup
+LOGROT_SRC   := $(DNS_ROOT)/cron_scripts/dns_log
+LOGROT_CRON  := $(CRON_D)/dns-log
+LOGROT_GEN   := $(DNS_ROOT)/cron_scripts/.dns_log.generated
 
 all:
 	$(MAKE) -C auth_dns
@@ -59,11 +68,20 @@ daily-cron:
 	@mkdir -p $(LOG_DIR)
 	@chown -R $(RUN_USER):$(RUN_GROUP) $(LOG_DIR)
 	@chmod 755 $(LOG_DIR)
+	@rm -f $(CRON_DAILY)/dns_log        # superseded by $(LOGROT_CRON)
 	sed -e 's|@LOG_DIR@|$(LOG_DIR)|g' \
 	    -e 's|@RUN_USER@|$(RUN_USER)|g' \
 	    -e 's|@RUN_GROUP@|$(RUN_GROUP)|g' \
-	    cron_scripts/dns_log > $(CRON_DAILY)/dns_log
-	chmod 755 $(CRON_DAILY)/dns_log
+	    cron_scripts/dns_log > $(LOGROT_GEN)
+	@chown root:root $(LOGROT_GEN) 2>/dev/null || true
+	@chmod 755 $(LOGROT_GEN)
+	@printf '%s\n%s\n%s\n%s\n' \
+	    '# Nightly DNS log rotation. Edit the script, not this file:' \
+	    '#   $(LOGROT_SRC)   (re-run `make install` to re-render)' \
+	    'MAILTO=""' \
+	    '5 0 * * * root $(LOGROT_GEN)' \
+	    > $(LOGROT_CRON)
+	@chmod 644 $(LOGROT_CRON)
 	sed -e 's|@HINTS_DEST@|$(HINTS_DEST)|g' \
 	    cron_scripts/refresh-root-hints > $(CRON_DAILY)/refresh-root-hints
 	chmod 755 $(CRON_DAILY)/refresh-root-hints
@@ -80,9 +98,22 @@ daily-cron:
 # The path's leading '/' is wrapped in a regex class ([/]) so the pattern does
 # NOT match pkill's OWN recipe shell — whose argv literally contains the pattern
 # string. Without it, pkill SIGTERMs the shell running it and the recipe dies.
+#
+# pkill only SENDS the signal; a server drains its in-flight queries before it
+# closes its sockets (up to ~5 s).  Wait for both to exit, or the `install`
+# that follows races them for the ports: upstream then dies on EADDRINUSE and
+# auth comes up without its TCP listener.
+NATIVE_AUTH_PAT     := $(patsubst /%,[/]%,$(DNS_ROOT))/auth_dns/bin/auth_dns
+NATIVE_UPSTREAM_PAT := $(patsubst /%,[/]%,$(DNS_ROOT))/upstream_dns/bin/upstream_dns
 stop-native:
-	@pkill -f '$(patsubst /%,[/]%,$(DNS_ROOT))/auth_dns/bin/auth_dns'         2>/dev/null || true
-	@pkill -f '$(patsubst /%,[/]%,$(DNS_ROOT))/upstream_dns/bin/upstream_dns' 2>/dev/null || true
+	@pkill -f '$(NATIVE_AUTH_PAT)'     2>/dev/null || true
+	@pkill -f '$(NATIVE_UPSTREAM_PAT)' 2>/dev/null || true
+	@for i in $$(seq 1 150); do \
+	     pgrep -f '$(NATIVE_AUTH_PAT)' >/dev/null || \
+	     pgrep -f '$(NATIVE_UPSTREAM_PAT)' >/dev/null || exit 0; \
+	     sleep 0.1; \
+	 done; \
+	 echo "WARNING: native DNS servers still running after 15 s"
 	@rm -f $(STARTUP_CRON)
 
 # Stop a DOCKER deployment: remove the containers (frees the ports). Images and
@@ -106,7 +137,7 @@ install: all stop-docker stop-native daily-cron
 	$(STARTUP_SRC)
 	@echo ""
 	@echo "Installed cron jobs:"
-	@echo "  $(CRON_DAILY)/dns_log              daily log archive"
+	@echo "  $(LOGROT_CRON)              00:05 log rotation -> $(LOG_DIR)/YYYY/MM/DD"
 	@echo "  $(CRON_DAILY)/refresh-root-hints   daily root-hints refresh"
 	@echo "  $(STARTUP_CRON)            @reboot -> $(STARTUP_SRC)"
 	@echo ""
@@ -116,8 +147,8 @@ install: all stop-docker stop-native daily-cron
 # Stop the native servers and remove all their cron jobs (stop-native also kills
 # the host processes and removes the @reboot launcher).
 uninstall: stop-native
-	rm -f $(CRON_DAILY)/dns_log $(CRON_DAILY)/refresh-root-hints
-	@echo "Stopped native servers; removed cron jobs (dns_log, refresh-root-hints, dns-startup)."
+	rm -f $(LOGROT_CRON) $(LOGROT_GEN) $(CRON_DAILY)/dns_log $(CRON_DAILY)/refresh-root-hints
+	@echo "Stopped native servers; removed cron jobs (dns-log, refresh-root-hints, dns-startup)."
 
 # --- Docker -----------------------------------------------------------------
 # `sudo make docker` reads dns.conf, installs the daily cron jobs, builds the
@@ -166,6 +197,10 @@ release:
 # image names resolve to the registry (not the local fallback tag).
 deploy:
 	@set -a; . ./dns.conf; set +a; \
+	 if [ "$$AUTH_ENABLED" = true ] && [ "$$UPSTREAM_ENABLED" != true ] && [ -z "$$AUTH_UPSTREAM_IP" ]; then \
+	     echo "ERROR: auth is enabled without upstream and AUTH_UPSTREAM_IP is blank."; \
+	     echo "       Set AUTH_UPSTREAM_IP in dns.conf to an external resolver (e.g. 1.1.1.1)."; exit 1; \
+	 fi; \
 	 . ./cron_scripts/dns-args.sh; \
 	 export AUTH_ARGS="$$(build_auth_args 172.28.0.2)"; \
 	 export UPSTREAM_ARGS="$$(build_upstream_args)"; \
@@ -182,5 +217,5 @@ deploy:
 # cron jobs.
 docker-down:
 	docker compose --profile auth --profile upstream down --rmi local --remove-orphans
-	rm -f $(CRON_DAILY)/dns_log $(CRON_DAILY)/refresh-root-hints
+	rm -f $(LOGROT_CRON) $(LOGROT_GEN) $(CRON_DAILY)/dns_log $(CRON_DAILY)/refresh-root-hints
 	@echo "Stopped containers, removed images, and daily cron jobs"

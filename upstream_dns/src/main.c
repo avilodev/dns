@@ -2,6 +2,7 @@
 #include "cache.h"
 #include "client_reply.h"
 #include "config.h"
+#include "diag.h"
 #include "dns_name.h"
 #include "query_log.h"
 #include "response_handler.h"
@@ -24,7 +25,8 @@ TrustAnchor* g_trust_anchors = NULL;
 
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_reload_hints = 0;
-static int stats_pipe[2] = {-1, -1};   /* SIGUSR1/2 -> main loop (self-pipe) */
+static volatile sig_atomic_t g_reopen_log = 0;
+static int stats_pipe[2] = {-1, -1};   /* SIGUSR1 -> main loop (self-pipe) */
 
 /* ---- Process setup ----------------------------------------------------- */
 
@@ -99,8 +101,15 @@ static void signal_handler(int signum)
     case SIGHUP:
         g_reload_hints = 1;
         break;
-    case SIGUSR1: case SIGUSR2:
+    case SIGUSR1:
         if (stats_pipe[1] >= 0 && write(stats_pipe[1], "s", 1) < 0) { /* best-effort */ }
+        break;
+    /* Reopen the query log ONLY — this is what the daily archiver sends after
+     * it moves the file aside.  SIGHUP would also work but drags the root
+     * hints reload and an NS-cache flush along with it, which is far too
+     * expensive to pay once a day just to rotate a log. */
+    case SIGUSR2:
+        g_reopen_log = 1;
         break;
     }
 }
@@ -191,6 +200,22 @@ static bool serve_from_cache(int sock, const char* req, ssize_t req_len,
     return true;
 }
 
+/* Log a query refused by the allow-list (auth_dns logs these too). */
+static void log_refused(const char* req, ssize_t req_len, const struct sockaddr_storage* ss)
+{
+    char domain[DNAME_TEXT_MAX];
+    uint16_t qtype = 0, edns_size;
+    bool do_bit;
+    if (!quick_parse_query(req, req_len, domain, sizeof(domain), &qtype, &do_bit, &edns_size)) {
+        snprintf(domain, sizeof(domain), "-");
+        qtype = 0;
+    }
+    char ip[INET6_ADDRSTRLEN];
+    uint16_t port;
+    sockaddr_to_ip(ss, ip, &port);
+    log_query(ip, port, qtype, domain, RCODE_REFUSED, NULL);
+}
+
 /* One datagram: filter, try the cache, else queue for a worker.  Returns
  * false to stop draining the socket (out of memory). */
 static bool handle_udp_datagram(int sock, struct ThreadPool* pool, const char* buf, ssize_t len,
@@ -210,6 +235,7 @@ static bool handle_udp_datagram(int sock, struct ThreadPool* pool, const char* b
     if (!rl_allow(ss)) return true;
     if (!acl_allows(ss)) {
         send_error_udp(sock, sa, ss_len, (const unsigned char*)buf, len, RCODE_REFUSED);
+        log_refused(buf, len, ss);
         return true;
     }
     if (serve_from_cache(sock, buf, len, ss, ss_len)) return true;
@@ -225,16 +251,21 @@ static bool handle_udp_datagram(int sock, struct ThreadPool* pool, const char* b
     ctx->client_addr     = *ss;
     ctx->client_addr_len = ss_len;
     if (threadpool_add_work(pool, process_query, ctx) < 0) {
-        fprintf(stderr, "Error: Failed to queue work (pool might be full)\n");
+        diag(DIAG_DEBUG, "Error: Failed to queue work (pool might be full)\n");
         send_error_udp(sock, sa, ss_len, (const unsigned char*)buf, len, RCODE_SERVER_FAILURE);
         free(ctx);
     }
     return true;
 }
 
+/* Datagrams handled per socket per poll() pass.  Draining to EAGAIN let a
+ * steady flood on one socket starve the other family, TCP accepts and signal
+ * handling (SIGTERM, SIGHUP) indefinitely. */
+#define UDP_DRAIN_BATCH 256
+
 static void drain_udp_socket(int sock, struct ThreadPool* pool)
 {
-    for (;;) {
+    for (int i = 0; i < UDP_DRAIN_BATCH; i++) {
         char buf[MAXLINE];
         struct sockaddr_storage ss = {0};
         socklen_t ss_len = sizeof(ss);
@@ -254,7 +285,16 @@ static void accept_tcp(int listener, struct ThreadPool* pool)
     struct sockaddr_storage ss = {0};
     socklen_t len = sizeof(ss);
     int fd = accept(listener, (struct sockaddr*)&ss, &len);
-    if (fd < 0) return;
+    if (fd < 0) {
+        /* Out of descriptors/memory: the connection stays in the backlog, so
+         * poll() would report it again at once and spin.  Pause briefly
+         * (UDP queues in the kernel meanwhile). */
+        if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+            diag(DIAG_WARN, "accept: %s; pausing TCP accepts\n", strerror(errno));
+            usleep(50000);
+        }
+        return;
+    }
     if (!acl_allows(&ss) || !rl_allow(&ss) || !tcp_conn_acquire(&ss)) {
         close(fd);
         return;
@@ -263,6 +303,7 @@ static void accept_tcp(int listener, struct ThreadPool* pool)
     if (ctx) {
         ctx->client_fd = fd;
         ctx->client_ss = ss;
+        ctx->pool      = pool;
         if (threadpool_add_work(pool, process_tcp_query, ctx) == 0) return;
     }
     close(fd);
@@ -299,7 +340,8 @@ int main(int argc, char** argv)
 
     if (load_config(argc, argv) < 0) {
         printf("Usage: ./bin/upstream_dns [-p port] [-t threads] [-q queue_size] [-b bind_addr]"
-               " [-a allow_cidrs] [-r per_source_qps] [-U user[:group]]\n");
+               " [-a allow_cidrs] [-r per_source_qps] [-U user[:group]]"
+               " [-L error|warn|info|debug]\n");
         exit(1);
     }
 
@@ -332,7 +374,7 @@ int main(int argc, char** argv)
     char hints_file[256];
     snprintf(hints_file, sizeof(hints_file), "%s%s", SERVER_PATH, HINTS_FILE);
     path_pin(hints_file);
-    path_pin(LOG_FILE_PATH);
+    log_pin_paths();
     path_pin(SERVER_PATH TRUST_ANCHOR_FILE);
     int nroots = load_hints(hints_file);
     if (nroots < 0) {
@@ -352,6 +394,14 @@ int main(int argc, char** argv)
     int tcp6 = create_listener(AF_INET6, SOCK_STREAM, port, false);
     if (udp4 < 0 && udp6 < 0)
         die("no UDP listener could be bound; check -b ", g_config.bind_addr);
+    /* A TCP bind that fails while the SAME family's UDP bind succeeded means
+     * the port is already served by another instance (create_listener returns
+     * -1 for both when -b selects the other family, which is not an error).
+     * Carrying on would leave a UDP-only half-server racing the first one for
+     * datagrams, so stop instead of warning. */
+    if ((udp4 >= 0 && tcp4 < 0) || (udp6 >= 0 && tcp6 < 0))
+        die("TCP listener failed while the same family's UDP listener bound — "
+            "another instance is probably already running", NULL);
 
     /* Open the log while root so its fd survives the drop. */
     if (g_config.drop_user) log_reopen_upstream();
@@ -379,6 +429,10 @@ int main(int argc, char** argv)
         if (g_reload_hints) {
             g_reload_hints = 0;
             reload(hints_file);
+        }
+        if (g_reopen_log) {
+            g_reopen_log = 0;
+            log_reopen_upstream();
         }
         /* 1 s timeout so signals are noticed promptly. */
         int nready = poll(pfds, P_COUNT, 1000);

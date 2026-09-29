@@ -150,6 +150,7 @@ typedef struct ServerConfig {
     char* drop_user;       /* drop to this user[:group] after bind (-U); NULL=off */
     char* block_mode;      /* -S: "nxdomain"(default)|"zero"|"<ip>"; NULL=default */
     char* config_path;     /* -c: config file path; NULL = built-in default       */
+    char* log_level;       /* -L: error|warn|info|debug; NULL = built-in default  */
 } Config;
 
 #endif /* TYPES_H */

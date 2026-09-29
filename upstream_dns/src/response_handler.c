@@ -142,9 +142,12 @@ NSCandidateList* extract_all_ns_with_glue(struct Packet* response,
         free(owner);
     }
 
+    /* IPv6 glue only stands in for missing IPv4 glue, and only on a host that
+     * can reach IPv6 — otherwise the NS stays glueless and gets resolved. */
+    bool v6_ok = hints_ipv6_usable();
     for (int i = 0; i < list->count; i++) {
-        if (!list->candidates[i].ns_ip) list->candidates[i].ns_ip = v6_glue[i];
-        else                            free(v6_glue[i]);
+        if (!list->candidates[i].ns_ip && v6_ok) list->candidates[i].ns_ip = v6_glue[i];
+        else                                     free(v6_glue[i]);
     }
     return list;
 }
@@ -158,6 +161,18 @@ void free_ns_candidate_list(NSCandidateList* list)
     }
     free(list->candidates);
     free(list);
+}
+
+/* An authoritative NODATA carries the zone's SOA in its authority section; a
+ * delegation carries NS and no SOA.  The AA bit alone can't tell them apart —
+ * some servers wrongly set it on referrals (RFC 2308 2.2). */
+bool authority_has_soa(struct Packet* response)
+{
+    if (!has_wire(response)) return false;
+    RRIter it; DnsRR rr;
+    for (rr_iter_init(&it, response->request, (int)response->recv_len); rr_next(&it, &rr); )
+        if (rr.section == SEC_AUTHORITY && rr.type == QTYPE_SOA) return true;
+    return false;
 }
 
 /* Filter by type: signed referrals put NSEC/RRSIG in the authority section too. */
@@ -333,7 +348,10 @@ static void filter_rrs(char** bufp, ssize_t* lenp, uint16_t qtype,
 
     /* Worst case: every kept RR emits a 255-byte owner, 10 fixed bytes and a
      * decompressed RDATA of at most 530 (SOA: two names plus 20 bytes). */
-    const long cap_max = (long)q_end + (long)total * (255 + 10 + 530) + 16;
+    long cap_max = (long)q_end + (long)total * (255 + 10 + 530) + 16;
+    /* A DNS message cannot exceed 65535 bytes (the TCP length prefix): if the
+     * rebuilt one would, keep the original rather than emit an unsendable one. */
+    if (cap_max > 65535) cap_max = 65535;
 
     for (long out_cap = (long)len * 4 + 2048; ; out_cap *= 4) {
         if (out_cap > cap_max) out_cap = cap_max;
@@ -378,7 +396,73 @@ void strip_dnssec_for_non_do(char** bufp, ssize_t* lenp, uint16_t qtype)
     filter_rrs(bufp, lenp, qtype, true, false, true);
 }
 
+/* Does every name in m[0..len) still decode (no pointer into cut bytes)? */
+static bool names_intact(const uint8_t* m, int len)
+{
+    char name[DNAME_TEXT_MAX];
+    if (rd16(m + 4) > 0 && dname_from_wire(m, len, HEADER_LEN, false, name, sizeof(name)) < 0)
+        return false;
+    RRIter it; DnsRR rr;
+    int seen = 0;
+    for (rr_iter_init(&it, m, len); rr_next(&it, &rr); seen++) {
+        if (dname_from_wire(m, len, rr.owner, false, name, sizeof(name)) < 0) return false;
+        int rd = rr.rdata;
+        switch (rr.type) {
+        case QTYPE_NS: case QTYPE_CNAME: case QTYPE_PTR:
+            if (dname_from_wire(m, len, rd, false, name, sizeof(name)) < 0) return false;
+            break;
+        case QTYPE_MX:
+            if (rr.rdlen < 3 || dname_from_wire(m, len, rd + 2, false, name, sizeof(name)) < 0)
+                return false;
+            break;
+        case QTYPE_SOA: {
+            int p = dname_from_wire(m, len, rd, false, name, sizeof(name));
+            if (p < 0 || dname_from_wire(m, len, p, false, name, sizeof(name)) < 0) return false;
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    return seen == rd16(m + 6) + rd16(m + 8) + rd16(m + 10);
+}
+
+/*
+ * Fast path for the usual reply shape: exactly one OPT, and it is the last
+ * record.  Cutting it off keeps the sender's name compression — the rebuild
+ * in filter_rrs() writes every name out in full, which grew typical answers
+ * by half and pushed them over 512/1232 bytes (TC=1, TCP retry) for nothing.
+ * Returns false (message untouched) whenever the shape doesn't fit.
+ */
+static bool cut_trailing_opt(char** bufp, ssize_t* lenp)
+{
+    uint8_t* m = (uint8_t*)*bufp;
+    int len = (int)*lenp;
+    int total = rd16(m + 6) + rd16(m + 8) + rd16(m + 10);
+    RRIter it; DnsRR rr;
+    int seen = 0, opts = 0, opt_start = -1, end = -1;
+    bool last_is_opt = false;
+    for (rr_iter_init(&it, m, len); rr_next(&it, &rr); seen++) {
+        last_is_opt = rr.type == QTYPE_OPT;
+        if (last_is_opt) { opts++; opt_start = rr.owner; }
+        end = rr.rdata + rr.rdlen;
+    }
+    if (seen != total || opts != 1 || !last_is_opt || rr.section != SEC_ADDITIONAL ||
+        end != len || opt_start < HEADER_LEN)
+        return false;
+
+    wr16(m + 10, (uint16_t)(rd16(m + 10) - 1));
+    if (!names_intact(m, opt_start)) {             /* a pointer reached into the OPT */
+        wr16(m + 10, (uint16_t)(rd16(m + 10) + 1));
+        return false;
+    }
+    *lenp = opt_start;
+    return true;
+}
+
 void strip_opt_rr(char** bufp, ssize_t* lenp)
 {
+    if (!bufp || !*bufp || !lenp || *lenp < HEADER_LEN) return;
+    if (cut_trailing_opt(bufp, lenp)) return;
     filter_rrs(bufp, lenp, 0, false, true, false);
 }

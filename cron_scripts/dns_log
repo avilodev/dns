@@ -1,52 +1,204 @@
 #!/bin/bash
+#
+# dns_log — nightly log rotation for both DNS servers.
+#
+# Installed by `make install`, which renders this file (paths substituted) to
+# cron_scripts/.dns_log.generated and points a /etc/cron.d entry at that copy —
+# so after editing it here, re-run `make install` for the change to apply.
+# Everything it touches lives under <repo>/logs — nothing is written anywhere
+# else on the system.
+#
+# Why cron.d and not cron.daily: cron.daily is driven by anacron and fires at
+# whatever time it gets round to (06:25 on this box), so an archive labelled
+# "the 21st" actually held 06:25 on the 20th through 06:25 on the 21st. The
+# cron.d entry runs at 00:05, which makes each dated directory hold one real
+# calendar day.
+#
+# Layout (unchanged — logs stay in the repo, partitioned by date):
+#
+#   logs/server.log                       live auth query log
+#   logs/upstream.log                     live recursive-resolver query log
+#   logs/dns-startup.log                  launcher diagnostics
+#   logs/auth.err, logs/upstream.err      per-server stderr/stdout
+#   logs/YYYY/MM/DD/<name>.log.gz         archived, compressed, pruned
+#
+# `make install` substitutes the placeholders below from its own location, so
+# no absolute path or username is baked into the repo.
 
-# DNS Log Archiver - Daily log rotation script for the auth server's server.log.
-# Installed to /etc/cron.daily/ by `make install`, which substitutes the
-# placeholders below with values derived from the install location — so no
-# absolute path or username is baked into the repo.
+set -euo pipefail
 
-set -e
-
-LOG_FILE="@LOG_DIR@/server.log"
 BASE_DIR="@LOG_DIR@"
-YEAR=$(date +%Y)
-MONTH=$(date +%m)
-DAY=$(date +%d)
+RUN_USER="@RUN_USER@"
+RUN_GROUP="@RUN_GROUP@"
+
+# How many days of archive to keep. The live logs are rotated every night, so
+# this is the only thing bounding total disk use.
+RETENTION_DAYS=30
+
+# Yesterday: this runs just after midnight, so the data being rotated belongs
+# to the day that has just ended, not the one that just started.
+read -r YEAR MONTH DAY <<< "$(date -d 'yesterday' '+%Y %m %d')"
 DEST_DIR="$BASE_DIR/$YEAR/$MONTH/$DAY"
 
-# Create destination directory if it doesn't exist.
-# Own the date dirs as the run user (not root) so the archive can be pruned
-# without sudo, while staying 0755 (not world-writable). The parents are
-# included because an earlier run may have created them root-owned.
+# Our own output goes into the logs directory, not to root's mailbox — a
+# nightly cron job that mails every run is a job people stop reading. This
+# file is trimmed to the last MAX_OWN_LINES at the end of each run, so it is
+# self-bounding and never needs rotating itself.
+OWN_LOG="$BASE_DIR/rotation.log"
+MAX_OWN_LINES=500
+exec >> "$OWN_LOG" 2>&1
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') dns_log: $*"; }
+
+# An unused destination for <name> inside $DEST_DIR. Normally just "$name",
+# but a second run on the same day (a manual invocation, or a catch-up run
+# after the box was off) must not land on top of the archive the first run
+# already wrote — .gz included, since compression happens afterwards.
+dest_slot() {
+    local name="$1" candidate="$DEST_DIR/$1" n=1
+    while [ -e "$candidate" ] || [ -e "$candidate.gz" ]; do
+        candidate="$DEST_DIR/$name.$n"
+        n=$((n + 1))
+    done
+    echo "$candidate"
+}
+
+# --- Rotation ---------------------------------------------------------------
+
+# Own the date dirs as the run user (not root) so the archive can be pruned and
+# read without sudo, while staying 0755. The parents are included because an
+# earlier run may have created them root-owned.
 mkdir -p "$DEST_DIR"
-chown @RUN_USER@:@RUN_GROUP@ "$BASE_DIR/$YEAR" "$BASE_DIR/$YEAR/$MONTH" "$DEST_DIR"
+chown "$RUN_USER:$RUN_GROUP" "$BASE_DIR/$YEAR" "$BASE_DIR/$YEAR/$MONTH" "$DEST_DIR" 2>/dev/null || true
 chmod 755 "$BASE_DIR/$YEAR" "$BASE_DIR/$YEAR/$MONTH" "$DEST_DIR"
 
-# copy-then-truncate (like logrotate's copytruncate): the server keeps its
-# O_APPEND fd, so after the truncate it simply continues at offset 0.  Lines
-# written between the cp and the truncate are lost; that window is a few ms.
-# The flock only stops two runs of THIS script overlapping — the server does
-# not take it.
-(
-    flock -x -w 60 200 || exit 1
-    
-    # Copy the log file with timestamp
-    if [ -f "$LOG_FILE" ]; then
-        cp "$LOG_FILE" "$DEST_DIR/server.log"
-        chown @RUN_USER@:@RUN_GROUP@ "$DEST_DIR/server.log"
-        chmod 0644 "$DEST_DIR/server.log"
-        
-        # Truncate the original log file (optional - remove if you don't want this)
-        : > "$LOG_FILE"
-        
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - Log archived to $DEST_DIR/server.log"
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - Warning: Log file not found at $LOG_FILE"
-        exit 1
-    fi
-) 200>"$LOG_FILE.lock"
+# rotate_move <file> <archive-name> <signal-target...>
+#
+# The servers hold their query log open for the process lifetime, so we rename
+# it aside and then create the replacement OURSELVES (as root) and hand it to
+# the log's previous owner — the dropped-privilege server cannot create a file
+# in a directory it does not own. Only once the new file exists do we signal;
+# the server reopens by name through its pinned directory fd and continues.
+#
+# Nothing is lost: every line written before the rename is in the archived
+# inode, every line after it is in the new file. That is the whole reason for
+# not using copy-then-truncate, which dropped whatever landed in the gap.
+SIGNALLED=0
+rotate_move() {
+    local src="$1" name="$2"; shift 2
+    [ -s "$src" ] || { log "skip $name (missing or empty)"; return 0; }
 
-# Clean up lock file
-rm -f "$LOG_FILE.lock"
+    local owner mode dest
+    owner="$(stat -c '%U:%G' "$src")"
+    mode="$(stat -c '%a' "$src")"
+    dest="$(dest_slot "$name")"
+
+    mv "$src" "$dest"
+    : > "$src"
+    chown "$owner" "$src"
+    chmod "$mode" "$src"
+
+    # SIGUSR2 means "reopen the query log" and nothing else. SIGHUP would also
+    # work but drags a full config/hints reload and a cache flush with it.
+    local target
+    SIGNALLED=1
+    for target in "$@"; do
+        pkill -USR2 -x "$target" 2>/dev/null || true
+        if command -v docker > /dev/null 2>&1; then
+            docker kill --signal=USR2 "$target" > /dev/null 2>&1 || true
+        fi
+    done
+
+    chown "$RUN_USER:$RUN_GROUP" "$dest"
+    chmod 0644 "$dest"
+    log "archived $(basename "$dest")"
+}
+
+# rotate_copy <file> <archive-name>
+#
+# For files written by a plain shell `>>` redirect (the launcher and the two
+# .err captures). There is no process to signal and the fd carries its own
+# offset, so copy-then-truncate is the only option; O_APPEND means the writer
+# simply resumes at offset 0. The race window costs at most a line or two of
+# diagnostics, which is acceptable for these and was NOT acceptable for the
+# query logs above.
+rotate_copy() {
+    local src="$1" name="$2" dest
+    [ -s "$src" ] || { log "skip $name (missing or empty)"; return 0; }
+    dest="$(dest_slot "$name")"
+
+    cp "$src" "$dest"
+    : > "$src"
+    chown "$RUN_USER:$RUN_GROUP" "$dest"
+    chmod 0644 "$dest"
+    log "archived $(basename "$dest")"
+}
+
+rotate_move "$BASE_DIR/server.log"       server.log       auth_dns
+rotate_move "$BASE_DIR/upstream.log"     upstream.log     upstream_dns
+rotate_copy "$BASE_DIR/dns-startup.log"  dns-startup.log
+rotate_copy "$BASE_DIR/auth.err"         auth.err
+rotate_copy "$BASE_DIR/upstream.err"     upstream.err
+# rotation.log is deliberately NOT rotated — it is trimmed in place below.
+
+# Sweep up any generation the in-process size cap left behind (it fires only
+# when this job has not run for a long time, e.g. a fresh clone that never ran
+# `make install`).
+for stale in "$BASE_DIR"/*.log.0; do
+    [ -e "$stale" ] || continue
+    rotate_copy "$stale" "$(basename "$stale").overflow"
+    rm -f "$stale"
+done
+
+# A server reopens its log on its next main-loop pass (up to ~1 s after the
+# signal) and keeps appending to the archived inode until then.  gzip -f reads
+# that file and unlinks it, so anything written after the read would be lost:
+# give the servers time to switch before compressing.
+if [ "$SIGNALLED" = 1 ]; then
+    sleep 3
+fi
+
+# Compress everything that landed here and is not already compressed — which
+# covers the numbered variants dest_slot hands out, not just the base names.
+# CSV query logs go about 7:1, the diagnostic logs far better; that ratio is
+# what makes a month of retention cheap.
+find "$DEST_DIR" -maxdepth 1 -type f ! -name '*.gz' -exec gzip -f {} + 2>/dev/null || true
+chown "$RUN_USER:$RUN_GROUP" "$DEST_DIR"/* 2>/dev/null || true
+
+# Compress anything left uncompressed in OLDER date directories too. This
+# matters once, for archives written before rotation started gzipping, and is
+# a no-op on every run after that. Without it those files would sit at full
+# size until retention caught up with them.
+find "$BASE_DIR"/[0-9][0-9][0-9][0-9]/[0-9][0-9]/[0-9][0-9] \
+     -maxdepth 1 -type f ! -name '*.gz' -exec gzip -f {} + 2>/dev/null || true
+
+# --- Retention --------------------------------------------------------------
+
+# Prune whole day directories older than the cutoff, then the month/year
+# directories that just became empty. Restricted to the YYYY/MM/DD shape so a
+# mistyped BASE_DIR cannot turn this into a wildcard delete.
+CUTOFF="$(date -d "$RETENTION_DAYS days ago" '+%Y%m%d')"
+pruned=0
+for day_dir in "$BASE_DIR"/[0-9][0-9][0-9][0-9]/[0-9][0-9]/[0-9][0-9]; do
+    [ -d "$day_dir" ] || continue
+    stamp="$(basename "$(dirname "$(dirname "$day_dir")")")$(basename "$(dirname "$day_dir")")$(basename "$day_dir")"
+    if [ "$stamp" -lt "$CUTOFF" ] 2>/dev/null; then
+        rm -rf "$day_dir"
+        pruned=$((pruned + 1))
+    fi
+done
+find "$BASE_DIR" -mindepth 1 -maxdepth 2 -type d -empty -delete 2>/dev/null || true
+if [ "$pruned" -gt 0 ]; then
+    log "pruned $pruned day(s) older than $RETENTION_DAYS days"
+fi
+
+log "rotation complete -> $DEST_DIR"
+
+# Trim our own log in place, keeping the fd valid for any later append.
+if [ -f "$OWN_LOG" ]; then
+    tail -n "$MAX_OWN_LINES" "$OWN_LOG" > "$OWN_LOG.tmp" 2>/dev/null &&
+        cat "$OWN_LOG.tmp" > "$OWN_LOG" && rm -f "$OWN_LOG.tmp"
+    chown "$RUN_USER:$RUN_GROUP" "$OWN_LOG" 2>/dev/null || true
+fi
 
 exit 0

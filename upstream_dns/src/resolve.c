@@ -1,3 +1,4 @@
+#include "diag.h"
 #include "resolve.h"
 #include "cache.h"
 #include "cname_handler.h"
@@ -92,7 +93,7 @@ static char* next_ns_candidate(NSCandidateList* list, int* idx, NSResolutionCont
         if (list->glueless_left <= 0) continue;
         list->glueless_left--;
         if (ns_ctx && already_resolving_ns(ns_ctx, c->ns_name)) {
-            fprintf(stderr, "    NS resolution loop detected\n");
+            diag(DIAG_DEBUG, "    NS resolution loop detected\n");
             continue;
         }
         char* ip = resolve_ns_addr(c->ns_name, ns_ctx);
@@ -172,7 +173,12 @@ typedef struct {
     char*            visited[MAX_SERVERS_VISITED];   /* "server|zone" loop detection */
     int              nvisited;
     int              iteration;
+    int              root_retries;      /* other roots tried after a root failed */
 } Walk;
+
+/* Extra roots to try when the one asked fails: the root step has no referral
+ * list of siblings to fall back on. */
+#define ROOT_RETRIES 2
 
 typedef enum { STEP_CONTINUE, STEP_DONE } Step;
 
@@ -221,7 +227,7 @@ static void walk_start(Walk* w)
 /* The cached delegation went stale (every server failed): walk from a root. */
 static bool restart_from_root(Walk* w)
 {
-    fprintf(stderr, "  Cached nameservers for %s failed; retrying from root hints\n",
+    diag(DIAG_DEBUG, "  Cached nameservers for %s failed; retrying from root hints\n",
             w->query->full_domain);
     walk_forget_path(w);
     free(w->server);
@@ -238,6 +244,14 @@ static bool try_next_server(Walk* w)
 {
     free(w->server);
     w->server = next_ns_candidate(w->ns_list, &w->ns_idx, w->ns_ctx);
+    /* Still at the root (no referral yet): ask a different root.  The failed
+     * one was reported to infra and now scores behind the others, so the
+     * pick moves on; asking the same one again stops at the loop check. */
+    if (!w->server && !w->ns_list && w->zone && !w->zone[0] &&
+        w->root_retries < ROOT_RETRIES) {
+        w->root_retries++;
+        w->server = hints_random_root_ip();
+    }
     return w->server != NULL;
 }
 
@@ -260,11 +274,11 @@ static struct Packet* chase_cname(Walk* w, struct Packet* resp, int depth, Cname
     uint32_t ttl = extract_min_ttl_from_response(resp);   /* 0 = "don't cache" */
     free_packet(resp);
     if (!target) {
-        fprintf(stderr, "Failed to extract CNAME target\n");
+        diag(DIAG_DEBUG, "Failed to extract CNAME target\n");
         return NULL;
     }
     if (check_cname_loop(chain, target)) {
-        fprintf(stderr, "CNAME loop detected at: %s\n", target);
+        diag(DIAG_DEBUG, "CNAME loop detected at: %s\n", target);
         free(target);
         return NULL;
     }
@@ -279,7 +293,7 @@ static struct Packet* chase_cname(Walk* w, struct Packet* resp, int depth, Cname
         free_packet(next);
     }
     if (!final) {
-        fprintf(stderr, "Failed to resolve CNAME target\n");
+        diag(DIAG_DEBUG, "Failed to resolve CNAME target\n");
         free(target);
         return NULL;
     }
@@ -326,7 +340,7 @@ static Step follow_referral(Walk* w, struct Packet* resp)
     char* apex = extract_zone_apex(resp);
     if (!apex || !apex[0] || !dname_is_subdomain(q->full_domain, apex) ||
         !dname_is_subdomain(apex, w->zone) || dname_is_subdomain(w->zone, apex)) {
-        fprintf(stderr, "Rejecting out-of-bailiwick referral: apex='%s' server-zone='%s' query='%s'\n",
+        diag(DIAG_DEBUG, "Rejecting out-of-bailiwick referral: apex='%s' server-zone='%s' query='%s'\n",
                 apex ? apex : "(none)", w->zone, q->full_domain);
         free(apex);
         free_packet(resp);
@@ -341,7 +355,7 @@ static Step follow_referral(Walk* w, struct Packet* resp)
     int idx = 0;
     char* next = next_ns_candidate(list, &idx, w->ns_ctx);
     if (!next) {
-        fprintf(stderr, "All nameservers failed or unreachable\n");
+        diag(DIAG_DEBUG, "All nameservers failed or unreachable\n");
         free_ns_candidate_list(list);
         free(apex);
         free_packet(resp);
@@ -379,7 +393,7 @@ static Step walk_step(Walk* w, int depth, CnameChain* chain, struct Packet** out
 
     /* Out of time: SERVFAIL inside auth_dns's forward timeout. */
     if (resolver_deadline_exceeded()) {
-        fprintf(stderr, "Resolution budget (%ds) exceeded for %s — SERVFAIL\n",
+        diag(DIAG_DEBUG, "Resolution budget (%ds) exceeded for %s — SERVFAIL\n",
                 RECURSION_BUDGET_SEC, q->full_domain);
         return STEP_DONE;
     }
@@ -395,12 +409,12 @@ static Step walk_step(Walk* w, int depth, CnameChain* chain, struct Packet** out
     snprintf(key, sizeof(key), "%s|%s", w->server, w->zone);
     for (int i = 0; i < w->nvisited; i++) {
         if (strcmp(w->visited[i], key) == 0) {
-            fprintf(stderr, "Referral loop detected\n");
+            diag(DIAG_DEBUG, "Referral loop detected\n");
             return STEP_DONE;
         }
     }
     if (w->nvisited >= MAX_SERVERS_VISITED) {
-        fprintf(stderr, "Error: Referral loop — visited server limit (%d) exceeded\n",
+        diag(DIAG_DEBUG, "Error: Referral loop — visited server limit (%d) exceeded\n",
                 MAX_SERVERS_VISITED);
         return STEP_DONE;
     }
@@ -408,7 +422,7 @@ static Step walk_step(Walk* w, int depth, CnameChain* chain, struct Packet** out
 
     struct Packet* resp = query_server(w->server, w->query);
     if (!resp) {
-        fprintf(stderr, "No response from %s\n", w->server);
+        diag(DIAG_DEBUG, "No response from %s\n", w->server);
         if (try_next_server(w) || (w->from_cache && restart_from_root(w)))
             return STEP_CONTINUE;
         return STEP_DONE;
@@ -417,19 +431,23 @@ static Step walk_step(Walk* w, int depth, CnameChain* chain, struct Packet** out
     /* A cached server that errors was probably re-delegated away. */
     if (w->from_cache && (resp->rcode == RCODE_SERVER_FAILURE ||
                           resp->rcode == RCODE_NOTIMP || resp->rcode == RCODE_REFUSED)) {
-        fprintf(stderr, "  Cached NS %s returned rcode=%u\n", w->server, resp->rcode);
+        diag(DIAG_DEBUG, "  Cached NS %s returned rcode=%u\n", w->server, resp->rcode);
         infra_report_failure(w->server);
         free_packet(resp);
         return try_next_server(w) || restart_from_root(w) ? STEP_CONTINUE : STEP_DONE;
     }
 
     /* The server answered: now its delegation may be cached — but only under
-     * a zone that contains the qname, or it could hijack unrelated names. */
-    if (g_ns_cache && w->pending_zone) {
+     * a zone that contains the qname, or it could hijack unrelated names.
+     * An error reply (lame: REFUSED/SERVFAIL/...) is not an answer: committing
+     * then put that lame server first in the cached set.  Leave the delegation
+     * pending for the sibling that does answer. */
+    if (g_ns_cache && w->pending_zone &&
+        (resp->rcode == RCODE_NO_ERROR || resp->rcode == RCODE_NAME_ERROR)) {
         if (dname_is_subdomain(q->full_domain, w->pending_zone))
             commit_ns_set(w->pending_zone, w->server, w->ns_list, w->pending_ttl);
         else
-            fprintf(stderr, "Refusing out-of-bailiwick NS-cache key '%s' for query '%s'\n",
+            diag(DIAG_DEBUG, "Refusing out-of-bailiwick NS-cache key '%s' for query '%s'\n",
                     w->pending_zone, q->full_domain);
         free(w->pending_zone);
         w->pending_zone = NULL;
@@ -439,17 +457,17 @@ static Step walk_step(Walk* w, int depth, CnameChain* chain, struct Packet** out
     /* TC=1: refetch answers over TCP; a truncated referral is still usable. */
     bool is_referral = !resp->aa && resp->ancount == 0 && resp->nscount > 0;
     if (resp->tc && !is_referral) {
-        fprintf(stderr, "Warning: Truncated UDP answer from %s for %s — retrying over TCP\n",
+        diag(DIAG_DEBUG, "Warning: Truncated UDP answer from %s for %s — retrying over TCP\n",
                 w->server, q->full_domain);
         struct Packet* tcp = query_server_tcp(w->server, w->query);
         free_packet(resp);
         if (!tcp) {
-            fprintf(stderr, "  TCP fallback failed for truncated answer — failing\n");
+            diag(DIAG_DEBUG, "  TCP fallback failed for truncated answer — failing\n");
             return STEP_DONE;
         }
         resp = tcp;
     } else if (resp->tc) {
-        fprintf(stderr, "Warning: Truncated referral (TC=1) from %s for %s — partial data\n",
+        diag(DIAG_DEBUG, "Warning: Truncated referral (TC=1) from %s for %s — partial data\n",
                 w->server, q->full_domain);
     }
 
@@ -468,14 +486,14 @@ static Step walk_step(Walk* w, int depth, CnameChain* chain, struct Packet** out
     }
     /* Any other error is usually one misconfigured peer: try its siblings. */
     if (resp->rcode != RCODE_NO_ERROR) {
-        fprintf(stderr, "DNS error RCODE=%u from %s\n", resp->rcode, w->server);
+        diag(DIAG_DEBUG, "DNS error RCODE=%u from %s\n", resp->rcode, w->server);
         infra_report_failure(w->server);
         free_packet(resp);
         return try_next_server(w) ? STEP_CONTINUE : STEP_DONE;
     }
     if (resp->ancount > 0) {
         if (!answer_owned_by_question(resp)) {
-            fprintf(stderr, "Answer from %s not owned by %s — trying sibling\n",
+            diag(DIAG_DEBUG, "Answer from %s not owned by %s — trying sibling\n",
                     w->server, q->full_domain);
             free_packet(resp);
             return try_next_server(w) ? STEP_CONTINUE : STEP_DONE;
@@ -483,7 +501,10 @@ static Step walk_step(Walk* w, int depth, CnameChain* chain, struct Packet** out
         *out = handle_answer(w, resp, depth, chain);
         return STEP_DONE;
     }
-    if (resp->aa) {                                     /* NODATA */
+    /* NODATA, but only on the evidence of an SOA: a referral whose server
+     * wrongly set AA would otherwise be handed to the client as an empty
+     * NOERROR instead of being followed. */
+    if (resp->aa && (resp->nscount == 0 || authority_has_soa(resp))) {
         clamp_negative_soa_ttl(resp);
         cache_answer(w, resp);
         *out = resp;
@@ -492,7 +513,7 @@ static Step walk_step(Walk* w, int depth, CnameChain* chain, struct Packet** out
     if (resp->nscount > 0)
         return follow_referral(w, resp);
 
-    fprintf(stderr, "Unexpected response format from %s\n", w->server);
+    diag(DIAG_DEBUG, "Unexpected response format from %s\n", w->server);
     free_packet(resp);
     return try_next_server(w) ? STEP_CONTINUE : STEP_DONE;
 }
@@ -501,7 +522,7 @@ static struct Packet* resolve_internal(struct Packet* query, int cname_depth, Cn
                                        NSResolutionContext* ns_ctx, DnssecChainCtx* dnssec_chain)
 {
     if (cname_depth >= MAX_CNAME_DEPTH) {
-        fprintf(stderr, "Maximum CNAME chain depth (%d) reached\n", MAX_CNAME_DEPTH);
+        diag(DIAG_DEBUG, "Maximum CNAME chain depth (%d) reached\n", MAX_CNAME_DEPTH);
         return NULL;
     }
     if (!query || !query->request || !query->full_domain) return NULL;
@@ -544,7 +565,7 @@ static struct Packet* resolve_internal(struct Packet* query, int cname_depth, Cn
     while (st == STEP_CONTINUE && w.iteration++ < MAX_ITERATIONS)
         st = walk_step(&w, cname_depth, chain, &result);
     if (st == STEP_CONTINUE)
-        fprintf(stderr, "Maximum iterations (%d) reached\n", MAX_ITERATIONS);
+        diag(DIAG_DEBUG, "Maximum iterations (%d) reached\n", MAX_ITERATIONS);
 
     walk_free(&w);
     return result;

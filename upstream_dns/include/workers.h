@@ -13,9 +13,12 @@ struct QueryContext {
 };
 
 /* An accepted TCP connection (served until EOF or idle timeout). */
+struct ThreadPool;
+
 struct TCPQueryContext {
     int client_fd;
     struct sockaddr_storage client_ss;
+    struct ThreadPool* pool;   /* the TCP pool: yield when others are queued */
 };
 
 /* Thread-pool tasks; both free their context. */

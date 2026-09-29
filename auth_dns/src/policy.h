@@ -38,7 +38,7 @@ int policy_load(const char* config_path);
  *   "zero"             -> sinkhole A=0.0.0.0 / AAAA=::
  *   "<ipv4|ipv6>"      -> sinkhole to that address
  */
-void policy_set_block_mode(const char* mode);
+int policy_set_block_mode(const char* mode);   /* -1: unrecognised mode (NXDOMAIN used) */
 
 /* RCODE for a BLOCK result: 3 (NXDOMAIN) or 0 (sinkhole modes). */
 int policy_block_mode_rcode(void);
@@ -59,7 +59,7 @@ int policy_block_mode_rcode(void);
 PolicyAction policy_lookup(const char* qname, uint16_t qtype, SynthAnswer* out,
                            char* zone_out, size_t zone_cap);
 
-/* Number of queries blocked since startup (for SIGUSR2 stats). */
+/* Number of queries blocked since startup (for SIGUSR1 stats). */
 uint64_t policy_blocked_count(void);
 
 #endif /* POLICY_H */

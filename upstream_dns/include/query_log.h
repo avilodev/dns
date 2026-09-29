@@ -13,6 +13,10 @@ void log_query(const char* client_ip, uint16_t port,
 void log_close_upstream(void);
 void log_reopen_upstream(void);   /* also opens it early, before a privilege drop */
 
+/* Pin the log AND its rotation slot while still root.  Call instead of
+ * path_pin(LOG_FILE_PATH) — the in-process size cap renames between them. */
+void log_pin_paths(void);
+
 /* Per-QTYPE counters (lock-free), printed on SIGUSR1. */
 void count_query(uint16_t qtype);
 void print_query_stats(void);

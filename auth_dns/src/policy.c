@@ -79,6 +79,10 @@ static void blockset_add(BlockSet* s, const char* name)
 {
     char lname[MAX_NAME + 1];
     lc_copy(name, lname, sizeof(lname));
+    /* "ads.example.com." is the same name; query names carry no trailing
+     * dot, so a stored one would never match.  Keep an escaped "\." intact. */
+    size_t n = strlen(lname);
+    if (n > 1 && lname[n - 1] == '.' && lname[n - 2] != '\\') lname[n - 1] = '\0';
     if (lname[0] == '\0') return;
     if (blockset_contains(s, lname)) return;   /* dedupe */
 
@@ -114,8 +118,9 @@ static int     g_block_rcode = RCODE_NAME_ERROR;  /* 3 = NXDOMAIN (default) */
 static int     g_sink_v4_ok = 0; static uint8_t g_sink_v4[4];
 static int     g_sink_v6_ok = 0; static uint8_t g_sink_v6[16];
 
-void policy_set_block_mode(const char* mode)
+int policy_set_block_mode(const char* mode)
 {
+    int rc = 0;
     pthread_rwlock_wrlock(&g_lock);
     g_sink_v4_ok = g_sink_v6_ok = 0;
     if (!mode || strcasecmp(mode, "nxdomain") == 0) {
@@ -131,8 +136,10 @@ void policy_set_block_mode(const char* mode)
     } else {
         fprintf(stderr, "policy: invalid -S block mode '%s'; using NXDOMAIN\n", mode);
         g_block_rcode = RCODE_NAME_ERROR;
+        rc = -1;
     }
     pthread_rwlock_unlock(&g_lock);
+    return rc;
 }
 
 int policy_block_mode_rcode(void)
@@ -152,7 +159,19 @@ uint64_t policy_blocked_count(void) { return atomic_load(&g_blocked); }
 static int looks_like_ip(const char* tok)
 {
     unsigned char tmp[16];
-    return inet_pton(AF_INET, tok, tmp) == 1 || inet_pton(AF_INET6, tok, tmp) == 1;
+    char addr[64];
+    /* Drop an IPv6 zone index ("fe80::1%lo0", as in stock hosts files). */
+    snprintf(addr, sizeof(addr), "%.*s", (int)strcspn(tok, "%"), tok);
+    return inet_pton(AF_INET, addr, tmp) == 1 || inet_pton(AF_INET6, addr, tmp) == 1;
+}
+
+/* Host names that stock hosts files map for the machine itself.  Listing them
+ * in a hosts-format blocklist is boilerplate, not intent — and since matching
+ * covers the whole subtree, "127.0.0.1 local" would block every *.local name. */
+static int hosts_boilerplate(const char* tok)
+{
+    if (!strchr(tok, '.')) return 1;              /* single label: localhost, local, ip6-*, ... */
+    return strcasecmp(tok, "localhost.localdomain") == 0 || looks_like_ip(tok);
 }
 
 /* Strip a '#' comment in place. */
@@ -168,10 +187,12 @@ static void parse_block_line(BlockSet* s, char* line)
     char* save = NULL;
     char* tok = strtok_r(line, " \t\r\n", &save);
     if (!tok) return;
-    if (looks_like_ip(tok))                       /* hosts-format: skip the IP */
+    bool hosts = looks_like_ip(tok);
+    if (hosts)                                    /* hosts-format: skip the IP */
         tok = strtok_r(NULL, " \t\r\n", &save);
     for (; tok; tok = strtok_r(NULL, " \t\r\n", &save))
-        blockset_add(s, tok);
+        if (!hosts || !hosts_boilerplate(tok))
+            blockset_add(s, tok);
 }
 
 /* ==========================================================================
