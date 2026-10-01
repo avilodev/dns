@@ -45,3 +45,6 @@ upstream_dns/config/*.key
 *.swp
 *.swo
 *~
+# Python caches
+__pycache__/
+*.pyc
