@@ -1,0 +1,62 @@
+# auth_dns config — authoritative records + blocklist.
+# Reload after editing:  kill -HUP $(cat /run/auth_dns.pid)
+
+# --- Authoritative zones ---
+# [name] header, then one record per line:
+#   A / AAAA / NS / MX <prio> <host> / CNAME / TXT "..." ["..."] / SRV <p> <w> <port> <tgt>
+#   HTTPS <prio> <target>
+#   SOA <mname> <rname> <serial> <refresh> <retry> <expire> <minimum>
+# Optional leading TTL on any record line, e.g. "300 A 192.0.2.10" (default 3600).
+# Wildcards: use [*.zone] (any record type).  Names may use RFC 1035 escapes (\. \DDD).
+
+# Example zone (uncomment and adapt). Every name in a zone you serve is
+# answered from here; anything else under that TLD gets a local NXDOMAIN
+# instead of being sent upstream.
+#
+# [example.test]
+# SOA    ns1.example.test  hostmaster.example.test  2026010101  3600  900  604800  300
+# NS     ns1.example.test
+#
+# [ns1.example.test]
+# A      192.0.2.10
+#
+# [www.example.test]
+# CNAME  ns1.example.test
+
+
+# --- Blocklist ---
+# Domains here (and all their subdomains) return NXDOMAIN.
+# One bare domain per line, or hosts-format "0.0.0.0 ads.example.com".
+[blocklist]
+# Google / DoubleClick ads + tracking
+ads.google.com
+adservice.google.com
+doubleclick.net
+2mdn.net
+googlesyndication.com
+googleadservices.com
+googletagservices.com
+googletagmanager.com
+google-analytics.com
+# Ad exchanges / networks
+adnxs.com
+amazon-adsystem.com
+criteo.com
+criteo.net
+pubmatic.com
+rubiconproject.com
+openx.net
+casalemedia.com
+adsrvr.org
+serving-sys.com
+advertising.com
+adcolony.com
+applovin.com
+zedo.com
+# Native ad / content recommendation
+taboola.com
+outbrain.com
+# Audience measurement / tracking
+moatads.com
+scorecardresearch.com
+quantserve.com
