@@ -3,7 +3,7 @@
 #include "dns_name.h"
 #include <pthread.h>
 
-/* ---- Pinned paths (see utils.h) ---------------------------------------- */
+// Pinned paths (see utils.h)
 
 #define MAX_PINS 32
 typedef struct { char* path; char* base; int dirfd; } Pin;
@@ -11,391 +11,425 @@ static Pin g_pins[MAX_PINS];
 static int g_pin_count = 0;
 static pthread_mutex_t g_pin_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Index of `path` among the pins, or -1.  Caller holds g_pin_lock. */
+// Index of `path` among the pins, or -1.
 static int find_pin(const char* path)
 {
-    for (int i = 0; i < g_pin_count; i++)
-        if (strcmp(g_pins[i].path, path) == 0) return i;
-    return -1;
+	for(int i = 0; i < g_pin_count; i++)
+		if(strcmp(g_pins[i].path, path) == 0)
+			return i;
+
+	return -1;
 }
 
-/* Parent directory of `path` into dir[cap]. */
+// Parent directory of `path` into dir[cap].
 static void parent_dir(const char* path, char* dir, size_t cap)
 {
-    const char* slash = strrchr(path, '/');
-    if (!slash)             snprintf(dir, cap, ".");
-    else if (slash == path) snprintf(dir, cap, "/");
-    else                    snprintf(dir, cap, "%.*s", (int)(slash - path), path);
+	const char* slash = strrchr(path, '/');
+
+	if(!slash)
+		snprintf(dir, cap, ".");
+	else if(slash == path)
+		snprintf(dir, cap, "/");
+	else
+		snprintf(dir, cap, "%.*s", (int)(slash - path), path);
 }
 
-/* An already-pinned fd for `dir`, or -1.  Caller holds g_pin_lock.  Pins are
- * never closed, so sharing one dirfd between several files is safe. */
+// An already-pinned fd for `dir`, or -1.
 static int pinned_dirfd(const char* dir)
 {
-    char other[1024];
-    for (int i = 0; i < g_pin_count; i++) {
-        parent_dir(g_pins[i].path, other, sizeof(other));
-        if (strcmp(other, dir) == 0) return g_pins[i].dirfd;
-    }
-    return -1;
+	char other[1024];
+
+	for(int i = 0; i < g_pin_count; i++) {
+		parent_dir(g_pins[i].path, other, sizeof(other));
+		if(strcmp(other, dir) == 0)
+			return g_pins[i].dirfd;
+	}
+
+	return -1;
 }
 
 void path_pin(const char* path)
 {
-    if (!path || !*path) return;
-    pthread_mutex_lock(&g_pin_lock);
-    for (int i = 0; i < g_pin_count; i++)
-        if (strcmp(g_pins[i].path, path) == 0) { pthread_mutex_unlock(&g_pin_lock); return; }
-    if (g_pin_count < MAX_PINS) {
-        const char* slash = strrchr(path, '/');
-        char dir[1024];
-        parent_dir(path, dir, sizeof(dir));
+	if(!path || !*path)
+		return;
+	pthread_mutex_lock(&g_pin_lock);
 
-        /* Files in one directory share a single dirfd. */
-        int fd = pinned_dirfd(dir);
-        bool fresh = fd < 0;
-        if (fresh) fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (fd >= 0) {
-            char* p = strdup(path);
-            char* b = strdup(slash ? slash + 1 : path);
-            if (p && b) {
-                g_pins[g_pin_count++] = (Pin){ p, b, fd };
-            } else {
-                free(p); free(b);
-                if (fresh) close(fd);   /* a shared dirfd stays with its owner */
-            }
-        }
-    }
-    pthread_mutex_unlock(&g_pin_lock);
+	for(int i = 0; i < g_pin_count; i++) {
+		if(strcmp(g_pins[i].path, path) == 0) {
+			pthread_mutex_unlock(&g_pin_lock);
+			return;
+		}
+	}
+
+	if(g_pin_count < MAX_PINS) {
+		const char* slash = strrchr(path, '/');
+		char dir[1024];
+		parent_dir(path, dir, sizeof(dir));
+
+		// Files in one directory share a single dirfd.
+		int fd = pinned_dirfd(dir);
+		bool fresh = fd < 0;
+		if(fresh)
+			fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+		if(fd >= 0) {
+			char* p = strdup(path);
+			char* b = strdup(slash ? slash + 1 : path);
+
+			if(p && b) {
+				g_pins[g_pin_count++] = (Pin){ p, b, fd };
+			} else {
+				free(p); free(b);
+				if(fresh)
+					close(fd);   // a shared dirfd stays with its owner
+			}
+		}
+	}
+
+	pthread_mutex_unlock(&g_pin_lock);
 }
 
 int path_open(const char* path, int flags, int mode)
 {
-    if (!path) return -1;
-    pthread_mutex_lock(&g_pin_lock);
-    for (int i = 0; i < g_pin_count; i++) {
-        if (strcmp(g_pins[i].path, path) == 0) {
-            int fd = openat(g_pins[i].dirfd, g_pins[i].base, flags | O_CLOEXEC, mode);
-            pthread_mutex_unlock(&g_pin_lock);
-            return fd;
-        }
-    }
-    pthread_mutex_unlock(&g_pin_lock);
-    return open(path, flags | O_CLOEXEC, mode);
+	if(!path)
+		return -1;
+	pthread_mutex_lock(&g_pin_lock);
+
+	for(int i = 0; i < g_pin_count; i++) {
+		if(strcmp(g_pins[i].path, path) == 0) {
+			int fd = openat(g_pins[i].dirfd, g_pins[i].base, flags | O_CLOEXEC, mode);
+			pthread_mutex_unlock(&g_pin_lock);
+			return fd;
+		}
+	}
+
+	pthread_mutex_unlock(&g_pin_lock);
+
+	return open(path, flags | O_CLOEXEC, mode);
 }
 
 int path_rename(const char* from, const char* to)
 {
-    if (!from || !to) return -1;
-    pthread_mutex_lock(&g_pin_lock);
-    int i = find_pin(from), j = find_pin(to);
-    /* renameat only helps when both names hang off the same pinned dirfd —
-     * which is the logger's case (log and rotation slot share a directory).
-     * Anything else takes the plain path and needs a traversable ancestor. */
-    int rc = (i >= 0 && j >= 0 && g_pins[i].dirfd == g_pins[j].dirfd)
-                 ? renameat(g_pins[i].dirfd, g_pins[i].base,
-                            g_pins[j].dirfd, g_pins[j].base)
-                 : rename(from, to);
-    pthread_mutex_unlock(&g_pin_lock);
-    return rc;
+	if(!from || !to)
+		return -1;
+	pthread_mutex_lock(&g_pin_lock);
+	int i = find_pin(from), j = find_pin(to);
+	// renameat only helps when both names hang off the same pinned dirfd
+	int rc = (i >= 0 && j >= 0 && g_pins[i].dirfd == g_pins[j].dirfd)
+				 ? renameat(g_pins[i].dirfd, g_pins[i].base,
+							g_pins[j].dirfd, g_pins[j].base)
+				 : rename(from, to);
+	pthread_mutex_unlock(&g_pin_lock);
+
+	return rc;
 }
 
 FILE* path_fopen(const char* path)
 {
-    int fd = path_open(path, O_RDONLY, 0);
-    if (fd < 0) return NULL;
-    FILE* f = fdopen(fd, "r");
-    if (!f) close(fd);
-    return f;
+	int fd = path_open(path, O_RDONLY, 0);
+
+	if(fd < 0)
+		return NULL;
+	FILE* f = fdopen(fd, "r");
+	if(!f)
+		close(fd);
+
+	return f;
 }
 
 extern Config g_config;
 
 static void init_default_config(void) {
-    g_config.upstream_dns = strdup(DEFAULT_UPSTREAM_DNS);
-    g_config.upstream_port = UPSTREAM_PORT;
+	g_config.upstream_dns = strdup(DEFAULT_UPSTREAM_DNS);
+	g_config.upstream_port = UPSTREAM_PORT;
 
-    g_config.thread_count = NUM_THREADS;
-    g_config.queue_size = QUEUE_SIZE;
+	g_config.thread_count = NUM_THREADS;
+	g_config.queue_size = QUEUE_SIZE;
 
-    g_config.bind_addr = NULL;
-    g_config.acl_csv = NULL;
-    g_config.rate_limit_qps = 0;
-    g_config.drop_user = NULL;
-    g_config.block_mode = NULL;
-    g_config.config_path = NULL;
-    g_config.log_level = NULL;
+	g_config.bind_addr = NULL;
+	g_config.acl_csv = NULL;
+	g_config.rate_limit_qps = 0;
+	g_config.drop_user = NULL;
+	g_config.block_mode = NULL;
+	g_config.config_path = NULL;
+	g_config.log_level = NULL;
 }
 
-/* Replace a string option, freeing any previous value (the flag may repeat). */
+// Replace a string option, freeing any previous value (the flag may repeat).
 static bool set_str(char** dst, const char* val) {
-    char* copy = strdup(val);
-    if (!copy) { fprintf(stderr, "Out of memory parsing options\n"); return false; }
-    free(*dst);
-    *dst = copy;
-    return true;
+	char* copy = strdup(val);
+
+	if(!copy) {
+		fprintf(stderr, "Out of memory parsing options\n");
+		return false;
+	}
+	free(*dst);
+	*dst = copy;
+
+	return true;
 }
 
-/* Parse command-line flags (-p/-t/-u/-q/-b/-a/-r/-U/-S/-c/-L) into g_config.
- * Returns 0 on success, -1 on an unknown or invalid flag. */
+// Parse command-line flags (-p/-t/-u/-q/-b/-a/-r/-U/-S/-c/-L) into g_config.
 int load_config(int argc, char** argv) {
-    // Initialize defaults
-    init_default_config();
+	// Initialize defaults
+	init_default_config();
 
-    // Parse command line arguments
-    int opt;
-    while ((opt = getopt(argc, argv, "p:t:u:q:b:a:r:U:S:c:L:")) != -1) {
-        char *end;
-        long v;
-        switch (opt) {
-            case 'p':
-                v = strtol(optarg, &end, 10);
-                if (*end != '\0' || v < 1 || v > 65535) {
-                    fprintf(stderr, "Invalid upstream port: %s\n", optarg);
-                    return -1;
-                }
-                g_config.upstream_port = (int)v;
-                break;
-            case 't':
-                v = strtol(optarg, &end, 10);
-                if (*end != '\0' || v < 1 || v > 1024) {
-                    fprintf(stderr, "Invalid thread count: %s\n", optarg);
-                    return -1;
-                }
-                g_config.thread_count = (int)v;
-                break;
-            case 'u': {
-                /* Validate the upstream address now: a typo would otherwise make
-                 * every forwarded query silently SERVFAIL at resolve time. */
-                struct in_addr  a4;
-                struct in6_addr a6;
-                if (inet_pton(AF_INET, optarg, &a4) != 1 &&
-                    inet_pton(AF_INET6, optarg, &a6) != 1) {
-                    fprintf(stderr, "Invalid upstream address: %s\n", optarg);
-                    return -1;
-                }
-                if (!set_str(&g_config.upstream_dns, optarg)) return -1;
-                break;
-            }
-            case 'q':
-                v = strtol(optarg, &end, 10);
-                if (*end != '\0' || v < 1 || v > 1048576) {
-                    fprintf(stderr, "Invalid queue size: %s\n", optarg);
-                    return -1;
-                }
-                g_config.queue_size = (int)v;
-                break;
-            case 'b':
-                if (!set_str(&g_config.bind_addr, optarg)) return -1;
-                break;
-            case 'a':
-                if (!set_str(&g_config.acl_csv, optarg)) return -1;
-                break;
-            case 'r':
-                v = strtol(optarg, &end, 10);
-                if (*end != '\0' || v < 0 || v > 1000000) {
-                    fprintf(stderr, "Invalid rate limit: %s\n", optarg);
-                    return -1;
-                }
-                g_config.rate_limit_qps = (int)v;
-                break;
-            case 'U':
-                if (!set_str(&g_config.drop_user, optarg)) return -1;
-                break;
-            case 'S':
-                if (!set_str(&g_config.block_mode, optarg)) return -1;
-                break;
-            case 'c':
-                if (!set_str(&g_config.config_path, optarg)) return -1;
-                break;
-            case 'L':
-                if (!set_str(&g_config.log_level, optarg)) return -1;
-                break;
-            default:
-                printf("Usage: ./bin/auth_dns <-p upstream_port> <-t thread_count> "
-                       "<-u upstream_dns> <-q queue_size> <-b bind_addr> "
-                       "<-a recursion_allow_cidrs> <-r per_source_qps> "
-                       "<-U user[:group]> <-S block_mode> <-c config_file> "
-                       "<-L error|warn|info|debug>\n");
-                return -1;
-        }
-    }
+	// Parse command line arguments
+	int opt;
+	while((opt = getopt(argc, argv, "p:t:u:q:b:a:r:U:S:c:L:")) != -1) {
+		char *end;
+		long v;
 
-    /* Set before any thread exists; diag() only reads it afterwards. */
-    if (g_config.log_level) {
-        int lvl = diag_level_from_name(g_config.log_level);
-        if (lvl < 0) {
-            fprintf(stderr, "Invalid log level: %s (want error|warn|info|debug)\n",
-                    g_config.log_level);
-            return -1;
-        }
-        g_diag_level = lvl;
-    }
-    return 0;
+		switch (opt) {
+		case 'p':
+			v = strtol(optarg, &end, 10);
+			if(*end != '\0' || v < 1 || v > 65535) {
+				fprintf(stderr, "Invalid upstream port: %s\n", optarg);
+				return -1;
+			}
+			g_config.upstream_port = (int)v;
+			break;
+		case 't':
+			v = strtol(optarg, &end, 10);
+			if(*end != '\0' || v < 1 || v > 1024) {
+				fprintf(stderr, "Invalid thread count: %s\n", optarg);
+				return -1;
+			}
+			g_config.thread_count = (int)v;
+			break;
+		case 'u': {
+			// Validate the upstream address now
+			struct in_addr  a4;
+			struct in6_addr a6;
+			if(inet_pton(AF_INET, optarg, &a4) != 1 &&
+			   inet_pton(AF_INET6, optarg, &a6) != 1) {
+				fprintf(stderr, "Invalid upstream address: %s\n", optarg);
+				return -1;
+			}
+			if(!set_str(&g_config.upstream_dns, optarg))
+				return -1;
+			break;
+		}
+		case 'q':
+			v = strtol(optarg, &end, 10);
+			if(*end != '\0' || v < 1 || v > 1048576) {
+				fprintf(stderr, "Invalid queue size: %s\n", optarg);
+				return -1;
+			}
+			g_config.queue_size = (int)v;
+			break;
+		case 'b':
+			if(!set_str(&g_config.bind_addr, optarg))
+				return -1;
+			break;
+		case 'a':
+			if(!set_str(&g_config.acl_csv, optarg))
+				return -1;
+			break;
+		case 'r':
+			v = strtol(optarg, &end, 10);
+			if(*end != '\0' || v < 0 || v > 1000000) {
+				fprintf(stderr, "Invalid rate limit: %s\n", optarg);
+				return -1;
+			}
+			g_config.rate_limit_qps = (int)v;
+			break;
+		case 'U':
+			if(!set_str(&g_config.drop_user, optarg))
+				return -1;
+			break;
+		case 'S':
+			if(!set_str(&g_config.block_mode, optarg))
+				return -1;
+			break;
+		case 'c':
+			if(!set_str(&g_config.config_path, optarg))
+				return -1;
+			break;
+		case 'L':
+			if(!set_str(&g_config.log_level, optarg))
+				return -1;
+			break;
+		default:
+			printf("Usage: ./bin/auth_dns <-p upstream_port> <-t thread_count> "
+				   "<-u upstream_dns> <-q queue_size> <-b bind_addr> "
+				   "<-a recursion_allow_cidrs> <-r per_source_qps> "
+				   "<-U user[:group]> <-S block_mode> <-c config_file> "
+				   "<-L error|warn|info|debug>\n");
+			return -1;
+		}
+	}
+
+	// Set before any thread exists; diag() only reads it afterwards.
+	if(g_config.log_level) {
+		int lvl = diag_level_from_name(g_config.log_level);
+		if(lvl < 0) {
+			fprintf(stderr, "Invalid log level: %s (want error|warn|info|debug)\n",
+					g_config.log_level);
+			return -1;
+		}
+		g_diag_level = lvl;
+	}
+
+	return 0;
 }
 
-/*
- * Write a domain name (e.g. "mail.example.com") into DNS wire-format label
- * encoding at buf[*pos], advancing *pos.  Each dot-separated label is written
- * as: <length-byte> <label-bytes>.  A final zero-length byte terminates the name.
- */
+// Write a domain name into DNS wire-format label encoding at buf[*pos]
 void write_dns_labels(const char* name, char* buf, int* pos, int buf_size) {
-    if (!name || !buf || !pos || *pos >= buf_size) return;
-    int n = dname_to_wire(name, (uint8_t*)buf + *pos, buf_size - *pos);
-    if (n < 0) {
-        /* Malformed or oversized name: emit the root label so the message
-         * stays well-formed rather than writing a partial name. */
-        fprintf(stderr, "Warning: cannot encode name '%s'\n", name);
-        buf[(*pos)++] = 0;
-        return;
-    }
-    *pos += n;
+	if(!name || !buf || !pos || *pos >= buf_size)
+		return;
+	int n = dname_to_wire(name, (uint8_t*)buf + *pos, buf_size - *pos);
+
+	if(n < 0) {
+		// Malformed or oversized name: emit the root label
+		fprintf(stderr, "Warning: cannot encode name '%s'\n", name);
+		buf[(*pos)++] = 0;
+		return;
+	}
+
+	*pos += n;
 }
 
-/*
- * Extract IP addresses from a DNS response packet.
- * Returns comma-separated IPs, a record type label (e.g. "MX_RECORD"), or NULL.
- */
-char* extract_ip_from_response(const struct Packet* response) {
-    if (!response || !response->request || response->recv_len < HEADER_LEN) {
-        return NULL;
-    }
+// Extract IP addresses from a DNS response packet.
+char* extract_ip_from_response(const struct packet* response) {
+	if(!response || !response->request || response->recv_len < HEADER_LEN)
+		return NULL;
 
-    uint16_t qdcount = rd16(response->request + 4);
-    uint16_t ancount = rd16(response->request + 6);
-    
-    if (ancount == 0) {
-        /* The RCODE column already says NXDOMAIN/SERVFAIL; an empty NOERROR
-         * answer is NODATA (the name exists, not with that type). */
-        uint8_t rcode = (uint8_t)(response->request[3] & 0x0F);
-        return rcode == RCODE_NO_ERROR ? strdup("NODATA") : NULL;
-    }
+	uint16_t qdcount = rd16(response->request + 4);
+	uint16_t ancount = rd16(response->request + 6);
 
-    unsigned char* ptr = (unsigned char*)response->request + HEADER_LEN;
-    unsigned char* end = (unsigned char*)response->request + response->recv_len;
-    
-    // Skip question section
-    for (int i = 0; i < qdcount; i++) {
-        while (ptr < end) {
-            if (*ptr == 0) {
-                ptr++;
-                break;
-            }
-            if ((*ptr & 0xC0) == 0xC0) {
-                ptr += 2;
-                break;
-            }
-            uint8_t len = *ptr;
-            ptr += len + 1;
-        }
-        if (ptr + 4 > end) return NULL;
-        ptr += 4; // QTYPE + QCLASS
-    }
-    
-    if (ptr >= end) return NULL;
+	if(ancount == 0) {
+		// The RCODE column already says NXDOMAIN/SERVFAIL
+		uint8_t rcode = (uint8_t)(response->request[3] & 0x0F);
+		return rcode == RCODE_NO_ERROR ? strdup("NODATA") : NULL;
+	}
 
-    // Build result with all IPs
-    char result[1024] = "";
-    int ip_count = 0;
-    uint16_t first_non_ip_type = 0;  /* first non-A/AAAA record type seen */
+	unsigned char* ptr = (unsigned char*)response->request + HEADER_LEN;
+	unsigned char* end = (unsigned char*)response->request + response->recv_len;
 
-    // Parse answer section
-    for (int i = 0; i < ancount && ptr < end; i++) {
-        // Skip answer name
-        while (ptr < end) {
-            if (*ptr == 0) {
-                ptr++;
-                break;
-            }
-            if ((*ptr & 0xC0) == 0xC0) {
-                ptr += 2;
-                break;
-            }
-            uint8_t len = *ptr;
-            ptr += len + 1;
-        }
-        
-        if (ptr + 10 > end) break;
-        
-        uint16_t atype = rd16(ptr);
-        ptr += 2;
-        ptr += 2; // Skip CLASS
-        ptr += 4; // Skip TTL
-        uint16_t rdlength = rd16(ptr);
-        ptr += 2;
-        
-        if (ptr + rdlength > end) break;
-        
-        // A record (IPv4)
-        if (atype == 1 && rdlength == 4) {
-            char ip_str[16];
-            snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u",
-                    ptr[0], ptr[1], ptr[2], ptr[3]);
-            
-            if (ip_count > 0) {
-                /* Space-separate multiple IPs so the CSV log's info column
-                 * stays a single comma-free field. */
-                strncat(result, " ", sizeof(result) - strlen(result) - 1);
-            }
-            strncat(result, ip_str, sizeof(result) - strlen(result) - 1);
-            ip_count++;
-        }
-        // AAAA record (IPv6)
-        else if (atype == 28 && rdlength == 16) {
-            char ip_str[INET6_ADDRSTRLEN];
-            if (!inet_ntop(AF_INET6, ptr, ip_str, sizeof(ip_str))) ip_str[0] = '\0';
-            
-            if (ip_count > 0) {
-                /* Space-separate multiple IPs so the CSV log's info column
-                 * stays a single comma-free field. */
-                strncat(result, " ", sizeof(result) - strlen(result) - 1);
-            }
-            strncat(result, ip_str, sizeof(result) - strlen(result) - 1);
-            ip_count++;
-        }
-        // Track first non-IP record type
-        else if (first_non_ip_type == 0) {
-            first_non_ip_type = atype;
-        }
-        
-        ptr += rdlength;
-    }
+	// Skip question section
+	for(int i = 0; i < qdcount; i++) {
+		while(ptr < end) {
+			if(*ptr == 0) {
+				ptr++;
+				break;
+			}
+			if((*ptr & 0xC0) == 0xC0) {
+				ptr += 2;
+				break;
+			}
+			uint8_t len = *ptr;
+			ptr += len + 1;
+		}
 
-    if (ip_count > 0) {
-        return strdup(result);
-    }
+		if(ptr + 4 > end)
+			return NULL;
+		ptr += 4; // QTYPE + QCLASS
+	}
 
-    // No A/AAAA records found, return the record type instead
-    if (first_non_ip_type > 0) {
-        const char* type_name;
-        switch (first_non_ip_type) {
-            case 5:  type_name = "CNAME"; break;
-            case 2:  type_name = "NS"; break;
-            case 6:  type_name = "SOA"; break;
-            case 15: type_name = "MX"; break;
-            case 16: type_name = "TXT"; break;
-            case 33: type_name = "SRV"; break;
-            case 65: type_name = "HTTPS"; break;
-            default: 
-                snprintf(result, sizeof(result), "TYPE_%u", first_non_ip_type);
-                return strdup(result);
-        }
-        snprintf(result, sizeof(result), "%s_RECORD", type_name);
-        return strdup(result);
-    }
+	if(ptr >= end)
+		return NULL;
 
-    return NULL;
+	// Build result with all IPs
+	char result[1024] = "";
+	int ip_count = 0;
+	uint16_t first_non_ip_type = 0;  // first non-A/AAAA record type seen
+
+	// Parse answer section
+	for(int i = 0; i < ancount && ptr < end; i++) {
+		// Skip answer name
+		while(ptr < end) {
+			if(*ptr == 0) {
+				ptr++;
+				break;
+			}
+			if((*ptr & 0xC0) == 0xC0) {
+				ptr += 2;
+				break;
+			}
+			uint8_t len = *ptr;
+			ptr += len + 1;
+		}
+
+		if(ptr + 10 > end)
+			break;
+
+		uint16_t atype = rd16(ptr);
+		ptr += 2;
+		ptr += 2; // Skip CLASS
+		ptr += 4; // Skip TTL
+		uint16_t rdlength = rd16(ptr);
+		ptr += 2;
+
+		if(ptr + rdlength > end)
+			break;
+
+		// A record (IPv4)
+		if(atype == 1 && rdlength == 4) {
+			char ip_str[16];
+			snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u",
+					ptr[0], ptr[1], ptr[2], ptr[3]);
+
+			if(ip_count > 0) {
+				// Space-separate multiple IPs
+				strncat(result, " ", sizeof(result) - strlen(result) - 1);
+			}
+			strncat(result, ip_str, sizeof(result) - strlen(result) - 1);
+			ip_count++;
+		} else if(atype == 28 && rdlength == 16) {
+			// AAAA record (IPv6)
+			char ip_str[INET6_ADDRSTRLEN];
+			if(!inet_ntop(AF_INET6, ptr, ip_str, sizeof(ip_str)))
+				ip_str[0] = '\0';
+
+			if(ip_count > 0) {
+				// Space-separate multiple IPs
+				strncat(result, " ", sizeof(result) - strlen(result) - 1);
+			}
+			strncat(result, ip_str, sizeof(result) - strlen(result) - 1);
+			ip_count++;
+		} else if(first_non_ip_type == 0) {
+			// Track first non-IP record type
+			first_non_ip_type = atype;
+		}
+
+		ptr += rdlength;
+	}
+
+	if(ip_count > 0)
+		return strdup(result);
+
+	// No A/AAAA records found, return the record type instead
+	if(first_non_ip_type > 0) {
+		const char* type_name;
+
+		switch (first_non_ip_type) {
+		case 5:  type_name = "CNAME"; break;
+		case 2:  type_name = "NS"; break;
+		case 6:  type_name = "SOA"; break;
+		case 15: type_name = "MX"; break;
+		case 16: type_name = "TXT"; break;
+		case 33: type_name = "SRV"; break;
+		case 65: type_name = "HTTPS"; break;
+		default:
+			snprintf(result, sizeof(result), "TYPE_%u", first_non_ip_type);
+			return strdup(result);
+		}
+
+		snprintf(result, sizeof(result), "%s_RECORD", type_name);
+		return strdup(result);
+	}
+
+	return NULL;
 }
 
-/* Free a Packet and all its heap-allocated fields. */
-int free_packet(struct Packet* pkt) {
-    if (!pkt) {
-        return -1;
-    }
+// Free a Packet and all its heap-allocated fields.
+int free_packet(struct packet* pkt) {
+	if(!pkt)
+		return -1;
 
-    free(pkt->request);
-    free(pkt->full_domain);
-    free(pkt);
+	free(pkt->request);
+	free(pkt->full_domain);
+	free(pkt);
 
-    return 0;
+	return 0;
 }

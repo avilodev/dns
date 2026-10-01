@@ -3,25 +3,25 @@
 
 #include "types.h"
 
-/* A cache-miss UDP datagram handed to the worker pool. */
-struct QueryContext {
-    int dns_sock;
-    struct sockaddr_storage client_addr;
-    socklen_t client_addr_len;
-    char buffer[MAXLINE];
-    ssize_t recv_len;
+// A cache-miss UDP datagram handed to the worker pool.
+struct query_context {
+	int dns_sock;
+	struct sockaddr_storage client_addr;
+	socklen_t client_addr_len;
+	char buffer[MAXLINE];
+	ssize_t recv_len;
 };
 
-/* An accepted TCP connection (served until EOF or idle timeout). */
-struct ThreadPool;
+// An accepted TCP connection (served until EOF or idle timeout).
+struct thread_pool;
 
-struct TCPQueryContext {
-    int client_fd;
-    struct sockaddr_storage client_ss;
-    struct ThreadPool* pool;   /* the TCP pool: yield when others are queued */
+struct tcp_query_context {
+	int client_fd;
+	struct sockaddr_storage client_ss;
+	struct thread_pool* pool;   // the TCP pool: yield when others are queued
 };
 
-/* Thread-pool tasks; both free their context. */
+// Thread-pool tasks; both free their context.
 void* process_query(void* arg);
 void* process_tcp_query(void* arg);
 

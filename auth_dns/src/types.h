@@ -16,16 +16,15 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include "wire_io.h"   /* alignment-safe wire field access */
+#include "wire_io.h"   // alignment-safe wire field access
 
-/* True for the errno a timed-out or would-block socket call reports.  EAGAIN
- * and EWOULDBLOCK are the same value on Linux but may differ elsewhere. */
+// True for the errno a timed-out or would-block socket call reports.
 static inline bool errno_is_timeout(int e)
 {
 #if EAGAIN == EWOULDBLOCK
-    return e == EAGAIN;
+	return e == EAGAIN;
 #else
-    return e == EAGAIN || e == EWOULDBLOCK;
+	return e == EAGAIN || e == EWOULDBLOCK;
 #endif
 }
 
@@ -33,17 +32,14 @@ static inline bool errno_is_timeout(int e)
 #define PORT 53
 #endif
 
-#define MAXLINE 4096   /* receive buffer for incoming queries */
+#define MAXLINE 4096   // receive buffer for incoming queries
 
-/* Capacity of every response buffer: the protocol's own limit (16-bit TCP
- * length prefix).  Answers are bounded by this, not by a record count; UDP
- * replies are then truncated to the client's size (TC=1) and retried on TCP. */
+// Capacity of every response buffer: the protocol's own limit.
 #define DNS_MSG_MAX 65535
 #define HEADER_LEN 12
 #define SOCKET_TIMEOUT 5
 
-/* EDNS UDP payload size we advertise and the largest UDP answer we send:
- * 1232 avoids IP fragmentation on virtually every path (DNS Flag Day 2020). */
+// EDNS UDP payload size we advertise and the largest UDP answer we send
 #define EDNS_UDP_PAYLOAD 1232
 
 // Default TTL for authoritative records (seconds)
@@ -78,22 +74,18 @@ static inline bool errno_is_timeout(int e)
 #define RCODE_NOTAUTH       9   // Not Authoritative (RFC 2136)
 #define RCODE_BADVERS       16  // Bad OPT Version (RFC 6891)
 
-/*
- * Paths — set at compile time by the Makefile via -D flags.
- * Fallbacks below assume the binary is run from its own server directory.
- * Override by passing -DSERVER_PATH='"..."' and -DLOG_FILE_PATH='"..."' to gcc.
- */
+// Paths — set at compile time by the Makefile via -D flags.
 #ifndef SERVER_PATH
-#define SERVER_PATH "."                      /* run from auth_dns/ */
+#define SERVER_PATH "."                      // run from auth_dns/
 #endif
 #ifndef LOG_FILE_PATH
-#define LOG_FILE_PATH "../logs/server.log"   /* logs/ sits next to auth_dns/ */
+#define LOG_FILE_PATH "../logs/server.log"   // logs/ sits next to auth_dns/
 #endif
 #ifndef PID_FILE_PATH
 #define PID_FILE_PATH "/run/auth_dns.pid"
 #endif
 
-/* Paths relative to SERVER_PATH — do not make these absolute. */
+// Paths relative to SERVER_PATH — do not make these absolute.
 #define CONFIG_FILE_PATH "/misc/config.txt"
 #define DNSSEC_CONFIG_DIR "/config"
 
@@ -102,55 +94,55 @@ static inline bool errno_is_timeout(int e)
 #define NUM_THREADS 20
 #define QUEUE_SIZE 100
 
-struct Packet {
-    char* request;
-    ssize_t recv_len;
+struct packet {
+	char* request;
+	ssize_t recv_len;
 
-    // DNS Header fields
-    uint16_t id;
-    uint16_t flags;
-    uint8_t qr;        // Query/Response flag
-    uint8_t opcode;    // Operation code
-    uint8_t aa;        // Authoritative answer
-    uint8_t tc;        // Truncation
-    uint8_t rd;        // Recursion desired
-    uint8_t ra;        // Recursion available
-    uint8_t z;         // Reserved
-    uint8_t ad;        // Authenticated data
-    uint8_t cd;        // Checking disabled
-    uint8_t rcode;     // Response code
-    uint8_t do_bit;       // DNSSEC OK (EDNS DO bit, RFC 4035 §3.2.1)
-    uint8_t edns_present; // 1 if client sent an EDNS0 OPT record
-    uint8_t edns_version; // EDNS version from OPT (RFC 6891 §6.1.3)
-    uint16_t edns_udp_size; // client-advertised UDP payload size (RFC 6891 §6.1.2)
+	// DNS Header fields
+	uint16_t id;
+	uint16_t flags;
+	uint8_t qr;        // Query/Response flag
+	uint8_t opcode;    // Operation code
+	uint8_t aa;        // Authoritative answer
+	uint8_t tc;        // Truncation
+	uint8_t rd;        // Recursion desired
+	uint8_t ra;        // Recursion available
+	uint8_t z;         // Reserved
+	uint8_t ad;        // Authenticated data
+	uint8_t cd;        // Checking disabled
+	uint8_t rcode;     // Response code
+	uint8_t do_bit;       // DNSSEC OK (EDNS DO bit, RFC 4035 §3.2.1)
+	uint8_t edns_present; // 1 if client sent an EDNS0 OPT record
+	uint8_t edns_version; // EDNS version from OPT (RFC 6891 §6.1.3)
+	uint16_t edns_udp_size; // client-advertised UDP payload size (RFC 6891 §6.1.2)
 
-    // DNS Record counts
-    uint16_t qdcount;  // Question count
-    uint16_t ancount;  // Answer count
-    uint16_t nscount;  // Authority count
-    uint16_t arcount;  // Additional count
+	// DNS Record counts
+	uint16_t qdcount;  // Question count
+	uint16_t ancount;  // Answer count
+	uint16_t nscount;  // Authority count
+	uint16_t arcount;  // Additional count
 
-    // Question name: presentation text from dns_name.h (escaped, lowercase)
-    char* full_domain;
+	// Question name: presentation text from dns_name.h (escaped, lowercase)
+	char* full_domain;
 
-     uint16_t q_type;   // Query type
-    uint16_t q_class;  // Query class (1=IN)
+	 uint16_t q_type;   // Query type
+	uint16_t q_class;  // Query class (1=IN)
 };
 
-typedef struct ServerConfig {
-    int thread_count;
-    int queue_size;
+typedef struct server_config {
+	int thread_count;
+	int queue_size;
 
-    char* upstream_dns;
-    int upstream_port;
+	char* upstream_dns;
+	int upstream_port;
 
-    char* bind_addr;       /* listen address (-b); NULL = INADDR_ANY/in6addr_any */
-    char* acl_csv;         /* recursion allow-list CIDRs (-a); NULL = defaults    */
-    int   rate_limit_qps;  /* per-source queries/sec for recursion (-r); 0 = off  */
-    char* drop_user;       /* drop to this user[:group] after bind (-U); NULL=off */
-    char* block_mode;      /* -S: "nxdomain"(default)|"zero"|"<ip>"; NULL=default */
-    char* config_path;     /* -c: config file path; NULL = built-in default       */
-    char* log_level;       /* -L: error|warn|info|debug; NULL = built-in default  */
+	char* bind_addr;       // listen address (-b); NULL = INADDR_ANY/in6addr_any
+	char* acl_csv;         // recursion allow-list CIDRs (-a); NULL = defaults
+	int   rate_limit_qps;  // per-source queries/sec for recursion (-r); 0 = off
+	char* drop_user;       // drop to this user[:group] after bind (-U); NULL=off
+	char* block_mode;      // -S: "nxdomain"(default)|"zero"|"<ip>"; NULL=default
+	char* config_path;     // -c: config file path; NULL = built-in default
+	char* log_level;       // -L: error|warn|info|debug; NULL = built-in default
 } Config;
 
 #endif /* TYPES_H */

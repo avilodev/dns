@@ -26,1143 +26,1178 @@
 
 Config g_config;
 
-/* Defined in auth.c; NULL when DNSSEC signing is not configured. */
-extern ZoneKey *g_zone_keys;
+// Defined in auth.c; NULL when DNSSEC signing is not configured.
+extern zone_key *g_zone_keys;
 
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_reload  = 0;
 static volatile sig_atomic_t g_reopen_log = 0;
 
-static char g_config_path[256];   /* SERVER_PATH + CONFIG_FILE_PATH (config.txt) */
+static char g_config_path[256];   // SERVER_PATH + CONFIG_FILE_PATH (config.txt)
 
-/* Per-QTYPE query counters (atomic, safe for concurrent worker threads). */
+// Per-QTYPE query counters (atomic, safe for concurrent worker threads).
 static _Atomic uint64_t g_qtype_counters[256];
 static _Atomic uint64_t g_total_queries;
 
-/* Self-pipe for async-signal-safe SIGUSR1 stats dump. */
+// Self-pipe for async-signal-safe SIGUSR1 stats dump.
 static int stats_pipe[2] = {-1, -1};
 
-/* qtype_name() is exported from logger.c — declared in logger.h */
+// qtype_name() is exported from logger.c — declared in logger.h
 
 static void print_qtype_stats(void) {
-    printf("Query statistics:\n");
-    printf("  Total queries: %" PRIu64 "\n", atomic_load(&g_total_queries));
-    printf("  Blocked:       %" PRIu64 "\n", policy_blocked_count());
-    for (int i = 1; i <= 255; i++) {
-        uint64_t c = atomic_load(&g_qtype_counters[i]);
-        if (c == 0) continue;
-        const char* name = qtype_name((uint16_t)i);
-        if (name) printf("  %-10s %" PRIu64 "\n", name, c);
-        else      printf("  TYPE%-6d %" PRIu64 "\n", i, c);
-    }
-    uint64_t other = atomic_load(&g_qtype_counters[0]);
-    if (other) printf("  %-10s %" PRIu64 "\n", "OTHER", other);
+	printf("Query statistics:\n");
+	printf("  Total queries: %" PRIu64 "\n", atomic_load(&g_total_queries));
+	printf("  Blocked:       %" PRIu64 "\n", policy_blocked_count());
+
+	for(int i = 1; i <= 255; i++) {
+		uint64_t c = atomic_load(&g_qtype_counters[i]);
+		if(c == 0)
+			continue;
+		const char* name = qtype_name((uint16_t)i);
+		if(name)
+			printf("  %-10s %" PRIu64 "\n", name, c);
+		else
+			printf("  TYPE%-6d %" PRIu64 "\n", i, c);
+	}
+
+	uint64_t other = atomic_load(&g_qtype_counters[0]);
+	if(other)
+		printf("  %-10s %" PRIu64 "\n", "OTHER", other);
 }
 
-/* --- TCP query context --------------------------------------------------- */
-struct TCPQueryContext {
-    int client_fd;
-    char client_ip[INET6_ADDRSTRLEN];
-    uint16_t client_port;
-    struct sockaddr_storage client_ss;   /* source addr for the recursion ACL */
+// TCP query context
+struct tcp_query_context {
+	int client_fd;
+	char client_ip[INET6_ADDRSTRLEN];
+	uint16_t client_port;
+	struct sockaddr_storage client_ss;   // source addr for the recursion ACL
 };
 
-/* --- Signal handler ------------------------------------------------------- */
+// Signal handler
 static void signal_handler(int signum) {
-    switch (signum) {
-        case SIGINT:
-        case SIGTERM:
-        case SIGQUIT:
-            g_running = 0;
-            break;
-        case SIGHUP:
-            g_reload = 1;
-            break;
-        case SIGUSR1:
-            if (stats_pipe[1] >= 0) {
-                char b = 's';
-                if (write(stats_pipe[1], &b, 1) < 0) { /* best-effort */ }
-            }
-            break;
-        /* Reopen the query log ONLY — this is what the daily archiver sends
-         * after it moves the file aside.  SIGHUP would also work but drags a
-         * full config, zone-key and blocklist reload along with it, which is
-         * far too expensive to pay once a day just to rotate a log. */
-        case SIGUSR2:
-            g_reopen_log = 1;
-            break;
-        default:
-            break;
-    }
+	switch (signum) {
+	case SIGINT:
+	case SIGTERM:
+	case SIGQUIT:
+		g_running = 0;
+		break;
+	case SIGHUP:
+		g_reload = 1;
+		break;
+	case SIGUSR1:
+		if(stats_pipe[1] >= 0) {
+			char b = 's';
+			if(write(stats_pipe[1], &b, 1) < 0) {
+			} // best-effort
+		}
+		break;
+		// Reopen the query log ONLY
+	case SIGUSR2:
+		g_reopen_log = 1;
+		break;
+	default:
+		break;
+	}
 }
 
 static void setup_signals(void) {
-    signal(SIGPIPE, SIG_IGN);
+	signal(SIGPIPE, SIG_IGN);
 
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = signal_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
 
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGQUIT, &sa, NULL);
-    sigaction(SIGHUP,  &sa, NULL);
-    sigaction(SIGUSR1, &sa, NULL);
-    sigaction(SIGUSR2, &sa, NULL);
+	sigaction(SIGINT,  &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGQUIT, &sa, NULL);
+	sigaction(SIGHUP,  &sa, NULL);
+	sigaction(SIGUSR1, &sa, NULL);
+	sigaction(SIGUSR2, &sa, NULL);
 }
 
-/* --- DNSSEC key reload ---------------------------------------------------- */
+// DNSSEC key reload
 
-/*
- * Swap in freshly loaded zone keys (SIGHUP).  Worker threads walk g_zone_keys
- * while holding g_auth_domains_lock for reading, so the pointer may only be
- * replaced under the write lock and the old list freed after it is unpublished
- * — otherwise a signing thread walks nodes this one has already freed.
- *
- * A failed load keeps the running keys, matching reload_auth_domains() and
- * policy_load(): a config file that momentarily cannot be read must not
- * silently turn signing off until the next restart.
- */
+// Swap in freshly loaded zone keys (SIGHUP).
 static void reload_zone_keys(void)
 {
-    ZoneKey *fresh = load_zone_keys(SERVER_PATH "/config");
-    if (!fresh) {
-        fprintf(stderr, "SIGHUP: zone-key reload failed; keeping the keys in service\n");
-        return;
-    }
+	zone_key *fresh = load_zone_keys(SERVER_PATH "/config");
 
-    pthread_rwlock_wrlock(&g_auth_domains_lock);
-    ZoneKey *old = g_zone_keys;
-    g_zone_keys = fresh;
-    pthread_rwlock_unlock(&g_auth_domains_lock);
+	if(!fresh) {
+		fprintf(stderr, "SIGHUP: zone-key reload failed; keeping the keys in service\n");
+		return;
+	}
 
-    /* No reader can still hold `old` once the write lock was granted. */
-    free_zone_keys(old);
-    printf("DNSSEC signing keys reloaded.\n");
+	pthread_rwlock_wrlock(&g_auth_domains_lock);
+	zone_key *old = g_zone_keys;
+	g_zone_keys = fresh;
+	pthread_rwlock_unlock(&g_auth_domains_lock);
+
+	// No reader can still hold `old` once the write lock was granted.
+	free_zone_keys(old);
+	printf("DNSSEC signing keys reloaded.\n");
 }
 
-/* --- Socket helpers ------------------------------------------------------- */
+// Socket helpers
 
-/*
- * Normalize the header flags of a forwarded (recursively-resolved) answer.
- * resolve_recursive() returns the raw authoritative-server response, whose
- * flags describe THAT server, not us.  For a recursive/forwarding answer we
- * MUST fix these bits (RFC 1035 §4.1.1):
- *   - clear AA — we are not authoritative for forwarded names
- *   - set   RA — this server provides recursion
- *   - echo  RD — mirror the client's query
- *   - echo  CD — RFC 4035 §3.2.2
- * QR, opcode, TC, AD and RCODE are left exactly as the upstream set them.
- */
-static void normalize_forwarded_flags(struct Packet* ans, const struct Packet* req) {
-    if (!ans || !ans->request || ans->recv_len < 4 || !req) return;
-    uint16_t flags = rd16(ans->request + 2);
-    flags &= ~(1u << 10);              /* AA = 0 */
-    flags |=  (1u << 7);               /* RA = 1 */
-    if (req->rd) flags |=  (1u << 8);  /* RD echo */
-    else         flags &= ~(1u << 8);
-    if (req->cd) flags |=  (1u << 4);  /* CD echo (RFC 4035 §3.2.2) */
-    else         flags &= ~(1u << 4);
-    wr16(ans->request + 2, flags);
+// Normalize the header flags of a forwarded (recursively-resolved) answer
+static void normalize_forwarded_flags(struct packet* ans, const struct packet* req) {
+	if(!ans || !ans->request || ans->recv_len < 4 || !req)
+		return;
+	uint16_t flags = rd16(ans->request + 2);
+	flags &= ~(1u << 10);              // AA = 0
+	flags |=  (1u << 7);               // RA = 1
+	if(req->rd)
+		flags |=  (1u << 8);  // RD echo
+	else
+		flags &= ~(1u << 8);
+	if(req->cd)
+		flags |=  (1u << 4);  // CD echo (RFC 4035 §3.2.2)
+	else
+		flags &= ~(1u << 4);
+	wr16(ans->request + 2, flags);
 }
 
-/*
- * Outcome of the recursion access-control gate (known_issues 4.3).
- *   QGATE_OK      — proceed (answer may still be NULL → SERVFAIL)
- *   QGATE_REFUSED — source not in the recursion allow-list → send REFUSED
- *   QGATE_DROP    — source over its rate limit → drop (UDP) / REFUSED (TCP)
- */
-typedef enum { QGATE_OK = 0, QGATE_REFUSED, QGATE_DROP } QueryGate;
+// Outcome of the recursion access-control gate (known_issues 4.3).
+typedef enum { QGATE_OK = 0, QGATE_REFUSED, QGATE_DROP } query_gate;
 
-/* What the local stage left for the remote (forwarding) stage to do. */
+// What the local stage left for the remote (forwarding) stage to do.
 typedef enum {
-    LOCAL_DONE = 0,   /* answer is complete                                   */
-    LOCAL_FORWARD,    /* nothing local: forward the whole query upstream      */
-    LOCAL_CHASE       /* local CNAME chain ends outside our data: resolve the */
-                      /* target upstream and append it                        */
-} LocalResult;
+	LOCAL_DONE = 0,   // answer is complete
+	LOCAL_FORWARD,    // nothing local: forward the whole query upstream
+	LOCAL_CHASE       // local CNAME chain ends outside our data: resolve the target upstream
+} local_result;
 
 #define MAX_CNAME_CHASE 8
 
-/* Build the blocked-name response for `pkt` from a policy decision `ans`
- * (NXDOMAIN, or a sinkhole answer / NODATA under -S). */
-static struct Packet* block_response(const struct Packet* pkt, const SynthAnswer* ans,
-                                     const char* zone) {
-    struct Packet* r = calloc(1, sizeof(struct Packet));
-    if (!r) return NULL;
-    r->request = calloc(1, DNS_MSG_MAX);
-    if (!r->request) { free(r); return NULL; }
+// Build the blocked-name response for `pkt` from a policy decision `ans`.
+static struct packet* block_response(const struct packet* pkt, const synth_answer* ans,
+									 const char* zone) {
+	struct packet* r = calloc(1, sizeof(struct packet));
 
-    int rcode = policy_block_mode_rcode();    /* 3 = NXDOMAIN, 0 = sinkhole */
-    int has   = (ans->addrlen > 0);           /* sinkhole answer present? */
-    ssize_t n = dns_synth_response((const unsigned char*)pkt->request, pkt->recv_len,
-                                   rcode, has ? ans : NULL, has ? 1 : 0,
-                                   (unsigned char*)r->request, DNS_MSG_MAX);
-    if (n <= 0) { free(r->request); free(r); return NULL; }
+	if(!r)
+		return NULL;
+	r->request = calloc(1, DNS_MSG_MAX);
+	if(!r->request) {
+		free(r);
+		return NULL;
+	}
 
-    /* Negative answer (NXDOMAIN, or sinkhole NODATA): add an SOA so clients
-     * can negative-cache it (RFC 2308 §5 — without one they SHOULD NOT cache
-     * and re-ask every time).  Short 60 s TTL. */
-    if (!has && n + 64 + 256 <= DNS_MSG_MAX) {
-        char* b = r->request;
-        int pos = (int)n;
-        /* Owner = the blocklist entry that matched, i.e. the apex of the zone
-         * being refused (RFC 2308 §3).  Naming the QNAME here instead left
-         * strict resolvers unable to negative-cache the refusal, so they
-         * re-queried every blocked name on every lookup. */
-        if (zone && *zone) write_dns_labels(zone, b, &pos, DNS_MSG_MAX);
-        else               { wr16(b + pos, DNS_NAME_PTR); pos += 2; }
-        wr16(b + pos, QTYPE_SOA);     pos += 2;
-        wr16(b + pos, 1);             pos += 2;          /* IN */
-        wr32(b + pos, 60);            pos += 4;          /* TTL */
-        int rdlen_at = pos;           pos += 2;
-        int rstart = pos;
-        write_dns_labels("localhost", b, &pos, DNS_MSG_MAX);        /* MNAME */
-        write_dns_labels("nobody.invalid", b, &pos, DNS_MSG_MAX);   /* RNAME */
-        wr32(b + pos, 1);     pos += 4;                  /* serial */
-        wr32(b + pos, 3600);  pos += 4;                  /* refresh */
-        wr32(b + pos, 600);   pos += 4;                  /* retry */
-        wr32(b + pos, 86400); pos += 4;                  /* expire */
-        wr32(b + pos, 60);    pos += 4;                  /* minimum */
-        wr16(b + rdlen_at, (uint16_t)(pos - rstart));
-        wr16(b + 8, 1);                                  /* NSCOUNT */
-        n = pos;
-    }
-    r->recv_len = n;
-    r->id = pkt->id;
-    return r;
+	int rcode = policy_block_mode_rcode();    // 3 = NXDOMAIN, 0 = sinkhole
+	int has   = (ans->addrlen > 0);           // sinkhole answer present?
+	ssize_t n = dns_synth_response((const unsigned char*)pkt->request, pkt->recv_len,
+								   rcode, has ? ans : NULL, has ? 1 : 0,
+								   (unsigned char*)r->request, DNS_MSG_MAX);
+	if(n <= 0) {
+		free(r->request);
+		free(r);
+		return NULL;
+	}
+
+	// Negative answer: add an SOA so clients can negative-cache it.
+	if(!has && n + 64 + 256 <= DNS_MSG_MAX) {
+		char* b = r->request;
+		int pos = (int)n;
+
+		// Owner = the blocklist entry that matched
+		if(zone && *zone) {
+			write_dns_labels(zone, b, &pos, DNS_MSG_MAX);
+		} else {
+			wr16(b + pos, DNS_NAME_PTR);
+			pos += 2;
+		}
+
+		wr16(b + pos, QTYPE_SOA);     pos += 2;
+		wr16(b + pos, 1);             pos += 2;          // IN
+		wr32(b + pos, 60);            pos += 4;          // TTL
+		int rdlen_at = pos;           pos += 2;
+		int rstart = pos;
+		write_dns_labels("localhost", b, &pos, DNS_MSG_MAX);        // MNAME
+		write_dns_labels("nobody.invalid", b, &pos, DNS_MSG_MAX);   // RNAME
+		wr32(b + pos, 1);     pos += 4;                  // serial
+		wr32(b + pos, 3600);  pos += 4;                  // refresh
+		wr32(b + pos, 600);   pos += 4;                  // retry
+		wr32(b + pos, 86400); pos += 4;                  // expire
+		wr32(b + pos, 60);    pos += 4;                  // minimum
+		wr16(b + rdlen_at, (uint16_t)(pos - rstart));
+		wr16(b + 8, 1);                                  // NSCOUNT
+		n = pos;
+	}
+
+	r->recv_len = n;
+	r->id = pkt->id;
+
+	return r;
 }
 
-/*
- * Local query policy: build a synthesized response for a blocklist hit
- * (NXDOMAIN by default, or a sinkhole answer under -S), or return NULL to let
- * the query proceed.  Served like the auth zones, before forwarding upstream.
- */
-static struct Packet* policy_answer(const struct Packet* pkt) {
-    if (!pkt || !pkt->full_domain || !pkt->request) return NULL;
+// Local query policy: build a synthesized response for a blocklist hit
+static struct packet* policy_answer(const struct packet* pkt) {
+	if(!pkt || !pkt->full_domain || !pkt->request)
+		return NULL;
 
-    SynthAnswer ans;
-    char zone[256];
-    if (policy_lookup(pkt->full_domain, pkt->q_type, &ans, zone, sizeof(zone)) == POLICY_PASS)
-        return NULL;
-    return block_response(pkt, &ans, zone);
+	synth_answer ans;
+	char zone[256];
+	if(policy_lookup(pkt->full_domain, pkt->q_type, &ans, zone, sizeof(zone)) == POLICY_PASS)
+		return NULL;
+
+	return block_response(pkt, &ans, zone);
 }
 
-/*
- * CNAME cloaking: a forwarded answer whose CNAME chain leads into a blocked
- * name (first-party alias -> tracker) is blocked like the target itself.
- * Returns the block response to send instead, or NULL when the chain is clean.
- */
-static struct Packet* cloaked_block(const struct Packet* pkt, const struct Packet* answer) {
-    if (!answer || !answer->request || answer->recv_len < HEADER_LEN) return NULL;
-    const uint8_t* m = (const uint8_t*)answer->request;
-    int len = (int)answer->recv_len;
-    int an  = rd16(m + 6);
-    int p   = HEADER_LEN;
-    for (int i = 0, qd = rd16(m + 4); i < qd; i++) {      /* skip question */
-        char tmp[DNAME_TEXT_MAX];
-        p = dname_from_wire(m, len, p, true, tmp, sizeof(tmp));
-        if (p < 0 || p + 4 > len) return NULL;
-        p += 4;
-    }
-    for (int i = 0; i < an; i++) {
-        char tmp[DNAME_TEXT_MAX];
-        p = dname_from_wire(m, len, p, true, tmp, sizeof(tmp));
-        if (p < 0 || p + 10 > len) return NULL;
-        uint16_t type  = rd16(m + p);
-        uint16_t rdlen = rd16(m + p + 8);
-        if (p + 10 + rdlen > len) return NULL;
-        if (type == QTYPE_CNAME &&
-            dname_from_wire(m, len, p + 10, true, tmp, sizeof(tmp)) >= 0) {
-            SynthAnswer ans;
-            char zone[256];
-            if (policy_lookup(tmp, pkt->q_type, &ans, zone, sizeof(zone)) == POLICY_BLOCK)
-                return block_response(pkt, &ans, zone);
-        }
-        p += 10 + rdlen;
-    }
-    return NULL;
+// CNAME cloaking: block a forwarded answer whose chain leads to a blocked name
+static struct packet* cloaked_block(const struct packet* pkt, const struct packet* answer) {
+	if(!answer || !answer->request || answer->recv_len < HEADER_LEN)
+		return NULL;
+	const uint8_t* m = (const uint8_t*)answer->request;
+	int len = (int)answer->recv_len;
+	int an  = rd16(m + 6);
+	int p   = HEADER_LEN;
+
+	for(int i = 0, qd = rd16(m + 4); i < qd; i++) {      // skip question
+		char tmp[DNAME_TEXT_MAX];
+		p = dname_from_wire(m, len, p, true, tmp, sizeof(tmp));
+		if(p < 0 || p + 4 > len)
+			return NULL;
+		p += 4;
+	}
+
+	for(int i = 0; i < an; i++) {
+		char tmp[DNAME_TEXT_MAX];
+		p = dname_from_wire(m, len, p, true, tmp, sizeof(tmp));
+		if(p < 0 || p + 10 > len)
+			return NULL;
+		uint16_t type  = rd16(m + p);
+		uint16_t rdlen = rd16(m + p + 8);
+		if(p + 10 + rdlen > len)
+			return NULL;
+		if(type == QTYPE_CNAME &&
+		   dname_from_wire(m, len, p + 10, true, tmp, sizeof(tmp)) >= 0) {
+			synth_answer ans;
+			char zone[256];
+			if(policy_lookup(tmp, pkt->q_type, &ans, zone, sizeof(zone)) == POLICY_BLOCK)
+				return block_response(pkt, &ans, zone);
+		}
+
+		p += 10 + rdlen;
+	}
+
+	return NULL;
 }
 
-/*
- * Locally served reverse zones for private address space (RFC 6303): PTR
- * lookups for RFC 1918, loopback, link-local and ULA addresses never leave the
- * network.  Names we hold records for are answered by check_internal() first;
- * everything else under these zones is NXDOMAIN (NODATA at the zone apex),
- * with the RFC 6303 SOA so clients can cache the answer.
- */
+// Locally served reverse zones for private address space
 static const char* const k_private_reverse[] = {
-    "10.in-addr.arpa",   "127.in-addr.arpa",  "254.169.in-addr.arpa",
-    "168.192.in-addr.arpa",
-    "0.in-addr.arpa",    "255.in-addr.arpa",          /* "this" and broadcast */
-    /* 100.64.0.0/10 (CGNAT, RFC 6598): 100.64 .. 100.127 */
-    "64.100.in-addr.arpa",  "65.100.in-addr.arpa",  "66.100.in-addr.arpa",
-    "67.100.in-addr.arpa",  "68.100.in-addr.arpa",  "69.100.in-addr.arpa",
-    "70.100.in-addr.arpa",  "71.100.in-addr.arpa",  "72.100.in-addr.arpa",
-    "73.100.in-addr.arpa",  "74.100.in-addr.arpa",  "75.100.in-addr.arpa",
-    "76.100.in-addr.arpa",  "77.100.in-addr.arpa",  "78.100.in-addr.arpa",
-    "79.100.in-addr.arpa",  "80.100.in-addr.arpa",  "81.100.in-addr.arpa",
-    "82.100.in-addr.arpa",  "83.100.in-addr.arpa",  "84.100.in-addr.arpa",
-    "85.100.in-addr.arpa",  "86.100.in-addr.arpa",  "87.100.in-addr.arpa",
-    "88.100.in-addr.arpa",  "89.100.in-addr.arpa",  "90.100.in-addr.arpa",
-    "91.100.in-addr.arpa",  "92.100.in-addr.arpa",  "93.100.in-addr.arpa",
-    "94.100.in-addr.arpa",  "95.100.in-addr.arpa",  "96.100.in-addr.arpa",
-    "97.100.in-addr.arpa",  "98.100.in-addr.arpa",  "99.100.in-addr.arpa",
-    "100.100.in-addr.arpa", "101.100.in-addr.arpa", "102.100.in-addr.arpa",
-    "103.100.in-addr.arpa", "104.100.in-addr.arpa", "105.100.in-addr.arpa",
-    "106.100.in-addr.arpa", "107.100.in-addr.arpa", "108.100.in-addr.arpa",
-    "109.100.in-addr.arpa", "110.100.in-addr.arpa", "111.100.in-addr.arpa",
-    "112.100.in-addr.arpa", "113.100.in-addr.arpa", "114.100.in-addr.arpa",
-    "115.100.in-addr.arpa", "116.100.in-addr.arpa", "117.100.in-addr.arpa",
-    "118.100.in-addr.arpa", "119.100.in-addr.arpa", "120.100.in-addr.arpa",
-    "121.100.in-addr.arpa", "122.100.in-addr.arpa", "123.100.in-addr.arpa",
-    "124.100.in-addr.arpa", "125.100.in-addr.arpa", "126.100.in-addr.arpa",
-    "127.100.in-addr.arpa",
-    "16.172.in-addr.arpa", "17.172.in-addr.arpa", "18.172.in-addr.arpa",
-    "19.172.in-addr.arpa", "20.172.in-addr.arpa", "21.172.in-addr.arpa",
-    "22.172.in-addr.arpa", "23.172.in-addr.arpa", "24.172.in-addr.arpa",
-    "25.172.in-addr.arpa", "26.172.in-addr.arpa", "27.172.in-addr.arpa",
-    "28.172.in-addr.arpa", "29.172.in-addr.arpa", "30.172.in-addr.arpa",
-    "31.172.in-addr.arpa",
-    "d.f.ip6.arpa", "8.e.f.ip6.arpa", "9.e.f.ip6.arpa", "a.e.f.ip6.arpa",
-    "b.e.f.ip6.arpa",
+	"10.in-addr.arpa",   "127.in-addr.arpa",  "254.169.in-addr.arpa",
+	"168.192.in-addr.arpa",
+	"0.in-addr.arpa",    "255.in-addr.arpa",          // "this" and broadcast
+	// 100.64.0.0/10 (CGNAT, RFC 6598): 100.64 ..
+	"64.100.in-addr.arpa",  "65.100.in-addr.arpa",  "66.100.in-addr.arpa",
+	"67.100.in-addr.arpa",  "68.100.in-addr.arpa",  "69.100.in-addr.arpa",
+	"70.100.in-addr.arpa",  "71.100.in-addr.arpa",  "72.100.in-addr.arpa",
+	"73.100.in-addr.arpa",  "74.100.in-addr.arpa",  "75.100.in-addr.arpa",
+	"76.100.in-addr.arpa",  "77.100.in-addr.arpa",  "78.100.in-addr.arpa",
+	"79.100.in-addr.arpa",  "80.100.in-addr.arpa",  "81.100.in-addr.arpa",
+	"82.100.in-addr.arpa",  "83.100.in-addr.arpa",  "84.100.in-addr.arpa",
+	"85.100.in-addr.arpa",  "86.100.in-addr.arpa",  "87.100.in-addr.arpa",
+	"88.100.in-addr.arpa",  "89.100.in-addr.arpa",  "90.100.in-addr.arpa",
+	"91.100.in-addr.arpa",  "92.100.in-addr.arpa",  "93.100.in-addr.arpa",
+	"94.100.in-addr.arpa",  "95.100.in-addr.arpa",  "96.100.in-addr.arpa",
+	"97.100.in-addr.arpa",  "98.100.in-addr.arpa",  "99.100.in-addr.arpa",
+	"100.100.in-addr.arpa", "101.100.in-addr.arpa", "102.100.in-addr.arpa",
+	"103.100.in-addr.arpa", "104.100.in-addr.arpa", "105.100.in-addr.arpa",
+	"106.100.in-addr.arpa", "107.100.in-addr.arpa", "108.100.in-addr.arpa",
+	"109.100.in-addr.arpa", "110.100.in-addr.arpa", "111.100.in-addr.arpa",
+	"112.100.in-addr.arpa", "113.100.in-addr.arpa", "114.100.in-addr.arpa",
+	"115.100.in-addr.arpa", "116.100.in-addr.arpa", "117.100.in-addr.arpa",
+	"118.100.in-addr.arpa", "119.100.in-addr.arpa", "120.100.in-addr.arpa",
+	"121.100.in-addr.arpa", "122.100.in-addr.arpa", "123.100.in-addr.arpa",
+	"124.100.in-addr.arpa", "125.100.in-addr.arpa", "126.100.in-addr.arpa",
+	"127.100.in-addr.arpa",
+	"16.172.in-addr.arpa", "17.172.in-addr.arpa", "18.172.in-addr.arpa",
+	"19.172.in-addr.arpa", "20.172.in-addr.arpa", "21.172.in-addr.arpa",
+	"22.172.in-addr.arpa", "23.172.in-addr.arpa", "24.172.in-addr.arpa",
+	"25.172.in-addr.arpa", "26.172.in-addr.arpa", "27.172.in-addr.arpa",
+	"28.172.in-addr.arpa", "29.172.in-addr.arpa", "30.172.in-addr.arpa",
+	"31.172.in-addr.arpa",
+	"d.f.ip6.arpa", "8.e.f.ip6.arpa", "9.e.f.ip6.arpa", "a.e.f.ip6.arpa",
+	"b.e.f.ip6.arpa",
 };
 
-static struct Packet* private_reverse_answer(struct Packet* pkt) {
-    if (!pkt || !pkt->full_domain) return NULL;
-    const char* name = pkt->full_domain;
-    for (size_t i = 0; i < sizeof(k_private_reverse) / sizeof(k_private_reverse[0]); i++) {
-        const char* zone = k_private_reverse[i];
-        if (!dname_is_subdomain(name, zone)) continue;
-        bool apex = (strcmp(name, zone) == 0);
+static struct packet* private_reverse_answer(struct packet* pkt) {
+	if(!pkt || !pkt->full_domain)
+		return NULL;
+	const char* name = pkt->full_domain;
 
-        /* RFC 6303 §3: "@ 10800 IN SOA @ nobody.invalid. 1 3600 1200 604800 10800" */
-        static __thread struct AuthDomain soa;
-        memset(&soa, 0, sizeof(soa));
-        snprintf(soa.domain, sizeof(soa.domain), "%s", zone);
-        snprintf(soa.soa_mname, sizeof(soa.soa_mname), "%s", zone);
-        snprintf(soa.soa_rname, sizeof(soa.soa_rname), "nobody.invalid");
-        soa.has_soa = true;
-        soa.soa_serial = 1; soa.soa_refresh = 3600; soa.soa_retry = 1200;
-        soa.soa_expire = 604800; soa.soa_minimum = 10800; soa.soa_ttl = 10800;
-        return apex ? build_nodata_response(pkt, &soa)
-                    : build_nxdomain_response(pkt, &soa);
-    }
-    return NULL;
+	for(size_t i = 0; i < sizeof(k_private_reverse) / sizeof(k_private_reverse[0]); i++) {
+		const char* zone = k_private_reverse[i];
+		if(!dname_is_subdomain(name, zone))
+			continue;
+		bool apex = (strcmp(name, zone) == 0);
+
+		// RFC 6303 §3: SOA @ nobody.invalid. 1 3600 1200 604800 10800
+		static __thread struct auth_domain soa;
+		memset(&soa, 0, sizeof(soa));
+		snprintf(soa.domain, sizeof(soa.domain), "%s", zone);
+		snprintf(soa.soa_mname, sizeof(soa.soa_mname), "%s", zone);
+		snprintf(soa.soa_rname, sizeof(soa.soa_rname), "nobody.invalid");
+		soa.has_soa = true;
+		soa.soa_serial = 1; soa.soa_refresh = 3600; soa.soa_retry = 1200;
+		soa.soa_expire = 604800; soa.soa_minimum = 10800; soa.soa_ttl = 10800;
+		return apex ? build_nodata_response(pkt, &soa)
+					: build_nxdomain_response(pkt, &soa);
+	}
+
+	return NULL;
 }
 
-/* Local answer for `q` from zones, blocklist and private reverse zones. */
-static struct Packet* local_lookup(struct Packet* q) {
-    struct Packet* a = check_internal(q);
-    if (!a) a = policy_answer(q);
-    if (!a) a = private_reverse_answer(q);
-    return a;
+// Local answer for `q` from zones, blocklist and private reverse zones.
+static struct packet* local_lookup(struct packet* q) {
+	struct packet* a = check_internal(q);
+
+	if(!a)
+		a = policy_answer(q);
+	if(!a)
+		a = private_reverse_answer(q);
+
+	return a;
 }
 
-/*
- * Local stage — everything answerable without the network: our zones, the
- * blocklist, private reverse zones, and CNAME chains whose targets are also
- * local.  Never blocks on I/O, so it is safe on the UDP receive threads.
- *
- * Authoritative answers (our own zones) and local policy are served to ANY
- * source — the auth server is, by design, publicly answerable for its zones.
- * Only the remote stage is access-controlled.
- */
-static struct Packet* resolve_local(struct Packet* pkt, LocalResult* how) {
-    *how = LOCAL_DONE;
-    struct Packet* answer = local_lookup(pkt);
-    if (!answer) { *how = LOCAL_FORWARD; return NULL; }
+// Local stage — everything answerable without the network: our zones
+static struct packet* resolve_local(struct packet* pkt, local_result* how) {
+	*how = LOCAL_DONE;
+	struct packet* answer = local_lookup(pkt);
+	if(!answer) {
+		*how = LOCAL_FORWARD;
+		return NULL;
+	}
 
-    /* RFC 1034 §4.3.2: an alias answer must carry its target's records too;
-     * stub resolvers do not chase a bare CNAME themselves. */
-    char target[DNAME_TEXT_MAX];
-    for (int depth = 0; depth < MAX_CNAME_CHASE &&
-                        cname_needs_chase(answer, pkt->q_type, target); depth++) {
-        struct Packet* sub = make_chase_query(pkt, target);
-        if (!sub) break;
-        struct Packet* sub_ans = local_lookup(sub);
-        free_packet(sub);
-        if (!sub_ans) { *how = LOCAL_CHASE; break; }   /* target is not ours */
-        int rc = merge_chased_answer(answer, sub_ans);
-        free_packet(sub_ans);
-        if (rc != 0) break;
-    }
-    return answer;
+	// RFC 1034 §4.3.2: an alias answer must carry its target's records too
+	char target[DNAME_TEXT_MAX];
+	for(int depth = 0; depth < MAX_CNAME_CHASE &&
+						cname_needs_chase(answer, pkt->q_type, target); depth++) {
+		struct packet* sub = make_chase_query(pkt, target);
+		if(!sub)
+			break;
+		struct packet* sub_ans = local_lookup(sub);
+		free_packet(sub);
+		if(!sub_ans) {
+			*how = LOCAL_CHASE;
+			break;
+		}   // target is not ours
+		int rc = merge_chased_answer(answer, sub_ans);
+		free_packet(sub_ans);
+		if(rc != 0)
+			break;
+	}
+
+	return answer;
 }
 
-/*
- * Remote stage — may block for up to the upstream timeout.  Applies the
- * recursion gate (the DNS-amplification vector), then forwards the query or,
- * for LOCAL_CHASE, resolves the CNAME target and appends it to `partial`.
- * Returns the final answer (NULL → SERVFAIL).  Takes ownership of `partial`.
- */
-static struct Packet* resolve_remote(struct Packet* pkt, struct Packet* partial,
-                                     LocalResult how,
-                                     const struct sockaddr_storage* src,
-                                     QueryGate* gate, int client_tcp) {
-    *gate = QGATE_OK;
-    if (how == LOCAL_DONE) return partial;
+// Remote stage — may block for up to the upstream timeout.
+static struct packet* resolve_remote(struct packet* pkt, struct packet* partial,
+									 local_result how,
+									 const struct sockaddr_storage* src,
+									 query_gate* gate, int client_tcp) {
+	*gate = QGATE_OK;
+	if(how == LOCAL_DONE)
+		return partial;
 
-    /* Charge the limiter before consulting the allow-list: replying to every
-     * out-of-ACL query regardless of rate made refusals an unmetered reflector
-     * for a spoofed source address. */
-    QueryGate g = QGATE_OK;
-    if (src && !rl_allow(src))      g = QGATE_DROP;
-    else if (src && !acl_allows(src)) g = QGATE_REFUSED;
+	// Charge the limiter before consulting the allow-list
+	query_gate g = QGATE_OK;
+	if(src && !rl_allow(src))
+		g = QGATE_DROP;
+	else if(src && !acl_allows(src))
+		g = QGATE_REFUSED;
 
-    /* RD=0 is NOT refused.  The client is asking what we already hold, which
-     * is a normal diagnostic (`dig +norecurse`), and refusing it tells the
-     * client we will not serve it at all — stubs may then stop using us.
-     * The query is forwarded with RD=0 intact; upstream honours that by
-     * answering from its cache only, so no recursion happens on the client's
-     * behalf and the pair behaves like one resolver with one cache. */
+	// RD=0 is not refused: the client is asking what we already hold
 
-    if (how == LOCAL_CHASE) {
-        /* Our own alias is always served; only its external target needs the
-         * recursion permission.  Without it, return the CNAME alone. */
-        if (g != QGATE_OK) return partial;
-        char target[DNAME_TEXT_MAX];
-        if (!cname_needs_chase(partial, pkt->q_type, target)) return partial;
-        struct Packet* sub = make_chase_query(pkt, target);
-        struct Packet* sub_ans = sub ? resolve_recursive(sub, client_tcp) : NULL;
-        struct Packet* blocked = cloaked_block(pkt, sub_ans);
-        free_packet(sub);
-        if (blocked) { free_packet(sub_ans); free_packet(partial); return blocked; }
-        if (sub_ans) merge_chased_answer(partial, sub_ans);
-        free_packet(sub_ans);
-        return partial;
-    }
+	if(how == LOCAL_CHASE) {
+		// Our own alias is always served
+		if(g != QGATE_OK)
+			return partial;
+		char target[DNAME_TEXT_MAX];
+		if(!cname_needs_chase(partial, pkt->q_type, target))
+			return partial;
+		struct packet* sub = make_chase_query(pkt, target);
+		struct packet* sub_ans = sub ? resolve_recursive(sub, client_tcp) : NULL;
+		struct packet* blocked = cloaked_block(pkt, sub_ans);
+		free_packet(sub);
+		if(blocked) {
+			free_packet(sub_ans);
+			free_packet(partial);
+			return blocked;
+		}
+		if(sub_ans)
+			merge_chased_answer(partial, sub_ans);
+		free_packet(sub_ans);
+		return partial;
+	}
 
-    /* LOCAL_FORWARD */
-    free_packet(partial);
-    if (g != QGATE_OK) { *gate = g; return NULL; }
-    /* Forward upstream over the same transport the client used: a TCP client
-     * needs a TCP upstream query to receive answers too large for UDP. */
-    struct Packet* answer = resolve_recursive(pkt, client_tcp);
-    struct Packet* blocked = cloaked_block(pkt, answer);
-    if (blocked) { free_packet(answer); return blocked; }
-    if (answer) normalize_forwarded_flags(answer, pkt);
-    return answer;
+	// LOCAL_FORWARD
+	free_packet(partial);
+	if(g != QGATE_OK) {
+		*gate = g;
+		return NULL;
+	}
+	// Forward upstream over the same transport the client used
+	struct packet* answer = resolve_recursive(pkt, client_tcp);
+	struct packet* blocked = cloaked_block(pkt, answer);
+	if(blocked) {
+		free_packet(answer);
+		return blocked;
+	}
+	if(answer)
+		normalize_forwarded_flags(answer, pkt);
+
+	return answer;
 }
 
-/* Parse-level handling shared by UDP and TCP.  Returns the parsed packet, or
- * NULL after having dealt with the message (dropped it or sent an error). */
-typedef void (*ErrorSender)(void* ctx, const char* buf, ssize_t n, int rcode);
-typedef void (*PacketSender)(void* ctx, struct Packet* resp);
+// Parse-level handling shared by UDP and TCP.
+typedef void (*error_sender)(void* ctx, const char* buf, ssize_t n, int rcode);
+typedef void (*packet_sender)(void* ctx, struct packet* resp);
 
-static struct Packet* accept_query(char* buf, ssize_t n, void* ctx,
-                                   ErrorSender send_err, PacketSender send_pkt,
-                                   const char* client_ip, uint16_t client_port) {
-    /* A QR=1 message is a response, not a query: never answer it (answering
-     * responses invites reflection loops between two servers). */
-    if (n >= 3 && ((unsigned char)buf[2] & 0x80)) return NULL;
+static struct packet* accept_query(char* buf, ssize_t n, void* ctx,
+								   error_sender send_err, packet_sender send_pkt,
+								   const char* client_ip, uint16_t client_port) {
+	// A QR=1 message is a response, not a query: never answer it.
+	if(n >= 3 && ((unsigned char)buf[2] & 0x80))
+		return NULL;
 
-    struct Packet* pkt = parse_request_headers(buf, n);
-    if (!pkt) {
-        log_entry(client_ip, client_port, 0, "PARSE_ERROR", RCODE_FORMAT_ERROR, NULL);
-        send_err(ctx, buf, n, RCODE_FORMAT_ERROR);   /* malformed → FORMERR */
-        return NULL;
-    }
+	struct packet* pkt = parse_request_headers(buf, n);
+	if(!pkt) {
+		log_entry(client_ip, client_port, 0, "PARSE_ERROR", RCODE_FORMAT_ERROR, NULL);
+		send_err(ctx, buf, n, RCODE_FORMAT_ERROR);   // malformed → FORMERR
+		return NULL;
+	}
 
-    // NOTIFY (opcode 4, RFC 1996): this server is never a secondary for any
-    // zone, so there is nothing to refresh — refuse instead of acknowledging.
-    if (pkt->rcode == RCODE_NOTIMP && pkt->opcode == 4) {
-        send_err(ctx, buf, n, RCODE_REFUSED);
-        free_packet(pkt);
-        return NULL;
-    }
+	// NOTIFY: this server is never a secondary for any zone
+	if(pkt->rcode == RCODE_NOTIMP && pkt->opcode == 4) {
+		send_err(ctx, buf, n, RCODE_REFUSED);
+		free_packet(pkt);
+		return NULL;
+	}
 
-    // NOTIMP and parser errors (e.g. FORMERR for an invalid QCLASS, RFC 1035)
-    if (pkt->rcode != 0) {
-        send_err(ctx, buf, n, pkt->rcode);
-        free_packet(pkt);
-        return NULL;
-    }
+	// NOTIMP and parser errors (e.g. FORMERR for an invalid QCLASS, RFC 1035)
+	if(pkt->rcode != 0) {
+		send_err(ctx, buf, n, pkt->rcode);
+		free_packet(pkt);
+		return NULL;
+	}
 
-    // Unsupported EDNS version: send BADVERS (RFC 6891 §6.1.3)
-    if (pkt->edns_present && pkt->edns_version > 0) {
-        struct Packet *bv = build_badvers_response(pkt);
-        if (bv) { send_pkt(ctx, bv); free_packet(bv); }
-        free_packet(pkt);
-        return NULL;
-    }
+	// Unsupported EDNS version: send BADVERS (RFC 6891 §6.1.3)
+	if(pkt->edns_present && pkt->edns_version > 0) {
+		struct packet *bv = build_badvers_response(pkt);
+		if(bv) {
+			send_pkt(ctx, bv);
+			free_packet(bv);
+		}
+		free_packet(pkt);
+		return NULL;
+	}
 
-    atomic_fetch_add(&g_total_queries, 1);
-    {
-        uint8_t idx = (pkt->q_type < 256) ? (uint8_t)pkt->q_type : 0;
-        atomic_fetch_add(&g_qtype_counters[idx], 1);
-    }
-    return pkt;
+	atomic_fetch_add(&g_total_queries, 1);
+	{
+		uint8_t idx = (pkt->q_type < 256) ? (uint8_t)pkt->q_type : 0;
+		atomic_fetch_add(&g_qtype_counters[idx], 1);
+	}
+
+	return pkt;
 }
 
-/* Log the outcome of a query. */
-static void log_answer(const char* ip, uint16_t port, const struct Packet* pkt,
-                       const struct Packet* answer) {
-    if (!answer) {
-        log_entry(ip, port, pkt->q_type, pkt->full_domain, RCODE_SERVER_FAILURE, NULL);
-        return;
-    }
-    char *resolved_ip = extract_ip_from_response(answer);
-    uint8_t ans_rcode = (answer->recv_len >= HEADER_LEN && answer->request)
-        ? (uint8_t)(rd16(answer->request + 2) & 0xF) : 0;
-    log_entry(ip, port, pkt->q_type, pkt->full_domain, ans_rcode, resolved_ip);
-    free(resolved_ip);
+// Log the outcome of a query.
+static void log_answer(const char* ip, uint16_t port, const struct packet* pkt,
+					   const struct packet* answer) {
+	if(!answer) {
+		log_entry(ip, port, pkt->q_type, pkt->full_domain, RCODE_SERVER_FAILURE, NULL);
+		return;
+	}
+	char *resolved_ip = extract_ip_from_response(answer);
+	uint8_t ans_rcode = (answer->recv_len >= HEADER_LEN && answer->request)
+		? (uint8_t)(rd16(answer->request + 2) & 0xF) : 0;
+	log_entry(ip, port, pkt->q_type, pkt->full_domain, ans_rcode, resolved_ip);
+	free(resolved_ip);
 }
 
-/* --- UDP ------------------------------------------------------------------ */
+// UDP
 
-struct UdpClient {
-    int sock;
-    struct sockaddr_storage addr;
-    socklen_t addr_len;
-    char ip[INET6_ADDRSTRLEN];
-    uint16_t port;
+struct udp_client {
+	int sock;
+	struct sockaddr_storage addr;
+	socklen_t addr_len;
+	char ip[INET6_ADDRSTRLEN];
+	uint16_t port;
 };
 
 static void udp_send_err(void* ctx, const char* buf, ssize_t n, int rcode) {
-    struct UdpClient* c = ctx;
-    send_error_udp(c->sock, (const struct sockaddr*)&c->addr, c->addr_len, buf, n, rcode);
+	struct udp_client* c = ctx;
+
+	send_error_udp(c->sock, (const struct sockaddr*)&c->addr, c->addr_len, buf, n, rcode);
 }
 
-static void udp_send_pkt(void* ctx, struct Packet* resp) {
-    struct UdpClient* c = ctx;
-    send_response(c->sock, resp, (const struct sockaddr*)&c->addr, c->addr_len);
+static void udp_send_pkt(void* ctx, struct packet* resp) {
+	struct udp_client* c = ctx;
+
+	send_response(c->sock, resp, (const struct sockaddr*)&c->addr, c->addr_len);
 }
 
-/* Log, finalize and send a UDP answer (SERVFAIL when NULL); frees `answer`. */
-static void udp_finish(struct UdpClient* c, struct Packet* pkt, struct Packet* answer) {
-    log_answer(c->ip, c->port, pkt, answer);
-    if (!answer) {
-        answer = build_servfail_response(pkt);
-        if (!answer) return;
-    }
-    finalize_udp_response(answer, pkt);
-    udp_send_pkt(c, answer);
-    free_packet(answer);
+// Log, finalize and send a UDP answer (SERVFAIL when NULL); frees `answer`.
+static void udp_finish(struct udp_client* c, struct packet* pkt, struct packet* answer) {
+	log_answer(c->ip, c->port, pkt, answer);
+	if(!answer) {
+		answer = build_servfail_response(pkt);
+		if(!answer)
+			return;
+	}
+	finalize_udp_response(answer, pkt);
+	udp_send_pkt(c, answer);
+	free_packet(answer);
 }
 
-/* A query handed from a UDP receive thread to the forwarder pool. */
-struct ForwardJob {
-    struct UdpClient client;
-    struct Packet* pkt;
-    struct Packet* partial;
-    LocalResult how;
+// A query handed from a UDP receive thread to the forwarder pool.
+struct forward_job_data {
+	struct udp_client client;
+	struct packet* pkt;
+	struct packet* partial;
+	local_result how;
 };
 
-static struct ThreadPool* g_forward_pool = NULL;
+static struct thread_pool* g_forward_pool = NULL;
 
 static void* forward_job(void* arg) {
-    struct ForwardJob* job = arg;
-    QueryGate gate;
-    struct Packet* answer = resolve_remote(job->pkt, job->partial, job->how,
-                                           &job->client.addr, &gate, 0 /* UDP */);
-    if (gate == QGATE_REFUSED) {
-        log_entry(job->client.ip, job->client.port, job->pkt->q_type,
-                  job->pkt->full_domain, RCODE_REFUSED, NULL);
-        send_error_udp(job->client.sock, (const struct sockaddr*)&job->client.addr,
-                       job->client.addr_len, job->pkt->request, job->pkt->recv_len,
-                       RCODE_REFUSED);
-    } else if (gate == QGATE_OK) {
-        udp_finish(&job->client, job->pkt, answer);
-    }
-    /* QGATE_DROP: over rate — drop silently; responding would still amplify. */
-    free_packet(job->pkt);
-    free(job);
-    return NULL;
+	struct forward_job_data* job = arg;
+	query_gate gate;
+	struct packet* answer = resolve_remote(job->pkt, job->partial, job->how,
+										   &job->client.addr, &gate, 0); // UDP
+
+	if(gate == QGATE_REFUSED) {
+		log_entry(job->client.ip, job->client.port, job->pkt->q_type,
+				  job->pkt->full_domain, RCODE_REFUSED, NULL);
+		send_error_udp(job->client.sock, (const struct sockaddr*)&job->client.addr,
+					   job->client.addr_len, job->pkt->request, job->pkt->recv_len,
+					   RCODE_REFUSED);
+	} else if(gate == QGATE_OK) {
+		udp_finish(&job->client, job->pkt, answer);
+	}
+
+	// QGATE_DROP: over rate — drop silently; responding would still amplify.
+	free_packet(job->pkt);
+	free(job);
+
+	return NULL;
 }
 
-/*
- * handle_udp_packet — core UDP query processing on a receive thread.
- * Local answers are sent inline; anything that needs the upstream resolver is
- * handed to the forwarder pool, so a slow recursion never delays the answers
- * behind it on this socket (head-of-line blocking).
- */
+// handle_udp_packet — core UDP query processing on a receive thread.
 static void handle_udp_packet(int sock,
-                               const struct sockaddr_storage *caddr,
-                               socklen_t clen,
-                               char *buf, ssize_t n)
+							   const struct sockaddr_storage *caddr,
+							   socklen_t clen,
+							   char *buf, ssize_t n)
 {
-    struct UdpClient c = { .sock = sock, .addr_len = clen, .ip = "?" };
-    memcpy(&c.addr, caddr, clen);
-    if (caddr->ss_family == AF_INET6) {
-        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6*)caddr;
-        inet_ntop(AF_INET6, &s6->sin6_addr, c.ip, sizeof(c.ip));
-        c.port = ntohs(s6->sin6_port);
-    } else {
-        const struct sockaddr_in *s4 = (const struct sockaddr_in*)caddr;
-        inet_ntop(AF_INET, &s4->sin_addr, c.ip, sizeof(c.ip));
-        c.port = ntohs(s4->sin_port);
-    }
+	struct udp_client c = { .sock = sock, .addr_len = clen, .ip = "?" };
 
-    struct Packet *pkt = accept_query(buf, n, &c, udp_send_err, udp_send_pkt, c.ip, c.port);
-    if (!pkt) return;
+	memcpy(&c.addr, caddr, clen);
+	if(caddr->ss_family == AF_INET6) {
+		const struct sockaddr_in6 *s6 = (const struct sockaddr_in6*)caddr;
+		inet_ntop(AF_INET6, &s6->sin6_addr, c.ip, sizeof(c.ip));
+		c.port = ntohs(s6->sin6_port);
+	} else {
+		const struct sockaddr_in *s4 = (const struct sockaddr_in*)caddr;
+		inet_ntop(AF_INET, &s4->sin_addr, c.ip, sizeof(c.ip));
+		c.port = ntohs(s4->sin_port);
+	}
 
-    LocalResult how;
-    struct Packet *answer = resolve_local(pkt, &how);
-    if (how == LOCAL_DONE) {
-        udp_finish(&c, pkt, answer);
-        free_packet(pkt);
-        return;
-    }
+	struct packet *pkt = accept_query(buf, n, &c, udp_send_err, udp_send_pkt, c.ip, c.port);
+	if(!pkt)
+		return;
 
-    struct ForwardJob *job = malloc(sizeof(*job));
-    if (job) {
-        job->client = c;
-        job->pkt = pkt;
-        job->partial = answer;
-        job->how = how;
-        if (threadpool_add_work(g_forward_pool, forward_job, job) == 0) return;
-        free(job);
-    }
-    /* Forwarder pool saturated: serve what we have (our CNAME) or SERVFAIL.
-     * A forward-only query still goes through the same gate as the forwarder
-     * would apply, so a flood cannot turn this path into an unmetered
-     * SERVFAIL reflector for sources outside the allow-list. */
-    if (how == LOCAL_FORWARD) {
-        free_packet(answer);
-        if (!rl_allow(&c.addr)) { free_packet(pkt); return; }        /* drop */
-        if (!acl_allows(&c.addr)) {
-            log_entry(c.ip, c.port, pkt->q_type, pkt->full_domain, RCODE_REFUSED, NULL);
-            send_error_udp(c.sock, (const struct sockaddr*)&c.addr, c.addr_len,
-                           pkt->request, pkt->recv_len, RCODE_REFUSED);
-            free_packet(pkt);
-            return;
-        }
-        answer = NULL;
-    }
-    udp_finish(&c, pkt, answer);
-    free_packet(pkt);
+	local_result how;
+	struct packet *answer = resolve_local(pkt, &how);
+	if(how == LOCAL_DONE) {
+		udp_finish(&c, pkt, answer);
+		free_packet(pkt);
+		return;
+	}
+
+	struct forward_job_data *job = malloc(sizeof(*job));
+	if(job) {
+		job->client = c;
+		job->pkt = pkt;
+		job->partial = answer;
+		job->how = how;
+		if(threadpool_add_work(g_forward_pool, forward_job, job) == 0)
+			return;
+		free(job);
+	}
+
+	// Forwarder pool saturated: serve what we have (our CNAME) or SERVFAIL.
+	if(how == LOCAL_FORWARD) {
+		free_packet(answer);
+		if(!rl_allow(&c.addr)) {
+			free_packet(pkt);
+			return;
+		}        // drop
+
+		if(!acl_allows(&c.addr)) {
+			log_entry(c.ip, c.port, pkt->q_type, pkt->full_domain, RCODE_REFUSED, NULL);
+			send_error_udp(c.sock, (const struct sockaddr*)&c.addr, c.addr_len,
+						   pkt->request, pkt->recv_len, RCODE_REFUSED);
+			free_packet(pkt);
+			return;
+		}
+
+		answer = NULL;
+	}
+
+	udp_finish(&c, pkt, answer);
+	free_packet(pkt);
 }
 
-/* --- SO_REUSEPORT UDP worker thread --------------------------------------- */
+// SO_REUSEPORT UDP worker thread
 
-/*
- * Each UDP worker thread owns its own socket bound with SO_REUSEPORT.
- * The kernel distributes incoming datagrams across all sockets on the same
- * port, so N worker threads give N-fold parallel receive throughput with no
- * userspace lock on the hot path.  The receive buffer is stack-allocated;
- * no malloc/free is needed per query.
- */
-struct UDPWorkerArg {
-    int sock;   /* pre-bound SO_REUSEPORT socket (bound in main while root) */
+// Each UDP worker thread owns its own socket bound with SO_REUSEPORT.
+struct udp_worker_arg {
+	int sock;   // pre-bound SO_REUSEPORT socket (bound in main while root)
 };
 
 static void* udp_worker_thread(void *arg)
 {
-    struct UDPWorkerArg *wa = arg;
-    int sock = wa->sock;
-    free(wa);
+	struct udp_worker_arg *wa = arg;
+	int sock = wa->sock;
 
-    char buf[MAXLINE];   /* stack-allocated: no malloc per query */
+	free(wa);
 
-    while (g_running) {
-        struct sockaddr_storage caddr;
-        socklen_t clen = sizeof(caddr);
-        ssize_t n = recvfrom(sock, buf, sizeof(buf), 0,
-                             (struct sockaddr*)&caddr, &clen);
-        if (n < 0) {
-            if (errno_is_timeout(errno) || errno == EINTR)
-                continue;   /* timeout — re-check g_running */
-            /* Only a broken socket ends the worker.  Anything else (ENOMEM,
-             * ENOBUFS, ...) is transient: exiting would leave this
-             * SO_REUSEPORT socket bound but unread, and the kernel would keep
-             * hashing a slice of clients to it. */
-            if (errno == EBADF || errno == ENOTSOCK || errno == EINVAL) {
-                perror("worker: recvfrom");
-                break;
-            }
-            diag(DIAG_WARN, "worker: recvfrom: %s (continuing)\n", strerror(errno));
-            usleep(10000);   /* don't spin if the condition persists */
-            continue;
-        }
-        if (n < HEADER_LEN) continue;   /* too short to be DNS */
-        handle_udp_packet(sock, &caddr, clen, buf, n);
-    }
+	char buf[MAXLINE];   // stack-allocated: no malloc per query
 
-    /* The socket is closed by main() once the forwarder pool has drained:
-     * queued forward jobs still reply through it. */
-    return NULL;
+	while(g_running) {
+		struct sockaddr_storage caddr;
+		socklen_t clen = sizeof(caddr);
+		ssize_t n = recvfrom(sock, buf, sizeof(buf), 0,
+							 (struct sockaddr*)&caddr, &clen);
+
+		if(n < 0) {
+			if(errno_is_timeout(errno) || errno == EINTR)
+				continue;   // timeout — re-check g_running
+			// Only a broken socket ends the worker.
+			if(errno == EBADF || errno == ENOTSOCK || errno == EINVAL) {
+				perror("worker: recvfrom");
+				break;
+			}
+			DIAG(DIAG_WARN, "worker: recvfrom: %s (continuing)\n", strerror(errno));
+			usleep(10000);   // don't spin if the condition persists
+			continue;
+		}
+
+		if(n < HEADER_LEN)
+			continue;   // too short to be DNS
+		handle_udp_packet(sock, &caddr, clen, buf, n);
+	}
+
+	// The socket is closed by main once the forwarder pool has drained
+	return NULL;
 }
 
-/* --- Worker: TCP query --------------------------------------------------- */
+// Worker: TCP query
 
-/* Idle time allowed before (and between pipelined) queries on one TCP
- * connection.  Each connection holds a TCP worker, so idle connections are
- * closed promptly (RFC 7766 §6.2.3) rather than starving new clients. */
+// Idle time allowed before queries on one TCP connection.
 #define TCP_IDLE_TIMEOUT 2
 
 static void tcp_send_err(void* ctx, const char* buf, ssize_t n, int rcode) {
-    send_error_tcp(*(int*)ctx, buf, n, rcode);
+	send_error_tcp(*(int*)ctx, buf, n, rcode);
 }
 
-static void tcp_send_pkt(void* ctx, struct Packet* resp) {
-    send_tcp_response(*(int*)ctx, resp);
+static void tcp_send_pkt(void* ctx, struct packet* resp) {
+	send_tcp_response(*(int*)ctx, resp);
 }
 
-/* TCP worker pool; process_tcp_query() checks it for waiting connections. */
-static struct ThreadPool* g_tcp_pool = NULL;
+// TCP worker pool; process_tcp_query() checks it for waiting connections.
+static struct thread_pool* g_tcp_pool = NULL;
 
 static void* process_tcp_query(void* arg) {
-    struct TCPQueryContext* ctx = (struct TCPQueryContext*)arg;
-    int fd = ctx->client_fd;
+	struct tcp_query_context* ctx = (struct tcp_query_context*)arg;
+	int fd = ctx->client_fd;
 
-    /* Guard against slow and idle clients.  Real clients send their query
-     * immediately after connecting, so the short idle limit applies from the
-     * start — a connection that sits silent is closed within
-     * TCP_IDLE_TIMEOUT and frees its worker. */
-    struct timeval rtv = { .tv_sec = TCP_IDLE_TIMEOUT, .tv_usec = 0 };
-    struct timeval wtv = { .tv_sec = SOCKET_TIMEOUT,   .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &wtv, sizeof(wtv));
+	// Guard against slow and idle clients.
+	struct timeval rtv = { .tv_sec = TCP_IDLE_TIMEOUT, .tv_usec = 0 };
+	struct timeval wtv = { .tv_sec = SOCKET_TIMEOUT,   .tv_usec = 0 };
 
-    // SO_KEEPALIVE: detect dead half-open connections (RFC 7766 §6.2.3)
-    int ka = 1;
-    setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE,   &ka,  sizeof(ka));
-    int ka_idle = 60, ka_intvl = 10, ka_cnt = 3;
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,   &ka_idle,  sizeof(ka_idle));
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL,  &ka_intvl, sizeof(ka_intvl));
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,    &ka_cnt,   sizeof(ka_cnt));
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &wtv, sizeof(wtv));
 
-    /* RFC 7766: process multiple queries on one TCP connection (pipelining).
-     * Loop until EOF, timeout (RCVTIMEO fires), or a hard error. */
-    for (;;) {
-        // DNS-over-TCP: 2-byte length prefix
-        uint16_t msg_len_net;
-        ssize_t n = recv(fd, &msg_len_net, 2, MSG_WAITALL);
-        if (n != 2) break;  // EOF or timeout → close connection
+	// SO_KEEPALIVE: detect dead half-open connections (RFC 7766 §6.2.3)
+	int ka = 1;
+	setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE,   &ka,  sizeof(ka));
+	int ka_idle = 60, ka_intvl = 10, ka_cnt = 3;
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,   &ka_idle,  sizeof(ka_idle));
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL,  &ka_intvl, sizeof(ka_intvl));
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,    &ka_cnt,   sizeof(ka_cnt));
 
-        uint16_t msg_len = ntohs(msg_len_net);
-        if (msg_len < HEADER_LEN) break;
+	// RFC 7766: process multiple queries on one TCP connection (pipelining).
+	for(;;) {
+		// DNS-over-TCP: 2-byte length prefix
+		uint16_t msg_len_net;
+		ssize_t n = recv(fd, &msg_len_net, 2, MSG_WAITALL);
+		if(n != 2)
+			break;  // EOF or timeout → close connection
 
-        /* RFC 7766 allows up to 65535 bytes over TCP; the buffer is sized to
-         * the length prefix, so a large query is answered rather than dropped
-         * along with the connection. */
-        char* buffer = malloc(msg_len);
-        if (!buffer) break;
+		uint16_t msg_len = ntohs(msg_len_net);
+		if(msg_len < HEADER_LEN)
+			break;
 
-        n = recv(fd, buffer, msg_len, MSG_WAITALL);
-        if (n != msg_len) { free(buffer); break; }
+		// RFC 7766 allows up to 65535 bytes over TCP
+		char* buffer = malloc(msg_len);
+		if(!buffer)
+			break;
 
-        struct Packet* pkt = accept_query(buffer, msg_len, &fd, tcp_send_err, tcp_send_pkt,
-                                          ctx->client_ip, ctx->client_port);
-        if (!pkt) { free(buffer); continue; }
+		n = recv(fd, buffer, msg_len, MSG_WAITALL);
+		if(n != msg_len) {
+			free(buffer);
+			break;
+		}
 
-        LocalResult how;
-        struct Packet* answer = resolve_local(pkt, &how);
-        QueryGate gate;
-        answer = resolve_remote(pkt, answer, how, &ctx->client_ss, &gate, 1 /* TCP */);
+		struct packet* pkt = accept_query(buffer, msg_len, &fd, tcp_send_err, tcp_send_pkt,
+										  ctx->client_ip, ctx->client_port);
+		if(!pkt) {
+			free(buffer);
+			continue;
+		}
 
-        if (gate == QGATE_REFUSED || gate == QGATE_DROP) {
-            /* TCP isn't an amplification vector (3-way handshake), so a
-             * rate-limited connection still gets an explicit REFUSED. */
-            log_entry(ctx->client_ip, ctx->client_port, pkt->q_type, pkt->full_domain, RCODE_REFUSED, NULL);
-            send_refused_tcp(fd, buffer, msg_len);
-            free_packet(pkt);
-            free(buffer);
-            if (threadpool_has_waiting(g_tcp_pool)) break;
-            continue;
-        }
+		local_result how;
+		struct packet* answer = resolve_local(pkt, &how);
+		query_gate gate;
+		answer = resolve_remote(pkt, answer, how, &ctx->client_ss, &gate, 1); // TCP
 
-        log_answer(ctx->client_ip, ctx->client_port, pkt, answer);
-        if (!answer) answer = build_servfail_response(pkt);
-        if (answer) {
-            /* RFC 6891 §6.1.1: echo an OPT RR to EDNS clients over TCP too (4.7).
-             * No truncation on TCP, so only the OPT-echo half is needed. */
-            append_edns_opt(answer, pkt);
-            send_tcp_response(fd, answer);
-            free_packet(answer);
-        }
+		if(gate == QGATE_REFUSED || gate == QGATE_DROP) {
+			// TCP isn't an amplification vector
+			log_entry(ctx->client_ip, ctx->client_port, pkt->q_type, pkt->full_domain, RCODE_REFUSED, NULL);
+			send_refused_tcp(fd, buffer, msg_len);
+			free_packet(pkt);
+			free(buffer);
+			if(threadpool_has_waiting(g_tcp_pool))
+				break;
+			continue;
+		}
 
-        free_packet(pkt);
-        free(buffer);
+		log_answer(ctx->client_ip, ctx->client_port, pkt, answer);
+		if(!answer)
+			answer = build_servfail_response(pkt);
+		if(answer) {
+			// RFC 6891 §6.1.1: echo an OPT RR to EDNS clients over TCP too (4.7).
+			append_edns_opt(answer, pkt);
+			send_tcp_response(fd, answer);
+			free_packet(answer);
+		}
 
-        /* Each connection holds a worker for as long as it keeps sending
-         * within TCP_IDLE_TIMEOUT, so a few clients could otherwise hold every
-         * worker indefinitely.  When other connections are queued behind us,
-         * hand the worker over after this answer (RFC 7766 §6.2.3 lets the
-         * server close; clients reconnect for further queries). */
-        if (threadpool_has_waiting(g_tcp_pool)) break;
-    }
+		free_packet(pkt);
+		free(buffer);
 
-    close(fd);
-    tcp_conn_release(&ctx->client_ss);
-    free(ctx);
-    return NULL;
+		// Hand the worker over after this answer if other connections are queued
+		if(threadpool_has_waiting(g_tcp_pool))
+			break;
+	}
+
+	close(fd);
+	tcp_conn_release(&ctx->client_ss);
+	free(ctx);
+
+	return NULL;
 }
 
-/* accept() failed.  On descriptor or memory exhaustion the connection stays
- * in the backlog, so poll() reports the listener readable again at once and
- * the loop would spin at 100% CPU: pause briefly to let resources free up. */
+// accept() failed: pause briefly instead of spinning on the backlog
 static void accept_backoff(void)
 {
-    if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
-        diag(DIAG_WARN, "accept: %s; pausing TCP accepts\n", strerror(errno));
-        usleep(100000);
-    }
+	if(errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+		DIAG(DIAG_WARN, "accept: %s; pausing TCP accepts\n", strerror(errno));
+		usleep(100000);
+	}
 }
 
-/* --- Main ---------------------------------------------------------------- */
+// Main
 
 int main(int argc, char** argv) {
-    /* Line-buffer stdout so startup/status lines stream to `docker logs`
-     * instead of sitting in libc's block buffer when stdout isn't a TTY. */
-    setvbuf(stdout, NULL, _IOLBF, 0);
+	// Line-buffer stdout so startup lines stream to `docker logs`
+	setvbuf(stdout, NULL, _IOLBF, 0);
 
-    /* Seed the rand() fallbacks used only if getrandom() ever fails. */
-    {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        srand((unsigned)ts.tv_nsec ^ (unsigned)getpid() ^ (unsigned)time(NULL));
-    }
+	// Seed the rand() fallbacks used only if getrandom() ever fails.
+	{
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		srand((unsigned)ts.tv_nsec ^ (unsigned)getpid() ^ (unsigned)time(NULL));
+	}
 
-    if (load_config(argc, argv) < 0) {
-        printf("Usage: ./bin/auth_dns <-p upstream_port> <-t thread_count> "
-               "<-u upstream_dns> <-q queue_size> <-b bind_addr> "
-               "<-a recursion_allow_cidrs> <-r per_source_qps> "
-               "<-U user[:group]> <-S block_mode> <-c config_file> "
-               "<-L error|warn|info|debug>\n");
-        exit(1);
-    }
+	if(load_config(argc, argv) < 0) {
+		printf("Usage: ./bin/auth_dns <-p upstream_port> <-t thread_count> "
+			   "<-u upstream_dns> <-q queue_size> <-b bind_addr> "
+			   "<-a recursion_allow_cidrs> <-r per_source_qps> "
+			   "<-U user[:group]> <-S block_mode> <-c config_file> "
+			   "<-L error|warn|info|debug>\n");
+		exit(1);
+	}
 
-    /* Recursion access control (known_issues 4.3): the default allow-list
-     * (loopback + RFC1918 + link-local) gates only the forwarding path; our
-     * own authoritative zones remain answerable to any source. */
-    acl_init_defaults();
-    if (g_config.acl_csv && acl_set_list(g_config.acl_csv) != 0) {
-        fprintf(stderr, "Error: invalid -a allow-list: %s\n", g_config.acl_csv);
-        exit(1);
-    }
-    rl_configure(g_config.rate_limit_qps, 0);
+	// Recursion access control
+	acl_init_defaults();
+	if(g_config.acl_csv && acl_set_list(g_config.acl_csv) != 0) {
+		fprintf(stderr, "Error: invalid -a allow-list: %s\n", g_config.acl_csv);
+		exit(1);
+	}
+	rl_configure(g_config.rate_limit_qps, 0);
 
-    /* All local knowledge (authoritative zones + blocklist) lives in one file;
-     * auth owns it and upstream stays a clean recursor.  Resolve the path once
-     * (-c overrides the built-in default) and use it for both loads here and on
-     * SIGHUP. */
-    if (g_config.config_path)
-        snprintf(g_config_path, sizeof(g_config_path), "%s", g_config.config_path);
-    else
-        snprintf(g_config_path, sizeof(g_config_path),
-                 "%s%s", SERVER_PATH, CONFIG_FILE_PATH);
+	// All local knowledge lives in one file; auth owns it
+	if(g_config.config_path) {
+		snprintf(g_config_path, sizeof(g_config_path), "%s", g_config.config_path);
+	} else {
+		snprintf(g_config_path, sizeof(g_config_path),
+				 "%s%s", SERVER_PATH, CONFIG_FILE_PATH);
+	}
 
-    /* Pin the config file and query log while still root, so SIGHUP reloads
-     * after the privilege drop can reach them even when an ancestor directory
-     * (e.g. a 0700 home) is not traversable by the drop user. */
-    path_pin(g_config_path);
-    log_pin_paths();
+	// Pin the config file and query log while still root
+	path_pin(g_config_path);
+	log_pin_paths();
 
-    /* Blocklist (the [blocklist] section of config.txt). */
-    if (policy_set_block_mode(g_config.block_mode) != 0) {
-        fprintf(stderr, "Error: invalid -S block mode: %s (want nxdomain|zero|<ip>)\n",
-                g_config.block_mode);
-        exit(1);
-    }
-    {
-        int pn = policy_load(g_config_path);
-        if (pn >= 0)
-            printf("Blocklist loaded: %d entries (block mode: %s)\n", pn,
-                   g_config.block_mode ? g_config.block_mode : "nxdomain");
-        else
-            fprintf(stderr, "Warning: policy_load failed; filtering disabled\n");
-    }
+	// Blocklist (the [blocklist] section of config.txt).
+	if(policy_set_block_mode(g_config.block_mode) != 0) {
+		fprintf(stderr, "Error: invalid -S block mode: %s (want nxdomain|zero|<ip>)\n",
+				g_config.block_mode);
+		exit(1);
+	}
+	{
+		int pn = policy_load(g_config_path);
+		if(pn >= 0) {
+			printf("Blocklist loaded: %d entries (block mode: %s)\n", pn,
+				   g_config.block_mode ? g_config.block_mode : "nxdomain");
+		} else {
+			fprintf(stderr, "Warning: policy_load failed; filtering disabled\n");
+		}
+	}
 
-    // Create self-pipe before setting up signals so the handler can use it.
-    // Write end is O_NONBLOCK so writes in signal context never block.
-    if (pipe(stats_pipe) < 0) {
-        perror("Warning: Failed to create stats pipe; SIGUSR1 stats disabled");
-        stats_pipe[0] = stats_pipe[1] = -1;
-    } else {
-        /* Both ends non-blocking: the handler must never block on write, and
-         * the main loop drains with read() until EAGAIN — a blocking read end
-         * would hang the poll loop (and all serving) after the first signal. */
-        for (int e = 0; e < 2; e++) {
-            int flags = fcntl(stats_pipe[e], F_GETFL, 0);
-            if (flags >= 0) fcntl(stats_pipe[e], F_SETFL, flags | O_NONBLOCK);
-        }
-    }
+	// Create self-pipe before setting up signals so the handler can use it.
+	if(pipe(stats_pipe) < 0) {
+		perror("Warning: Failed to create stats pipe; SIGUSR1 stats disabled");
+		stats_pipe[0] = stats_pipe[1] = -1;
+	} else {
+		// Both ends non-blocking: the handler must never block on write
+		for(int e = 0; e < 2; e++) {
+			int flags = fcntl(stats_pipe[e], F_GETFL, 0);
+			if(flags >= 0)
+				fcntl(stats_pipe[e], F_SETFL, flags | O_NONBLOCK);
+		}
+	}
 
-    setup_signals();
-    write_pid_file();
+	setup_signals();
+	write_pid_file();
 
-    // Load authoritative domains (the [domain] sections of config.txt)
-    printf("Loading authoritative domains...\n");
-    int loaded_count = load_auth_domains(g_config_path);
-    if (loaded_count == 0) {
-        fprintf(stderr, "Warning: Running with no authoritative domains\n\n");
-    }
+	// Load authoritative domains (the [domain] sections of config.txt)
+	printf("Loading authoritative domains...\n");
+	int loaded_count = load_auth_domains(g_config_path);
+	if(loaded_count == 0)
+		fprintf(stderr, "Warning: Running with no authoritative domains\n\n");
 
-    // Load DNSSEC signing keys (non-fatal — signing stays disabled if absent)
-    printf("Loading DNSSEC signing keys...\n");
-    g_zone_keys = load_zone_keys(SERVER_PATH "/config");
-    if (g_zone_keys)
-        printf("DNSSEC online signing enabled.\n\n");
-    else
-        printf("DNSSEC online signing disabled (no keys configured).\n\n");
+	// Load DNSSEC signing keys (non-fatal — signing stays disabled if absent)
+	printf("Loading DNSSEC signing keys...\n");
+	g_zone_keys = load_zone_keys(SERVER_PATH "/config");
+	if(g_zone_keys)
+		printf("DNSSEC online signing enabled.\n\n");
+	else
+		printf("DNSSEC online signing disabled (no keys configured).\n\n");
 
-    // Create TCP sockets (bound while still privileged; port 53 needs root).
-    int tcp4_sock = create_tcp_socket_v4(PORT);  // may be -1
-    int tcp6_sock = create_tcp_socket_v6(PORT);  // may be -1
+	// Create TCP sockets (bound while still privileged; port 53 needs root).
+	int tcp4_sock = create_tcp_socket_v4(PORT);  // may be -1
+	int tcp6_sock = create_tcp_socket_v6(PORT);  // may be -1
 
-    /*
-     * UDP: one SO_REUSEPORT socket per worker, all bound here in main() while
-     * we still have privileges.  The kernel load-balances datagrams across all
-     * of them, so each worker runs independently — no shared lock on the UDP
-     * hot path and no per-query malloc.  Binding here rather than inside each
-     * thread is what lets us drop privileges before any worker starts.
-     */
-    int n_udp = g_config.thread_count;
-    pthread_t *udp4_threads = calloc(n_udp, sizeof(pthread_t));
-    pthread_t *udp6_threads = calloc(n_udp, sizeof(pthread_t));
-    int *udp4_fds = malloc((size_t)n_udp * sizeof(int));
-    int *udp6_fds = malloc((size_t)n_udp * sizeof(int));
-    int n_udp6 = 0;
+	// UDP: one SO_REUSEPORT socket per worker
+	int n_udp = g_config.thread_count;
+	pthread_t *udp4_threads = calloc(n_udp, sizeof(pthread_t));
+	pthread_t *udp6_threads = calloc(n_udp, sizeof(pthread_t));
+	int *udp4_fds = malloc((size_t)n_udp * sizeof(int));
+	int *udp6_fds = malloc((size_t)n_udp * sizeof(int));
+	int n_udp6 = 0;
 
-    if (!udp4_threads || !udp6_threads || !udp4_fds || !udp6_fds) {
-        fprintf(stderr, "Error: Failed to allocate UDP worker arrays\n");
-        exit(EXIT_FAILURE);
-    }
+	if(!udp4_threads || !udp6_threads || !udp4_fds || !udp6_fds) {
+		fprintf(stderr, "Error: Failed to allocate UDP worker arrays\n");
+		exit(EXIT_FAILURE);
+	}
 
-    /* A -b that is not an IPv4 address selects IPv6 only: skip IPv4 instead
-     * of treating its (expected) failure as fatal. */
-    struct in_addr bind4;
-    bool want_v4 = !g_config.bind_addr ||
-                   inet_pton(AF_INET, g_config.bind_addr, &bind4) == 1;
-    int n_udp4 = want_v4 ? n_udp : 0;
-    for (int i = 0; i < n_udp4; i++) {
-        udp4_fds[i] = create_reuseport_udp_socket(AF_INET, PORT);
-        if (udp4_fds[i] < 0) {
-            fprintf(stderr, "Error: bind UDP IPv4 on port %d: %s\n",
-                    PORT, strerror(errno));
-            exit(EXIT_FAILURE);
-        }
-    }
-    /* IPv6 is best-effort: stop at the first failure (no kernel v6, or -b is v4). */
-    for (int i = 0; i < n_udp; i++) {
-        int s = create_reuseport_udp_socket(AF_INET6, PORT);
-        if (s < 0) break;
-        udp6_fds[i] = s;
-        n_udp6 = i + 1;
-    }
-    if (n_udp4 == 0 && n_udp6 == 0) {
-        fprintf(stderr, "Error: no UDP listener could be bound on port %d; check -b %s\n",
-                PORT, g_config.bind_addr ? g_config.bind_addr : "");
-        exit(EXIT_FAILURE);
-    }
-    /* UDP binds share the port (SO_REUSEPORT), so a second instance gets this
-     * far; its TCP bind is what fails.  Running on as a UDP-only half-server
-     * would silently split queries with the first one — stop instead. */
-    if ((n_udp4 > 0 && tcp4_sock < 0) || (n_udp6 > 0 && tcp6_sock < 0)) {
-        fprintf(stderr, "Error: TCP listener failed while the same family's UDP "
-                        "listener bound — another instance is probably already running\n");
-        exit(EXIT_FAILURE);
-    }
+	// A -b that is not an IPv4 address selects IPv6 only
+	struct in_addr bind4;
+	bool want_v4 = !g_config.bind_addr ||
+				   inet_pton(AF_INET, g_config.bind_addr, &bind4) == 1;
+	int n_udp4 = want_v4 ? n_udp : 0;
+	for(int i = 0; i < n_udp4; i++) {
+		udp4_fds[i] = create_reuseport_udp_socket(AF_INET, PORT);
+		if(udp4_fds[i] < 0) {
+			fprintf(stderr, "Error: bind UDP IPv4 on port %d: %s\n",
+					PORT, strerror(errno));
+			exit(EXIT_FAILURE);
+		}
+	}
 
-    printf("DNS Server listening on port %d (", PORT);
-    if (n_udp4 > 0)     printf("UDP IPv4 SO_REUSEPORT");
-    if (n_udp6 > 0)     printf("%sUDP IPv6 SO_REUSEPORT", n_udp4 > 0 ? ", " : "");
-    if (tcp4_sock >= 0) printf(", TCP IPv4");
-    if (tcp6_sock >= 0) printf(", TCP IPv6");
-    printf(")\n");
-    printf("Upstream DNS: %s:%d\n", g_config.upstream_dns, g_config.upstream_port);
-    printf("Loaded %d authoritative domain(s)\n\n", loaded_count);
+	// IPv6 is best-effort: stop at the first failure (no kernel v6, or -b is v4).
+	for(int i = 0; i < n_udp; i++) {
+		int s = create_reuseport_udp_socket(AF_INET6, PORT);
+		if(s < 0)
+			break;
+		udp6_fds[i] = s;
+		n_udp6 = i + 1;
+	}
 
-    /* Open the query log now, while still privileged, so its fd survives the
-     * drop (writes go through the fd; permission is checked only at open).
-     * Without this the lazy open in the worker threads would run as the dropped
-     * user and fail if the log dir is root-owned. */
-    if (g_config.drop_user) log_reopen();
+	if(n_udp4 == 0 && n_udp6 == 0) {
+		fprintf(stderr, "Error: no UDP listener could be bound on port %d; check -b %s\n",
+				PORT, g_config.bind_addr ? g_config.bind_addr : "");
+		exit(EXIT_FAILURE);
+	}
+	// UDP binds share the port, so a second instance gets this far
+	if((n_udp4 > 0 && tcp4_sock < 0) || (n_udp6 > 0 && tcp6_sock < 0)) {
+		fprintf(stderr, "Error: TCP listener failed while the same family's UDP "
+						"listener bound — another instance is probably already running\n");
+		exit(EXIT_FAILURE);
+	}
 
-    /* All listening sockets are bound — drop root before serving any query. */
-    drop_privileges(g_config.drop_user);
+	printf("DNS Server listening on port %d (", PORT);
+	if(n_udp4 > 0)
+		printf("UDP IPv4 SO_REUSEPORT");
+	if(n_udp6 > 0)
+		printf("%sUDP IPv6 SO_REUSEPORT", n_udp4 > 0 ? ", " : "");
+	if(tcp4_sock >= 0)
+		printf(", TCP IPv4");
+	if(tcp6_sock >= 0)
+		printf(", TCP IPv6");
+	printf(")\n");
+	printf("Upstream DNS: %s:%d\n", g_config.upstream_dns, g_config.upstream_port);
+	printf("Loaded %d authoritative domain(s)\n\n", loaded_count);
 
-    /*
-     * Forwarder pool: UDP queries that need the upstream resolver run here, so
-     * the receive threads only ever do local, non-blocking work.
-     */
-    struct ThreadPoolConfig fwd_config = {
-        .num_threads    = g_config.thread_count,
-        .max_queue_size = g_config.queue_size
-    };
-    g_forward_pool = threadpool_create(fwd_config);
-    if (!g_forward_pool) {
-        fprintf(stderr, "Error: Failed to create forwarder thread pool\n");
-        exit(EXIT_FAILURE);
-    }
+	// Open the query log now, while still privileged, so its fd survives the drop.
+	if(g_config.drop_user)
+		log_reopen();
 
+	// All listening sockets are bound — drop root before serving any query.
+	drop_privileges(g_config.drop_user);
 
-    for (int i = 0; i < n_udp4; i++) {
-        struct UDPWorkerArg *wa = malloc(sizeof(*wa));
-        if (!wa) { fprintf(stderr, "Error: malloc UDPWorkerArg\n"); exit(EXIT_FAILURE); }
-        wa->sock = udp4_fds[i];
-        if (pthread_create(&udp4_threads[i], NULL, udp_worker_thread, wa) != 0) {
-            perror("Error: pthread_create UDP4 worker");
-            exit(EXIT_FAILURE);
-        }
-    }
-    for (int i = 0; i < n_udp6; i++) {
-        struct UDPWorkerArg *wa = malloc(sizeof(*wa));
-        if (!wa) { fprintf(stderr, "Error: malloc UDPWorkerArg\n"); exit(EXIT_FAILURE); }
-        wa->sock = udp6_fds[i];
-        if (pthread_create(&udp6_threads[i], NULL, udp_worker_thread, wa) != 0) {
-            perror("Warning: pthread_create UDP6 worker");
-            free(wa);
-            /* Close this socket and every one still bound behind it; the
-             * shutdown path only walks as far as n_udp6. */
-            for (int j = i; j < n_udp6; j++) close(udp6_fds[j]);
-            n_udp6 = i;   /* only join the threads we actually started */
-            break;
-        }
-    }
+	// Forwarder pool: UDP queries that need the upstream resolver run here
+	struct thread_pool_config fwd_config = {
+		.num_threads    = g_config.thread_count,
+		.max_queue_size = g_config.queue_size
+	};
+	g_forward_pool = threadpool_create(fwd_config);
+	if(!g_forward_pool) {
+		fprintf(stderr, "Error: Failed to create forwarder thread pool\n");
+		exit(EXIT_FAILURE);
+	}
 
+	for(int i = 0; i < n_udp4; i++) {
+		struct udp_worker_arg *wa = malloc(sizeof(*wa));
+		if(!wa) {
+			fprintf(stderr, "Error: malloc UDPWorkerArg\n");
+			exit(EXIT_FAILURE);
+		}
+		wa->sock = udp4_fds[i];
+		if(pthread_create(&udp4_threads[i], NULL, udp_worker_thread, wa) != 0) {
+			perror("Error: pthread_create UDP4 worker");
+			exit(EXIT_FAILURE);
+		}
+	}
 
-    /*
-     * TCP: a dedicated pool (each connection holds a worker until it closes or
-     * idles out), sized like the UDP side so a few idle connections cannot
-     * lock out every other TCP client.
-     */
-    int tcp_threads = g_config.thread_count < 4 ? 4 : g_config.thread_count;
-    struct ThreadPoolConfig pool_config = {
-        .num_threads    = tcp_threads,
-        .max_queue_size = g_config.queue_size
-    };
-    struct ThreadPool *thread_pool = threadpool_create(pool_config);
-    if (!thread_pool) {
-        fprintf(stderr, "Error: Failed to create TCP thread pool\n");
-        exit(EXIT_FAILURE);
-    }
-    g_tcp_pool = thread_pool;
+	for(int i = 0; i < n_udp6; i++) {
+		struct udp_worker_arg *wa = malloc(sizeof(*wa));
+		if(!wa) {
+			fprintf(stderr, "Error: malloc UDPWorkerArg\n");
+			exit(EXIT_FAILURE);
+		}
+		wa->sock = udp6_fds[i];
+		if(pthread_create(&udp6_threads[i], NULL, udp_worker_thread, wa) != 0) {
+			perror("Warning: pthread_create UDP6 worker");
+			free(wa);
+			// Close this socket and every one still bound behind it
+			for(int j = i; j < n_udp6; j++)
+				close(udp6_fds[j]);
+			n_udp6 = i;   // only join the threads we actually started
+			break;
+		}
+	}
 
-    // Build poll() fd set (up to 4: TCP4, TCP6, stats_pipe, unused)
-    struct pollfd pfds[4];
-    int nfds = 0;
-    int tcp4_idx = -1, tcp6_idx = -1, stats_idx = -1;
+	// TCP: a dedicated pool, sized like the UDP side
+	int tcp_threads = g_config.thread_count < 4 ? 4 : g_config.thread_count;
+	struct thread_pool_config pool_config = {
+		.num_threads    = tcp_threads,
+		.max_queue_size = g_config.queue_size
+	};
+	struct thread_pool *tcp_thread_pool = threadpool_create(pool_config);
+	if(!tcp_thread_pool) {
+		fprintf(stderr, "Error: Failed to create TCP thread pool\n");
+		exit(EXIT_FAILURE);
+	}
+	g_tcp_pool = tcp_thread_pool;
 
-    if (tcp4_sock >= 0) { pfds[nfds].fd = tcp4_sock; pfds[nfds].events = POLLIN; tcp4_idx = nfds++; }
-    if (tcp6_sock >= 0) { pfds[nfds].fd = tcp6_sock; pfds[nfds].events = POLLIN; tcp6_idx = nfds++; }
-    pfds[nfds].fd = stats_pipe[0]; pfds[nfds].events = (stats_pipe[0] >= 0) ? POLLIN : 0; stats_idx = nfds++;
+	// Build poll() fd set (up to 4: TCP4, TCP6, stats_pipe, unused)
+	struct pollfd pfds[4];
+	int nfds = 0;
+	int tcp4_idx = -1, tcp6_idx = -1, stats_idx = -1;
 
-    printf("Waiting for queries...\n\n");
+	if(tcp4_sock >= 0) {
+		pfds[nfds].fd = tcp4_sock;
+		pfds[nfds].events = POLLIN;
+		tcp4_idx = nfds++;
+	}
+	if(tcp6_sock >= 0) {
+		pfds[nfds].fd = tcp6_sock;
+		pfds[nfds].events = POLLIN;
+		tcp6_idx = nfds++;
+	}
+	pfds[nfds].fd = stats_pipe[0]; pfds[nfds].events = (stats_pipe[0] >= 0) ? POLLIN : 0; stats_idx = nfds++;
 
-    while (g_running) {
-        /* SIGUSR2 from the daily archiver: pick up the freshly created log. */
-        if (g_reopen_log) {
-            g_reopen_log = 0;
-            log_reopen();
-        }
+	printf("Waiting for queries...\n\n");
 
-        // Handle SIGHUP reload before polling
-        if (g_reload) {
-            g_reload = 0;
-            printf("SIGHUP received — reloading config from %s\n", g_config_path);
-            reload_auth_domains(g_config_path);
+	while(g_running) {
+		// SIGUSR2 from the daily archiver: pick up the freshly created log.
+		if(g_reopen_log) {
+			g_reopen_log = 0;
+			log_reopen();
+		}
 
-            /* Reload DNSSEC zone keys so key rotation takes effect without restart. */
-            reload_zone_keys();
+		// Handle SIGHUP reload before polling
+		if(g_reload) {
+			g_reload = 0;
+			printf("SIGHUP received — reloading config from %s\n", g_config_path);
+			reload_auth_domains(g_config_path);
 
-            /* Reopen log file so logrotate can move the old one. */
-            log_reopen();
+			// Reload DNSSEC zone keys so key rotation takes effect without restart.
+			reload_zone_keys();
 
-            /* Reload the blocklist; policy_load swaps the table atomically
-             * behind its own lock. */
-            {
-                int pn = policy_load(g_config_path);
-                if (pn >= 0) printf("Blocklist reloaded: %d entries\n", pn);
-            }
-        }
+			// Reopen log file so logrotate can move the old one.
+			log_reopen();
 
-        int nready = poll(pfds, nfds, 1000);
-        if (nready < 0) {
-            if (errno == EINTR) continue;
-            perror("Error: poll failed");
-            break;
-        }
-        if (nready == 0) continue;
+			// Reload the blocklist
+			{
+				int pn = policy_load(g_config_path);
+				if(pn >= 0)
+					printf("Blocklist reloaded: %d entries\n", pn);
+			}
+		}
 
-        // Handle SIGUSR1 stats request from self-pipe
-        if (stats_pipe[0] >= 0 && (pfds[stats_idx].revents & POLLIN)) {
-            char buf[16];
-            while (read(stats_pipe[0], buf, sizeof(buf)) > 0) {}
-            print_qtype_stats();
-        }
+		int nready = poll(pfds, nfds, 1000);
+		if(nready < 0) {
+			if(errno == EINTR)
+				continue;
+			perror("Error: poll failed");
+			break;
+		}
 
-        // --- TCP IPv4 accept ---
-        if (tcp4_idx >= 0 && (pfds[tcp4_idx].revents & POLLIN)) {
-            struct sockaddr_storage caddr;
-            socklen_t clen = sizeof(caddr);
-            int cfd = accept(tcp4_sock, (struct sockaddr*)&caddr, &clen);
-            if (cfd < 0) accept_backoff();
-            if (cfd >= 0 && !tcp_conn_acquire(&caddr)) { close(cfd); cfd = -1; }
-            if (cfd >= 0) {
-                struct TCPQueryContext *ctx = malloc(sizeof(*ctx));
-                if (ctx) {
-                    ctx->client_fd = cfd;
-                    memset(&ctx->client_ss, 0, sizeof(ctx->client_ss));
-                    memcpy(&ctx->client_ss, &caddr, clen);
-                    struct sockaddr_in *s4 = (struct sockaddr_in*)&caddr;
-                    inet_ntop(AF_INET, &s4->sin_addr, ctx->client_ip, sizeof(ctx->client_ip));
-                    ctx->client_port = ntohs(s4->sin_port);
-                    if (threadpool_add_work(thread_pool, process_tcp_query, ctx) < 0) {
-                        close(cfd); free(ctx); tcp_conn_release(&caddr);
-                    }
-                } else { close(cfd); tcp_conn_release(&caddr); }
-            }
-        }
+		if(nready == 0)
+			continue;
 
-        // --- TCP IPv6 accept ---
-        if (tcp6_idx >= 0 && (pfds[tcp6_idx].revents & POLLIN)) {
-            struct sockaddr_storage caddr;
-            socklen_t clen = sizeof(caddr);
-            int cfd = accept(tcp6_sock, (struct sockaddr*)&caddr, &clen);
-            if (cfd < 0) accept_backoff();
-            if (cfd >= 0 && !tcp_conn_acquire(&caddr)) { close(cfd); cfd = -1; }
-            if (cfd >= 0) {
-                struct TCPQueryContext *ctx = malloc(sizeof(*ctx));
-                if (ctx) {
-                    ctx->client_fd = cfd;
-                    memset(&ctx->client_ss, 0, sizeof(ctx->client_ss));
-                    memcpy(&ctx->client_ss, &caddr, clen);
-                    struct sockaddr_in6 *s6 = (struct sockaddr_in6*)&caddr;
-                    inet_ntop(AF_INET6, &s6->sin6_addr, ctx->client_ip, sizeof(ctx->client_ip));
-                    ctx->client_port = ntohs(s6->sin6_port);
-                    if (threadpool_add_work(thread_pool, process_tcp_query, ctx) < 0) {
-                        close(cfd); free(ctx); tcp_conn_release(&caddr);
-                    }
-                } else { close(cfd); tcp_conn_release(&caddr); }
-            }
-        }
-    }
+		// Handle SIGUSR1 stats request from self-pipe
+		if(stats_pipe[0] >= 0 && (pfds[stats_idx].revents & POLLIN)) {
+			char buf[16];
+			while(read(stats_pipe[0], buf, sizeof(buf)) > 0) {
+			}
+			print_qtype_stats();
+		}
 
-    printf("Shutting down DNS server...\n");
+		// --- TCP IPv4 accept ---
+		if(tcp4_idx >= 0 && (pfds[tcp4_idx].revents & POLLIN)) {
+			struct sockaddr_storage caddr;
+			socklen_t clen = sizeof(caddr);
+			int cfd = accept(tcp4_sock, (struct sockaddr*)&caddr, &clen);
+			if(cfd < 0)
+				accept_backoff();
+			if(cfd >= 0 && !tcp_conn_acquire(&caddr)) {
+				close(cfd);
+				cfd = -1;
+			}
 
-    /* g_running=0 causes each UDP worker to exit after its 1-second timeout. */
-    for (int i = 0; i < n_udp4; i++) pthread_join(udp4_threads[i], NULL);
-    for (int i = 0; i < n_udp6; i++) pthread_join(udp6_threads[i], NULL);
-    free(udp4_threads);
-    free(udp6_threads);
+			if(cfd >= 0) {
+				struct tcp_query_context *ctx = malloc(sizeof(*ctx));
+				if(ctx) {
+					ctx->client_fd = cfd;
+					memset(&ctx->client_ss, 0, sizeof(ctx->client_ss));
+					memcpy(&ctx->client_ss, &caddr, clen);
+					struct sockaddr_in *s4 = (struct sockaddr_in*)&caddr;
+					inet_ntop(AF_INET, &s4->sin_addr, ctx->client_ip, sizeof(ctx->client_ip));
+					ctx->client_port = ntohs(s4->sin_port);
+					if(threadpool_add_work(tcp_thread_pool, process_tcp_query, ctx) < 0) {
+						close(cfd); free(ctx); tcp_conn_release(&caddr);
+					}
+				} else {
+					close(cfd);
+					tcp_conn_release(&caddr);
+				}
+			}
+		}
 
-    threadpool_wait(thread_pool);
-    threadpool_destroy(thread_pool);
-    threadpool_wait(g_forward_pool);
-    threadpool_destroy(g_forward_pool);
+		// --- TCP IPv6 accept ---
+		if(tcp6_idx >= 0 && (pfds[tcp6_idx].revents & POLLIN)) {
+			struct sockaddr_storage caddr;
+			socklen_t clen = sizeof(caddr);
+			int cfd = accept(tcp6_sock, (struct sockaddr*)&caddr, &clen);
+			if(cfd < 0)
+				accept_backoff();
+			if(cfd >= 0 && !tcp_conn_acquire(&caddr)) {
+				close(cfd);
+				cfd = -1;
+			}
 
-    /* Only now are no forward jobs left that could send on these sockets. */
-    for (int i = 0; i < n_udp4; i++) close(udp4_fds[i]);
-    for (int i = 0; i < n_udp6; i++) close(udp6_fds[i]);
-    free(udp4_fds);
-    free(udp6_fds);
+			if(cfd >= 0) {
+				struct tcp_query_context *ctx = malloc(sizeof(*ctx));
+				if(ctx) {
+					ctx->client_fd = cfd;
+					memset(&ctx->client_ss, 0, sizeof(ctx->client_ss));
+					memcpy(&ctx->client_ss, &caddr, clen);
+					struct sockaddr_in6 *s6 = (struct sockaddr_in6*)&caddr;
+					inet_ntop(AF_INET6, &s6->sin6_addr, ctx->client_ip, sizeof(ctx->client_ip));
+					ctx->client_port = ntohs(s6->sin6_port);
+					if(threadpool_add_work(tcp_thread_pool, process_tcp_query, ctx) < 0) {
+						close(cfd); free(ctx); tcp_conn_release(&caddr);
+					}
+				} else {
+					close(cfd);
+					tcp_conn_release(&caddr);
+				}
+			}
+		}
+	}
 
-    if (tcp4_sock >= 0) close(tcp4_sock);
-    if (tcp6_sock >= 0) close(tcp6_sock);
+	printf("Shutting down DNS server...\n");
 
-    if (stats_pipe[0] >= 0) { close(stats_pipe[0]); stats_pipe[0] = -1; }
-    if (stats_pipe[1] >= 0) { close(stats_pipe[1]); stats_pipe[1] = -1; }
+	// g_running=0 causes each UDP worker to exit after its 1-second timeout.
+	for(int i = 0; i < n_udp4; i++)
+		pthread_join(udp4_threads[i], NULL);
+	for(int i = 0; i < n_udp6; i++)
+		pthread_join(udp6_threads[i], NULL);
+	free(udp4_threads);
+	free(udp6_threads);
 
-    if (g_config.upstream_dns) free(g_config.upstream_dns);
-    if (g_zone_keys) { free_zone_keys(g_zone_keys); g_zone_keys = NULL; }
+	threadpool_wait(tcp_thread_pool);
+	threadpool_destroy(tcp_thread_pool);
+	threadpool_wait(g_forward_pool);
+	threadpool_destroy(g_forward_pool);
 
-    log_close();
-    remove_pid_file();
+	// Only now are no forward jobs left that could send on these sockets.
+	for(int i = 0; i < n_udp4; i++)
+		close(udp4_fds[i]);
+	for(int i = 0; i < n_udp6; i++)
+		close(udp6_fds[i]);
+	free(udp4_fds);
+	free(udp6_fds);
 
-    return 0;
+	if(tcp4_sock >= 0)
+		close(tcp4_sock);
+	if(tcp6_sock >= 0)
+		close(tcp6_sock);
+
+	if(stats_pipe[0] >= 0) {
+		close(stats_pipe[0]);
+		stats_pipe[0] = -1;
+	}
+	if(stats_pipe[1] >= 0) {
+		close(stats_pipe[1]);
+		stats_pipe[1] = -1;
+	}
+
+	if(g_config.upstream_dns)
+		free(g_config.upstream_dns);
+	if(g_zone_keys) {
+		free_zone_keys(g_zone_keys);
+		g_zone_keys = NULL;
+	}
+
+	log_close();
+	remove_pid_file();
+
+	return 0;
 }
