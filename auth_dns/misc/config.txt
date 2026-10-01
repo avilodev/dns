@@ -6,7 +6,7 @@
 #   A / AAAA / NS / MX <prio> <host> / CNAME / TXT "..." ["..."] / SRV <p> <w> <port> <tgt>
 #   HTTPS <prio> <target>
 #   SOA <mname> <rname> <serial> <refresh> <retry> <expire> <minimum>
-# Optional leading TTL on any record line, e.g. "300 A 192.0.2.10" (default 3600).
+# Optional leading TTL on any record line, e.g. "300 A 192.168.1.10" (default 3600).
 # Wildcards: use [*.zone] (any record type).  Names may use RFC 1035 escapes (\. \DDD).
 
 # Example zone (uncomment and adapt). Every name in a zone you serve is
@@ -18,7 +18,7 @@
 # NS     ns1.example.test
 #
 # [ns1.example.test]
-# A      192.0.2.10
+# A      192.168.1.10
 #
 # [www.example.test]
 # CNAME  ns1.example.test
